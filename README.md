@@ -3,9 +3,29 @@
 LangGraph-based deep research workflow. Multi-phase pipeline with grounding verification.
 
 ```
-Phase 0 (Plan) → Phase 1a (Search) → Phase 1b (Verify) → Phase 2 (Integrate) → Phase 3 (Report)
-                       ↑                    │
-                       └──── fail ───────────┘
+使用者輸入 topic + ref files (text/image/PDF)
+        │
+        ▼
+┌─ Clarification (main.py, graph 外) ─────────────┐
+│  多輪澄清 Q&A（LLM 提問 → 使用者回答 → Judge 評估）│
+└──────────────────────────────────────────────────┘
+        │ clarifications + refs
+        ▼
+Phase 0 (Plan + Research Brief)
+  ├─ 生成研究計畫
+  └─ synthesize_research_topic → full_research_topic（全流程固定 context）
+        │
+        ▼
+  [Human Approval] ─── ask mode 時暫停等使用者確認
+        │
+        ▼
+Phase 1a (Search) → Phase 1b (Verify) → Phase 2 (Integrate) → Phase 3 (Report)
+        ↑                    │
+        └──── fail ──────────┘
+
+Context Window 管理（context.py）：
+  全塞 or Iterative Refinement（BM25 排序 + 分批送入 + prompt prefix caching）
+  超過 30% threshold → 分批 │ 超過 100% → 自動切換最大 provider │ 仍超 → error
 ```
 
 ## Quick Start
@@ -67,7 +87,13 @@ No additional API keys needed for grounding — just AWS credentials for Bedrock
 .venv/bin/python3 main.py "AI Agent 框架比較" --standard --budget 80
 
 # Auto-approve research plan (no confirmation prompt)
-.venv/bin/python3 main.py "量子計算進展" --auto
+.venv/bin/python3 main.py "量子計算進展" --noask
+
+# 附加參考文件（支援文字、圖片、PDF）
+.venv/bin/python3 main.py "AI Agent 框架比較" --ref report.pdf arch.png notes.md
+
+# 指定完整模型版號 + 調整 context 閾值
+.venv/bin/python3 main.py "量子計算進展" --model gemini-2.5-pro --context-threshold 0.5
 ```
 
 ### Claude Code skill
@@ -99,11 +125,12 @@ deep-research/
 ├── main.py                  # CLI entry point
 ├── deep_research/
 │   ├── config.py            # Project paths (all relative)
+│   ├── context.py           # Context window management (Iterative Refinement + BM25 + caching)
 │   ├── llm.py               # LLM factory (Claude/OpenAI/Gemini)
 │   ├── graph.py             # Main StateGraph definition
 │   ├── state.py             # Pydantic models + TypedDict states
 │   ├── nodes/               # Phase implementations
-│   │   ├── phase0.py        # Research planning
+│   │   ├── phase0.py        # Clarify + planning + research brief synthesis
 │   │   ├── phase1a.py       # Search + deep-read
 │   │   ├── phase1b.py       # Grounding verification subgraph
 │   │   ├── phase2.py        # Conflict resolution + integration
