@@ -1,0 +1,15 @@
+langgraph==1.1.6
+langgraph-prebuilt==1.0.9
+langgraph-checkpoint==4.0.1
+langgraph-sdk==0.3.13
+langchain-core==1.2.28
+langchain-anthropic==1.4.0
+langchain-openai==1.1.12
+langchain-google-genai==4.2.1
+pydantic==2.12.5
+httpx==0.28.1
+python-dotenv==1.2.2
+anthropic==0.94.0
+openai==2.31.0
+rank-bm25==0.2.2
+pymupdf==1.25.5
