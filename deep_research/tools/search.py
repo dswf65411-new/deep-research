@@ -14,16 +14,27 @@ SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 _CLIENT_TIMEOUT = 30
 
 
-async def brave_search(query: str, count: int = 10) -> list[dict]:
+async def brave_search(
+    query: str,
+    count: int = 10,
+    country: str = "",
+    search_lang: str = "",
+) -> list[dict]:
     """Call Brave Web Search API directly.
 
     Returns list of {"title", "url", "description"}.
+    country: ISO 3166-1 alpha-2 country code, e.g. "TW" for Taiwan.
+    search_lang: BCP 47 language code, e.g. "zh-hant" for Traditional Chinese.
     """
     if not BRAVE_API_KEY:
         return []
 
     url = "https://api.search.brave.com/res/v1/web/search"
-    params = {"q": query, "count": count}
+    params: dict[str, str | int] = {"q": query, "count": count}
+    if country:
+        params["country"] = country
+    if search_lang:
+        params["search_lang"] = search_lang
     headers = {
         "Accept": "application/json",
         "Accept-Encoding": "gzip",

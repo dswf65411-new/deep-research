@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import logging
 import mimetypes
+import sys
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -25,6 +26,10 @@ from deep_research.llm import (
     get_llm,
     get_provider,
     find_largest_available_provider,
+    safe_ainvoke,
+    safe_ainvoke_chain,
+    get_role_context_limit,
+    _available_chain,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,12 +51,51 @@ def estimate_tokens(text: str) -> int:
 def read_reference_files(paths: list[str]) -> list[dict]:
     """讀取參考檔案，回傳統一格式。
 
-    支援：
-      - 文字檔（.md, .txt, .csv, .json, .py 等）→ {"type": "text", "name": ..., "content": ...}
-      - 圖片（.png, .jpg, .gif, .webp 等）→ {"type": "image", "name": ..., "mime": ..., "data": base64}
-      - PDF → {"type": "text", "name": ..., "content": 提取的文字}
-      - Workspace 目錄 → 讀取 final-report.md
+    ============================================================
+    ✅ 支援格式
+    ============================================================
 
+    【文字類 — 走 UTF-8 直讀，副檔名無限制，只要能 UTF-8 decode】
+      - Markdown：  .md, .markdown
+      - 純文字：    .txt, .log
+      - 結構化：    .json, .yaml, .yml, .toml, .xml, .csv, .tsv
+      - 原始碼：    .py, .js, .ts, .go, .rs, .java, .c, .cpp, .sh
+      - 網頁：      .html, .htm
+      - 任何其他 UTF-8 可讀的純文字檔
+      → 格式：{"type": "text", "name": ..., "content": ...}
+
+    【PDF — 用 pymupdf 提取純文字（圖表/排版會遺失）】
+      - .pdf
+      → 格式：{"type": "text", "name": ..., "content": 提取的純文字}
+      - ⚠️ 需 pip install pymupdf，否則 content 會是錯誤訊息字串
+      - ⚠️ 掃描檔 PDF（無 OCR 文字層）提取結果為空
+
+    【圖片 — base64 編碼送 LLM 視覺理解】
+      - PNG、JPEG / JPG、GIF、WebP、BMP、TIFF、SVG（任何 mime = image/*）
+      → 格式：{"type": "image", "name": ..., "mime": ..., "data": base64}
+      - ⚠️ 實務上 LLM provider 通常只認 PNG / JPEG / GIF / WebP
+        TIFF / BMP / SVG 可能被 LLM 拒絕或誤判
+
+    【Workspace 目錄 — 研究追加功能】
+      - 傳入的 path 是目錄時，讀裡面的 final-report.md
+      → 格式：{"type": "text", "name": "{dir}/final-report.md", "content": ...}
+      - 用途：把前一次研究的報告當作新研究的 context
+
+    ============================================================
+    ❌ 不支援格式（會被 skip + 印 warning）
+    ============================================================
+
+      - Office 文件：.docx, .xlsx, .pptx（zip 容器，走文字 fallback 會 UnicodeDecodeError）
+      - 壓縮檔：.zip, .tar, .gz, .7z
+      - 音訊：.mp3, .wav, .m4a, .ogg
+      - 影片：.mp4, .mov, .avi, .webm
+      - 非 UTF-8 文字檔（Big5、GBK、Shift-JIS）— 編碼硬寫死 utf-8
+
+    若需支援上述格式，需擴充此函式的分支邏輯。
+
+    Raises:
+        ValueError: 當使用者傳入明確不支援的格式時，立刻拋錯（fail-fast），
+                    而不是 skip 後讓使用者後面才發現 ref 沒被讀到。
     Returns:
         list of ref dicts
     """
@@ -68,11 +112,51 @@ def read_reference_files(paths: list[str]) -> list[dict]:
                     "name": f"{path.name}/final-report.md",
                     "content": report.read_text(encoding="utf-8"),
                 })
+            else:
+                raise ValueError(
+                    f"❌ 目錄 {path} 內沒有 final-report.md。\n"
+                    f"   目錄參考僅支援讀取先前研究的 workspace（必須包含 final-report.md）。"
+                )
             continue
 
         if not path.is_file():
-            logger.warning(f"參考檔案不存在，跳過: {path}")
-            continue
+            raise ValueError(f"❌ 參考檔案不存在：{path}")
+
+        # ─── Fail-fast：明確不支援的格式立刻拋錯 ───────────────────
+        # 這些格式就算走 UTF-8 fallback 也必定失敗（zip 容器、二進位）
+        # 與其 skip 讓使用者後面才發現少了 ref，不如當下就明確告知
+        UNSUPPORTED_EXTS = {
+            # Office 文件（zip 容器，無法 UTF-8 讀）
+            ".docx": "Word 文件", ".xlsx": "Excel 試算表", ".pptx": "PowerPoint 簡報",
+            ".doc":  "Word 文件（舊版）", ".xls": "Excel 試算表（舊版）",
+            ".ppt":  "PowerPoint 簡報（舊版）", ".odt": "OpenDocument 文字",
+            ".ods":  "OpenDocument 試算表", ".odp": "OpenDocument 簡報",
+            ".rtf":  "RTF 格式文件",
+            # 電子書
+            ".epub": "EPUB 電子書", ".mobi": "Kindle 電子書", ".azw3": "Kindle 電子書",
+            # 壓縮檔
+            ".zip": "ZIP 壓縮檔", ".tar": "TAR 封存檔", ".gz": "Gzip 壓縮檔",
+            ".bz2": "Bzip2 壓縮檔", ".7z": "7-Zip 壓縮檔", ".rar": "RAR 壓縮檔",
+            # 音訊
+            ".mp3": "MP3 音訊", ".wav": "WAV 音訊", ".m4a": "M4A 音訊",
+            ".ogg": "OGG 音訊", ".flac": "FLAC 音訊", ".aac": "AAC 音訊",
+            # 影片
+            ".mp4": "MP4 影片", ".mov": "MOV 影片", ".avi": "AVI 影片",
+            ".mkv": "MKV 影片", ".webm": "WebM 影片", ".flv": "FLV 影片",
+            # 其他二進位
+            ".exe": "執行檔", ".dll": "動態連結庫", ".so": "共享函式庫",
+            ".dmg": "macOS 磁碟映像", ".iso": "ISO 映像檔",
+        }
+        suffix = path.suffix.lower()
+        if suffix in UNSUPPORTED_EXTS:
+            raise ValueError(
+                f"❌ 不支援的檔案格式：{path.name}（{UNSUPPORTED_EXTS[suffix]}）\n"
+                f"   ✅ 目前僅支援：\n"
+                f"      • 純文字類：.md, .txt, .json, .yaml, .csv, .html, 程式原始碼等\n"
+                f"      • PDF：.pdf（只讀文字，圖表/圖片會被忽略）\n"
+                f"      • 圖片：.png, .jpg, .jpeg, .gif, .webp\n"
+                f"   如需提供 Office 文件，請先轉為 PDF 或貼成純文字。"
+            )
 
         mime, _ = mimetypes.guess_type(str(path))
 
@@ -88,8 +172,24 @@ def read_reference_files(paths: list[str]) -> list[dict]:
             })
 
         elif mime == "application/pdf":
-            # PDF → 提取文字
+            # ─── PDF：提取純文字，並明確告知使用者限制 ────────────
+            # 使用者常誤以為 LLM 能「看」PDF 的圖表/排版，實際只讀到文字。
+            # 在讀取當下就用 stderr 印提醒，確保使用者知道限制。
+            print(
+                f"📄 偵測到 PDF：{path.name}\n"
+                f"   ⚠️  只會讀取『文字內容』。以下資訊會被忽略：\n"
+                f"       • 圖片、圖表、示意圖\n"
+                f"       • 表格的排版結構（文字仍可讀到，但可能錯位）\n"
+                f"       • 掃描檔若無 OCR 文字層，將完全無法讀取\n"
+                f"   如有關鍵圖表，建議另存為 PNG/JPG 一併提供。",
+                file=sys.stderr,
+            )
             text = _extract_pdf_text(path)
+            if not text.strip():
+                raise ValueError(
+                    f"❌ 無法從 PDF 提取任何文字：{path.name}\n"
+                    f"   可能原因：掃描檔無 OCR 文字層 / 加密 / 檔案損毀。"
+                )
             refs.append({
                 "type": "text",
                 "name": path.name,
@@ -97,7 +197,7 @@ def read_reference_files(paths: list[str]) -> list[dict]:
             })
 
         else:
-            # 文字檔
+            # 其他檔案：嘗試用 UTF-8 讀（純文字副檔名會走到這裡）
             try:
                 content = path.read_text(encoding="utf-8")
                 refs.append({
@@ -106,7 +206,14 @@ def read_reference_files(paths: list[str]) -> list[dict]:
                     "content": content,
                 })
             except UnicodeDecodeError:
-                logger.warning(f"無法以 UTF-8 讀取 {path}，跳過")
+                # 讀不到表示檔案不是 UTF-8 文字（可能是未列入黑名單的二進位格式
+                # 或是 Big5/GBK 等非 UTF-8 編碼），一樣拋錯
+                raise ValueError(
+                    f"❌ 無法以 UTF-8 讀取 {path.name}\n"
+                    f"   可能是未被明確列入支援清單的二進位檔、\n"
+                    f"   或是非 UTF-8 編碼的文字檔（如 Big5, GBK）。\n"
+                    f"   請先轉為 UTF-8 或另存為支援的格式。"
+                )
 
     return refs
 
@@ -199,8 +306,58 @@ async def synthesize_research_topic(
 
     一次性呼叫，在 Phase 0 澄清完成後執行。
     產出的 full_research_topic 會作為整個研究的 fixed context。
+
+    Anti-pattern 防護（LLM 專注原則）：
+      - 場景：使用者可能丟入整份長 PDF / 大型文字檔當 refs，
+              一次性呼叫無 Iterative Refinement 保護，易觸發 LiM。
+      - 策略：文字 refs 總量軟上限 30K tokens 警告，硬上限 50K tokens 截斷。
+              圖片 refs 不動（圖片 token 計費方式不同，交給模型處理）。
     """
-    llm = get_llm(tier="strong", max_tokens=8192, temperature=0.2)
+    import logging
+    log = logging.getLogger(__name__)
+
+    # refs 大小保護：文字類累積估 tokens，超過上限截斷
+    safe_refs: list[dict] = []
+    if refs:
+        SOFT_LIMIT = 30_000
+        HARD_LIMIT = 50_000
+        accumulated = 0
+        truncated_count = 0
+        for ref in refs:
+            if ref.get("type") == "text":
+                content = ref.get("content", "")
+                ref_tokens = estimate_tokens(content)
+                if accumulated + ref_tokens <= HARD_LIMIT:
+                    safe_refs.append(ref)
+                    accumulated += ref_tokens
+                else:
+                    # 只留頭尾各 ~1500 tokens (4500 chars) 摘要
+                    remaining = HARD_LIMIT - accumulated
+                    if remaining > 3000:
+                        keep_chars = (remaining - 500) * 3 // 2
+                        head = content[:keep_chars]
+                        tail = content[-keep_chars:] if len(content) > keep_chars * 2 else ""
+                        if tail:
+                            new_content = f"{head}\n\n...[中段省略 ~{ref_tokens - remaining} tokens 以符合 50K 上限]...\n\n{tail}"
+                        else:
+                            new_content = head + "\n\n...[尾段省略以符合 50K 上限]..."
+                        safe_refs.append({**ref, "content": new_content})
+                        accumulated = HARD_LIMIT
+                    truncated_count += 1
+            else:
+                # 圖片直接放行
+                safe_refs.append(ref)
+        if accumulated > SOFT_LIMIT:
+            log.warning(
+                "[synthesize] refs 文字總量 %d tokens 超過軟上限 %d — 建議拆分或先自行摘要",
+                accumulated,
+                SOFT_LIMIT,
+            )
+        if truncated_count:
+            log.warning(
+                "[synthesize] 已截斷 %d 份 refs（超過 50K tokens 硬上限）",
+                truncated_count,
+            )
 
     # 組裝 multimodal content blocks
     content_blocks: list[dict] = [
@@ -208,8 +365,8 @@ async def synthesize_research_topic(
     ]
 
     # 參考文件（文字+圖片）
-    if refs:
-        ref_blocks = refs_to_message_content(refs)
+    if safe_refs:
+        ref_blocks = refs_to_message_content(safe_refs)
         content_blocks.extend(ref_blocks)
 
     # 澄清問答
@@ -226,7 +383,13 @@ async def synthesize_research_topic(
     system_msg = SystemMessage(content=SYNTHESIZE_PROMPT)
     human_msg = HumanMessage(content=content_blocks)
 
-    response = await llm.ainvoke([system_msg, human_msg])
+    # role="writer" — 規劃 / 統整類，Claude Opus 主導，內含 fallback chain
+    response = await safe_ainvoke_chain(
+        role="writer",
+        messages=[system_msg, human_msg],
+        max_tokens=8192,
+        temperature=0.2,
+    )
     return response.content
 
 
@@ -238,17 +401,20 @@ async def _expand_query(topic: str) -> str:
     """LLM 生成加長版 query，提升 BM25 的 recall。
 
     包含：同義詞、相關術語、多語言對應、領域慣用詞。
-    成本很低（一次 fast tier call，output ~200 tokens）。
+    成本很低（一次 verifier chain call，output ~200 tokens）。
     """
-    llm = get_llm(tier="fast", max_tokens=1024, temperature=0.3)
-
-    response = await llm.ainvoke([
-        SystemMessage(content="""根據研究主題，生成一段用於資訊檢索的加長查詢。
+    response = await safe_ainvoke_chain(
+        role="verifier",
+        messages=[
+            SystemMessage(content="""根據研究主題，生成一段用於資訊檢索的加長查詢。
 包含：同義詞、相關術語、英文對應詞、領域慣用詞、相關概念。
 目的是提升 BM25 關鍵字匹配的 recall。
 直接輸出查詢文字，不要解釋。"""),
-        HumanMessage(content=topic),
-    ])
+            HumanMessage(content=topic),
+        ],
+        max_tokens=1024,
+        temperature=0.3,
+    )
     return response.content
 
 
@@ -339,6 +505,7 @@ async def iterative_refine(
     extra_context: str = "",
     tier: str = "strong",
     provider: str | None = None,
+    role: str | None = None,
 ) -> str:
     """Iterative Refinement 核心：將所有 sources 增量整合進 draft。
 
@@ -346,7 +513,7 @@ async def iterative_refine(
       1. total_tokens < budget → 全塞，一次 LLM call
       2. total_tokens >= budget → 迴圈，每輪塞到 budget 為止
       3. fixed_cost > budget → 一篇一篇送
-      4. fixed_cost + 單篇 > 100% context → 換最大 provider，仍超 → raise
+      4. fixed_cost + 單篇 > 100% context → role 模式 raise；tier 模式換最大 provider
 
     Args:
         sources: list of source text strings（搜尋結果原文）
@@ -358,8 +525,13 @@ async def iterative_refine(
             - Phase 3: 最終審計 prompt
         extra_context: 額外固定 context（如待核對 claims、statements），
             會放在 research_topic 之後、draft 之前。
-        tier: LLM tier ("strong" or "fast")
-        provider: override provider (None = use global)
+        tier: LLM tier ("strong" or "fast") — 僅在 role=None 時使用
+        provider: override provider — 僅在 role=None 時使用
+        role: 角色化 fallback chain 模式（推薦）。
+            "writer"   → Claude Opus → Sonnet → GPT-pro（規劃 / 整合 / 報告）
+            "verifier" → Gemini → GPT-mini → Claude Haiku（抽取 / 核對 / 審計）
+            設定後，內部走 safe_ainvoke_chain（自動 fallback），
+            context_limit / cache 格式以 chain 第一個 model 為準。
 
     Returns:
         最終的 draft / 核查結果 / 審計結果
@@ -367,10 +539,39 @@ async def iterative_refine(
     if not system_prompt:
         system_prompt = ITERATIVE_SYSTEM
 
-    p = provider or get_provider()
+    if role is not None:
+        # Role 模式：用 chain 第一個 model 的 context limit，cache 格式取第一家 provider
+        primary_provider, _primary_model = _available_chain(role)[0]
+        p = primary_provider
+        context_limit = get_role_context_limit(role)
+    else:
+        p = provider or get_provider()
+        context_limit = get_context_limit(p, tier)
+
     threshold = get_context_threshold()
-    context_limit = get_context_limit(p, tier)
     budget = int(context_limit * threshold)
+
+    # extra_context 放大器檢查 —
+    # iterative_refine 每輪都會重傳 extra_context，分批模式下實際消耗 = extra × 輪數。
+    # 呼叫端若塞了整份登記表 / 全部 claims / 全部 statements，這裡會放大成雜訊主因。
+    # 軟上限 2K tokens（警告），硬上限 4K tokens（截斷保護）。
+    if extra_context:
+        extra_tokens = estimate_tokens(extra_context)
+        if extra_tokens > 2000:
+            logger.warning(
+                f"iterative_refine: extra_context 過大 ({extra_tokens:,} tokens)。"
+                f"每輪都會重傳 → 分批模式下實際消耗 = {extra_tokens:,} × 輪數。"
+                f"建議呼叫端拆成多個獨立 call（per-section / per-group）或精簡 context。"
+            )
+        if extra_tokens > 4000:
+            char_cap = 12000  # ~4000 tokens
+            extra_context = (
+                extra_context[:char_cap]
+                + "\n\n...[extra_context 超過 4K tokens 硬上限，已截斷]..."
+            )
+            logger.warning(
+                f"extra_context 硬截斷至 ~{estimate_tokens(extra_context):,} tokens"
+            )
 
     # 估算 fixed 部分的 tokens
     fixed_prompt_tokens = estimate_tokens(system_prompt + full_research_topic + extra_context)
@@ -385,7 +586,7 @@ async def iterative_refine(
     # --- Step 1: 全塞判斷 ---
     if total_tokens < budget:
         logger.info("全塞模式：所有 sources 一次送入")
-        return await _single_pass(sources, full_research_topic, system_prompt, extra_context, tier, p)
+        return await _single_pass(sources, full_research_topic, system_prompt, extra_context, tier, p, role)
 
     # --- Step 2+: Iterative Refinement ---
     logger.info(f"Iterative Refinement 模式：{len(sources)} sources 分批處理")
@@ -408,7 +609,15 @@ async def iterative_refine(
             remaining_for_one = context_limit - fixed_cost  # 用 100% limit 而非 threshold
 
             if remaining_for_one <= 0:
-                # 連 100% context 都不夠 → 換最大 provider
+                if role is not None:
+                    # Role 模式：fallback chain 自己會挑可用的 provider，
+                    # 此處若仍超 limit 表示研究任務書過長，無解。
+                    raise RuntimeError(
+                        f"[role={role}] fixed_prompt + draft ({fixed_cost:,} tokens) 超過 "
+                        f"chain primary model 的 100% context limit ({context_limit:,} tokens)。"
+                        f"請縮短研究任務書或調高 --context-threshold。"
+                    )
+                # tier 模式：連 100% context 都不夠 → 換最大 provider
                 larger = find_largest_available_provider(tier)
                 if larger:
                     larger_limit = get_context_limit(larger, tier)
@@ -436,7 +645,7 @@ async def iterative_refine(
                 source = source[:char_limit] + "\n\n[...此來源因篇幅過長被截斷...]"
                 logger.warning(f"Source {processed+1} 過長 ({source_tokens:,} tokens)，截斷至 {remaining_for_one:,} tokens")
 
-            draft = await _refine_once(draft, [source], full_research_topic, system_prompt, extra_context, tier, p)
+            draft = await _refine_once(draft, [source], full_research_topic, system_prompt, extra_context, tier, p, role)
             processed += 1
         else:
             # 正常情況：貪心塞多篇
@@ -451,7 +660,7 @@ async def iterative_refine(
                 batch_tokens += source_tokens
                 processed += 1
 
-            draft = await _refine_once(draft, batch, full_research_topic, system_prompt, extra_context, tier, p)
+            draft = await _refine_once(draft, batch, full_research_topic, system_prompt, extra_context, tier, p, role)
 
         logger.info(f"已處理 {processed}/{len(sorted_sources)} sources, draft: {estimate_tokens(draft):,} tokens")
 
@@ -465,10 +674,9 @@ async def _single_pass(
     extra_context: str,
     tier: str,
     provider: str,
+    role: str | None = None,
 ) -> str:
     """全塞模式：一次 LLM call 處理所有 sources。"""
-    llm = get_llm(tier=tier, max_tokens=16384, temperature=0.2, provider=provider)
-
     all_sources = "\n\n---\n\n".join(
         f"### 來源 {i+1}\n{s}" for i, s in enumerate(sources)
     )
@@ -492,11 +700,21 @@ async def _single_pass(
 {all_sources}"""
 
     human_content = _build_human_with_cache(human_text, full_research_topic, provider)
-
-    response = await llm.ainvoke([
+    messages = [
         SystemMessage(content=system_content),
         HumanMessage(content=human_content),
-    ])
+    ]
+
+    if role is not None:
+        response = await safe_ainvoke_chain(
+            role=role,
+            messages=messages,
+            max_tokens=16384,
+            temperature=0.2,
+        )
+    else:
+        llm = get_llm(tier=tier, max_tokens=16384, temperature=0.2, provider=provider)
+        response = await safe_ainvoke(llm, messages)
     return response.content
 
 
@@ -508,10 +726,9 @@ async def _refine_once(
     extra_context: str,
     tier: str,
     provider: str,
+    role: str | None = None,
 ) -> str:
     """一輪 Iterative Refinement：draft + 一批 sources → 更新後的 draft。"""
-    llm = get_llm(tier=tier, max_tokens=16384, temperature=0.2, provider=provider)
-
     batch_text = "\n\n---\n\n".join(
         f"### 來源 {i+1}\n{s}" for i, s in enumerate(source_batch)
     )
@@ -542,11 +759,21 @@ async def _refine_once(
 {batch_text}"""
 
     human_content = _build_human_with_cache(human_text, full_research_topic, provider)
-
-    response = await llm.ainvoke([
+    messages = [
         SystemMessage(content=system_content),
         HumanMessage(content=human_content),
-    ])
+    ]
+
+    if role is not None:
+        response = await safe_ainvoke_chain(
+            role=role,
+            messages=messages,
+            max_tokens=16384,
+            temperature=0.2,
+        )
+    else:
+        llm = get_llm(tier=tier, max_tokens=16384, temperature=0.2, provider=provider)
+        response = await safe_ainvoke(llm, messages)
     return response.content
 
 

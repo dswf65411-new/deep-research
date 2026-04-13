@@ -24,7 +24,7 @@ from langgraph.types import interrupt
 from deep_research.harness.gates import gate_check
 from deep_research.nodes.phase0 import phase0_plan
 from deep_research.nodes.phase1a import phase1a_search
-from deep_research.nodes.phase1b import phase1b_verify
+from deep_research.nodes.phase1b import phase1b_verify, trigger_fallback_node
 from deep_research.nodes.phase2 import phase2_integrate
 from deep_research.nodes.phase3 import phase3_report
 from deep_research.state import ResearchState
@@ -70,22 +70,28 @@ def route_after_plan(state: ResearchState) -> str:
     return "phase1a"
 
 
-def route_after_verify(state: ResearchState) -> str:
-    """Route after Phase 1b: pass → phase2, fail → phase1a, max_retries → phase2."""
-    result = state.get("phase1b_result", "fail")
+def route_after_fallback(state: ResearchState) -> str:
+    """Route after trigger_fallback_node.
 
-    if result == "pass":
-        return "phase2"
-    if result == "max_retries":
+    Priority:
+    1. needs_refetch non-empty → focus-mode phase1a (via increment_iter)
+    2. phase1b passed normally → phase2
+    3. Max retries hit → phase2 (force through)
+    4. Else → normal phase1a retry (via increment_iter)
+    """
+    needs = state.get("needs_refetch", [])
+    if needs:
+        return "increment_iter"
+
+    result = state.get("phase1b_result", "fail")
+    if result in ("pass", "max_retries"):
         return "phase2"
 
     gate = gate_check(state)
-    if gate == "pass":
-        return "phase2"
-    if gate == "max_retries":
+    if gate in ("pass", "max_retries"):
         return "phase2"
 
-    return "phase1a"
+    return "increment_iter"
 
 
 async def increment_iteration(state: ResearchState) -> dict:
@@ -118,6 +124,7 @@ def build_deep_research(checkpointer=None) -> StateGraph:
     builder.add_node("human_approval", human_approval)
     builder.add_node("phase1a", phase1a_search)
     builder.add_node("phase1b", phase1b_verify)
+    builder.add_node("trigger_fallback", trigger_fallback_node)
     builder.add_node("increment_iter", increment_iteration)
     builder.add_node("phase2", phase2_integrate)
     builder.add_node("phase3", phase3_report)
@@ -138,16 +145,17 @@ def build_deep_research(checkpointer=None) -> StateGraph:
     # Approval → search
     builder.add_edge("human_approval", "phase1a")
 
-    # Search → verify
+    # Search → verify → fallback trigger
     builder.add_edge("phase1a", "phase1b")
+    builder.add_edge("phase1b", "trigger_fallback")
 
-    # Verify → conditional
+    # Fallback trigger → conditional (focus-mode loop or proceed to phase2)
     builder.add_conditional_edges(
-        "phase1b",
-        route_after_verify,
+        "trigger_fallback",
+        route_after_fallback,
         {
             "phase2": "phase2",
-            "phase1a": "increment_iter",
+            "increment_iter": "increment_iter",
         },
     )
     builder.add_edge("increment_iter", "phase1a")

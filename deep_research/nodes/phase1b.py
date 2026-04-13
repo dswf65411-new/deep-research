@@ -6,14 +6,19 @@ Contains the verify subgraph (most complex part of the pipeline):
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import re
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
 from deep_research.harness.gates import quality_gate
-from deep_research.llm import get_llm
+from deep_research.llm import get_llm, safe_ainvoke, safe_ainvoke_chain
 from deep_research.state import Claim, SubagentResult, VerifyState
 from deep_research.tools.grounding import (
     check_grounding_availability,
@@ -42,6 +47,138 @@ THRESHOLDS = {
 # Subgraph nodes
 # ---------------------------------------------------------------------------
 
+async def _llm_ground_one_claim(
+    claim: "Claim",
+    source_texts: list[str],
+    semaphore: asyncio.Semaphore,
+) -> dict:
+    """LLM-based grounding for a single claim (used as fallback).
+
+    Runs concurrently under the provided semaphore to avoid rate-limit spikes.
+    Returns a grounding result dict compatible with ground_claims() output.
+    """
+    combined = "\n\n---\n\n".join(source_texts[:3])
+    # Truncate to avoid huge context — grounding needs local context, not full doc
+    if len(combined) > 6000:
+        combined = combined[:6000] + "\n...[truncated]"
+
+    threshold = THRESHOLDS.get(claim.claim_type, 0.7)
+
+    prompt = f"""你是事實核查員。判斷以下 Claim 是否有來源文本的直接支持。
+
+## 重要說明
+- Claim 可能以繁體中文撰寫，但來源文本可能是英文或其他語言。這是正常現象。
+- 請跨語言判斷：如果 Claim 是來源文本的忠實描述（即使語言不同），視為 GROUNDED。
+- 例如：英文來源 "Best speech-to-text app" → 中文 Claim "最佳語音轉文字應用程式" → 視為支持。
+- 不要因為語言不同而降低分數。
+
+## 來源文本
+{combined}
+
+## 待查 Claim（類型：{claim.claim_type}）
+{claim.claim_text}
+
+## 評分規則
+- 1.0：文本中有明確句子直接支持此 claim（即使不同語言表達）
+- 0.7-0.9：文本有充分間接支持或可合理推導
+- 0.5-0.69：文本有部分相關支持
+- 0.0-0.49：文本中找不到支持，或相矛盾
+
+只輸出 JSON，不要其他文字：{{"score": 0.0到1.0}}"""
+
+    async with semaphore:
+        try:
+            response = await safe_ainvoke_chain(
+                role="verifier",
+                messages=[HumanMessage(content=prompt)],
+                max_tokens=60,
+                temperature=0.0,
+            )
+            text = response.content if hasattr(response, "content") else str(response)
+            m = re.search(r'\{[^}]+\}', text)
+            if m:
+                data = json.loads(m.group())
+                score = min(max(float(data.get("score", 0.5)), 0.0), 1.0)
+            else:
+                score = 0.5
+        except Exception as exc:
+            logger.warning("LLM grounding fallback failed for %s: %s", claim.claim_id, exc)
+            # Conservative: don't penalize when LLM itself fails
+            score = 0.5
+
+    verdict = "GROUNDED" if score >= threshold else "NOT_GROUNDED"
+    return {
+        "claim_id": claim.claim_id,
+        "score": score,
+        "verdict": verdict,
+        "tool": "llm",
+        "threshold": threshold,
+    }
+
+
+def _strip_html_for_grounding(content: str) -> str:
+    """Strip HTML tags and decode entities from raw fetched content for grounding.
+
+    Raw files (_raw.md) may contain full HTML with CSS/JS noise. The LLM grounding
+    prompt is truncated at 6000 chars, so CSS/JS preamble would crowd out actual text.
+    This strips HTML tags so the LLM sees plain text, improving grounding accuracy.
+    """
+    import re as _re
+    import html as _html_module
+    # Remove script and style blocks entirely
+    content = _re.sub(r'<(script|style)[^>]*>.*?</(script|style)>', ' ', content, flags=_re.DOTALL | _re.IGNORECASE)
+    # Remove all other HTML tags
+    content = _re.sub(r'<[^>]+>', ' ', content)
+    # Decode HTML entities (e.g. &amp; → &, &lt; → <)
+    content = _html_module.unescape(content)
+    # Collapse whitespace
+    content = _re.sub(r'[ \t]+', ' ', content)
+    content = _re.sub(r'\n{3,}', '\n\n', content)
+    return content.strip()
+
+
+async def _gather_claim_sources(
+    claim: "Claim", workspace: str
+) -> list[str]:
+    """Collect source text for grounding.
+
+    Strategy:
+    1. Try *_raw.md (full fetched content). If it contains HTML, strip the tags
+       so the LLM grounding sees clean text rather than CSS/JS noise.
+    2. Fall back to *.md (metadata + extracted quotes) if raw is unavailable.
+
+    The search-results directory has two files per source:
+      S001_raw.md  — full fetched page content (may be raw HTML, up to 25K chars)
+      S001.md      — metadata + extracted verified quotes (clean, < 2K chars)
+    """
+    import glob as _glob
+
+    source_texts: list[str] = []
+    for sid in claim.source_ids:
+        # Prefer _raw.md (full content, HTML-stripped); fall back to .md (metadata)
+        for suffix in (f"{sid}_raw.md", f"{sid}.md"):
+            source_files = list_workspace_files(workspace, "search-results", f"**/{suffix}")
+            if not source_files:
+                pattern = f"{workspace}/search-results/**/{suffix}"
+                source_files = _glob.glob(pattern, recursive=True)
+            if source_files:
+                for sf in source_files:
+                    raw = Path(sf).read_text(encoding="utf-8") if Path(sf).exists() else ""
+                    if not raw:
+                        continue
+                    # Strip HTML if this is a raw fetch file
+                    if suffix.endswith("_raw.md") and "<html" in raw.lower():
+                        cleaned = _strip_html_for_grounding(raw)
+                        # Fall back to metadata if stripping left too little content
+                        content = cleaned if len(cleaned.strip()) >= 200 else raw
+                    else:
+                        content = raw
+                    if content and len(content.strip()) >= 200:
+                        source_texts.append(content)
+                break  # found raw — skip metadata fallback
+    return source_texts
+
+
 async def grounding_check_node(state: VerifyState) -> dict:
     """Run grounding verification on all claims."""
     claims = state.get("claims_to_verify", [])
@@ -50,35 +187,58 @@ async def grounding_check_node(state: VerifyState) -> dict:
     if not claims:
         return {"grounding_results": []}
 
-    # Check tool availability first
-    tool_name, error = check_grounding_availability()
-    if tool_name == "none":
-        return {
-            "grounding_results": [
-                {"claim_id": c.claim_id, "error": f"GROUNDING-UNAVAILABLE: {error}"}
-                for c in claims
-            ]
-        }
+    # Always use LLM grounding.
+    # CLI tools (bedrock/minicheck/nemo) test with English→English but our pipeline
+    # generates Chinese claim_text against English sources, giving ~0.00 scores.
+    # LLM grounding handles cross-language matching correctly.
+    tool_name, error = "none", "forced LLM path for cross-language support"
+    use_llm_fallback = True
+    logger.info("grounding_check_node: 使用 LLM grounding（Gemini fallback，支援跨語言）")
 
+    if use_llm_fallback:
+        # LLM fallback path：先並發收集 source texts，再並發 LLM grounding
+        sem = asyncio.Semaphore(5)  # 最多 5 個並發 LLM calls，避免 429
+
+        # Gather source texts for all claims concurrently
+        source_tasks = [_gather_claim_sources(claim, workspace) for claim in claims]
+        all_sources = await asyncio.gather(*source_tasks)
+
+        # Run LLM grounding concurrently for claims that have sources
+        llm_tasks = []
+        no_source_indices: list[int] = []
+        grounding_indices: list[int] = []
+
+        for i, (claim, srcs) in enumerate(zip(claims, all_sources)):
+            if not srcs:
+                no_source_indices.append(i)
+            else:
+                grounding_indices.append(i)
+                llm_tasks.append(_llm_ground_one_claim(claim, srcs, sem))
+
+        llm_results = await asyncio.gather(*llm_tasks)
+
+        # Merge results in original order
+        results: list[dict] = [None] * len(claims)  # type: ignore[list-item]
+        for idx in no_source_indices:
+            results[idx] = {
+                "claim_id": claims[idx].claim_id,
+                "score": 0.0,
+                "verdict": "NO_SOURCE_TEXT",
+                "tool": "none",
+            }
+        for task_i, claim_i in enumerate(grounding_indices):
+            results[claim_i] = llm_results[task_i]
+
+        logger.info(
+            "LLM grounding fallback 完成：%d claims，%d 有 source，%d NO_SOURCE_TEXT",
+            len(claims), len(grounding_indices), len(no_source_indices),
+        )
+        return {"grounding_results": [r for r in results if r is not None]}
+
+    # ── CLI grounding path (bedrock / minicheck / nemo) ──────────────────────
     results = []
-    # Batch claims by subquestion for efficiency
     for claim in claims:
-        # Gather source text for this claim
-        source_texts = []
-        for sid in claim.source_ids:
-            # Find the source file
-            source_files = list_workspace_files(workspace, "search-results", f"**/{sid}.md")
-            if not source_files:
-                # Try broader search
-                import glob as g
-                pattern = f"{workspace}/search-results/**/{sid}.md"
-                source_files = g.glob(pattern, recursive=True)
-
-            for sf in source_files:
-                content = Path(sf).read_text(encoding="utf-8") if Path(sf).exists() else ""
-                if content:
-                    # Truncate to ~2000 tokens worth of text around quotes
-                    source_texts.append(content)
+        source_texts = await _gather_claim_sources(claim, workspace)
 
         if not source_texts:
             results.append({
@@ -90,14 +250,14 @@ async def grounding_check_node(state: VerifyState) -> dict:
             continue
 
         combined_source = "\n\n---\n\n".join(source_texts)
-        grounding = ground_claims(
+        grounding_res = ground_claims(
             claims=[claim.claim_text],
             sources=[combined_source],
             preferred_tool=tool_name,
         )
 
-        if grounding:
-            r = grounding[0]
+        if grounding_res:
+            r = grounding_res[0]
             threshold = THRESHOLDS.get(claim.claim_type, 0.7)
             results.append({
                 "claim_id": claim.claim_id,
@@ -118,14 +278,45 @@ async def grounding_check_node(state: VerifyState) -> dict:
 
 
 async def quality_eval_node(state: VerifyState) -> dict:
-    """Evaluate 4-dimensional quality for each subquestion."""
+    """Evaluate quality for each subquestion.
+
+    執行順序（順序重要）：
+    1. Grounding verdict → 設定 claim.status（approved / rejected / pending）
+    2. Relevance filter → LLM 判斷 approved claims 是否 on-topic；off-topic → rejected
+    3. Dim-score 計算 → 基於過濾後的 approved claims（反映真實品質）
+    """
     claims = state.get("claims_to_verify", [])
     grounding = state.get("grounding_results", [])
+    workspace = state.get("workspace_path", "")
 
     # Build grounding map
     g_map = {r["claim_id"]: r for r in grounding}
 
-    # Group claims by subquestion
+    # ── Step 1: Set initial status from grounding verdict ─────────────────
+    # Must happen before relevance check so we only check grounded (approved) claims.
+    for c in claims:
+        g = g_map.get(c.claim_id, {})
+        verdict = g.get("verdict", "")
+        if verdict == "GROUNDED":
+            c.status = "approved"
+        elif verdict in ("NOT_GROUNDED", "ERROR"):
+            c.status = "rejected"
+        # NO_SOURCE_TEXT → stays pending (attack agent may have source context)
+
+    # ── Step 2: Relevance filter ──────────────────────────────────────────
+    # Grounding only checks "does the text exist in source?"; not "does it answer the SQ?".
+    # Reject off-topic approved claims (addresses, bios, boilerplate that happen to be in source).
+    irrelevant_ids = await _run_relevance_checks(claims, workspace)
+    for c in claims:
+        if c.claim_id in irrelevant_ids:
+            logger.info(
+                "quality_eval: relevance filter 拒絕 off-topic claim %s: %s",
+                c.claim_id,
+                c.claim_text[:60],
+            )
+            c.status = "rejected"
+
+    # ── Step 3: Compute quality dimensions (post-relevance-filter) ────────
     by_subq: dict[str, list[Claim]] = {}
     for c in claims:
         by_subq.setdefault(c.subquestion, []).append(c)
@@ -134,49 +325,51 @@ async def quality_eval_node(state: VerifyState) -> dict:
     all_failed = []
 
     for subq, subq_claims in by_subq.items():
-        grounded_claims = [
-            c for c in subq_claims
-            if g_map.get(c.claim_id, {}).get("verdict") == "GROUNDED"
-        ]
-        advocate_claims = [c for c in grounded_claims if "advocate" in (c.source_ids[0] if c.source_ids else "")]
-        critic_claims = [c for c in grounded_claims if "critic" in (c.source_ids[0] if c.source_ids else "")]
+        # Dimension scores based on claims that passed both grounding AND relevance
+        approved_claims = [c for c in subq_claims if c.status == "approved"]
 
-        # Actionability: claims are specific and bounded
-        actionability = len(grounded_claims) > 0
+        # Actionability: at least one approved claim
+        actionability = len(approved_claims) > 0
 
-        # Freshness: defer to claim metadata (simplified check)
-        freshness = True  # Will be properly checked with freshness SLA
+        # Freshness: simplified (real SLA check deferred to future iteration)
+        freshness = True
 
-        # Plurality: >= 2 independent sources
-        all_sources = set()
-        for c in grounded_claims:
+        # Plurality: >= 2 independent sources among approved claims
+        all_sources: set[str] = set()
+        for c in approved_claims:
             all_sources.update(c.source_ids)
         plurality = len(all_sources) >= 2
 
-        # Completeness: both advocate and critic covered
-        has_advocate = any(True for c in subq_claims
-                         for r in [g_map.get(c.claim_id, {})]
-                         if r.get("verdict") == "GROUNDED")
-        completeness = has_advocate and len(grounded_claims) >= 2
+        # Completeness: >= 2 approved claims for this SQ
+        completeness = len(approved_claims) >= 2
+
+        # Relevance dimension: False if any claim in this SQ was off-topic
+        sq_irrelevant = irrelevant_ids & {c.claim_id for c in subq_claims}
+        relevance = len(sq_irrelevant) == 0
 
         dim_scores = {
             "actionability": actionability,
             "freshness": freshness,
             "plurality": plurality,
             "completeness": completeness,
+            "relevance": relevance,  # informational; not enforced by quality_gate
         }
         scores[subq] = dim_scores
 
-        result, failed = quality_gate(dim_scores)
+        # quality_gate enforces only the 4 primary dimensions
+        result, failed = quality_gate(
+            {k: v for k, v in dim_scores.items() if k != "relevance"}
+        )
         if failed:
             all_failed.extend(failed)
 
-    overall_result, overall_failed = quality_gate(
+    quality_gate(
         {d: all(scores[sq].get(d, False) for sq in scores) for d in
          ["actionability", "freshness", "plurality", "completeness"]}
     ) if scores else ("needs_attack", ["no_claims"])
 
     return {
+        "claims_to_verify": claims,
         "quality_scores": scores,
         "failed_dimensions": list(set(all_failed)) if all_failed else [],
     }
@@ -188,6 +381,154 @@ def quality_routing(state: VerifyState) -> str:
     if not failed:
         return "all_pass"
     return "needs_attack"
+
+
+# ---------------------------------------------------------------------------
+# Relevance filter helpers — LLM judges if claim answers the subquestion
+# ---------------------------------------------------------------------------
+
+_RELEVANCE_SYSTEM = """你是研究 claim 相關性審查員。判斷每個 claim 是否真的回答了研究子問題。
+
+## 判斷標準
+- relevant=true：claim 的資訊直接或間接有助於回答子問題（功能、性能、價格、限制、比較等）
+- relevant=false：claim 與子問題**完全無關**（公司實體地址、電話號碼、客服促銷語、無關產品廣告、作者 bio、Cookie 聲明、無關的 NAS/硬體設定教學等）
+
+## 輸出格式（嚴格 JSON array）
+[{"claim_id": "...", "relevant": true/false, "reason": "一行說明"}]
+
+只輸出 JSON，不要其他文字。"""
+
+
+def _extract_sq_descriptions(checklist_text: str) -> dict[str, str]:
+    """從 coverage.chk 解析 Q{n} → 子問題描述的映射。
+
+    coverage.chk 格式：
+        ## Q1: 市場概覽與初步篩選
+        ## Q2: 中文（台灣）轉譯準確性...
+    """
+    if not checklist_text:
+        return {}
+    result: dict[str, str] = {}
+    for m in re.finditer(r'^##\s+(Q\d+):\s+(.+)', checklist_text, re.MULTILINE):
+        sq_id = m.group(1)
+        desc = m.group(2).strip()
+        if sq_id not in result and desc:
+            result[sq_id] = desc
+    return result
+
+
+async def _batch_relevance_check(
+    sq_id: str,
+    sq_description: str,
+    approved_claims: list[Claim],
+    semaphore: asyncio.Semaphore,
+) -> dict[str, bool]:
+    """Check relevance of approved claims for one subquestion.
+
+    Runs one LLM call per SQ (batch, not per-claim).
+    Returns {claim_id: is_relevant}.
+    Conservative on failure: all claims assumed relevant (no false rejections).
+    """
+    if not approved_claims:
+        return {}
+
+    claims_text = "\n".join(
+        f"- {c.claim_id}: {c.claim_text}"
+        for c in approved_claims
+    )
+
+    user_msg = f"""## 研究子問題
+{sq_id}: {sq_description}
+
+## Claims（逐條判斷是否回答子問題）
+{claims_text}
+
+每個 claim 都必須給出判定："""
+
+    async with semaphore:
+        try:
+            response = await safe_ainvoke_chain(
+                role="verifier",
+                messages=[
+                    SystemMessage(content=_RELEVANCE_SYSTEM),
+                    HumanMessage(content=user_msg),
+                ],
+                max_tokens=600,
+                temperature=0.0,
+            )
+            text = response.content if hasattr(response, "content") else str(response)
+            m = re.search(r'\[[\s\S]*?\]', text)
+            if not m:
+                logger.warning("relevance check: no JSON array found for %s", sq_id)
+                return {c.claim_id: True for c in approved_claims}
+            parsed = json.loads(m.group())
+            return {
+                r["claim_id"]: bool(r.get("relevant", True))
+                for r in parsed
+                if isinstance(r, dict) and "claim_id" in r
+            }
+        except Exception as exc:
+            logger.warning("_batch_relevance_check failed for %s: %s", sq_id, exc)
+            # Conservative: on any error, assume all relevant (avoid false rejections)
+            return {c.claim_id: True for c in approved_claims}
+
+
+async def _run_relevance_checks(
+    claims: list[Claim],
+    workspace: str,
+) -> set[str]:
+    """Run relevance checks for all approved claims.
+
+    Reads coverage.chk to get SQ descriptions.
+    Skips SQs with no meaningful description (too risky to reject without context).
+    Returns set of claim_ids that are off-topic.
+    """
+    checklist_text = ""
+    if workspace:
+        checklist_text = read_workspace_file(workspace, "coverage.chk") or ""
+    sq_descriptions = _extract_sq_descriptions(checklist_text)
+
+    if not sq_descriptions:
+        logger.debug("relevance check: no SQ descriptions found, skipping")
+        return set()
+
+    # Group approved claims by subquestion
+    approved_by_subq: dict[str, list[Claim]] = {}
+    for c in claims:
+        if c.status == "approved":
+            approved_by_subq.setdefault(c.subquestion, []).append(c)
+
+    if not approved_by_subq:
+        return set()
+
+    # Only run for SQs with a real description (>= 5 chars)
+    sem = asyncio.Semaphore(3)  # max 3 concurrent LLM calls
+    tasks = []
+    for sq, subq_claims in approved_by_subq.items():
+        desc = sq_descriptions.get(sq, "")
+        if not desc or len(desc) < 5:
+            logger.debug("relevance check: no description for %s, skipping", sq)
+            continue
+        tasks.append(_batch_relevance_check(sq, desc, subq_claims, sem))
+
+    if not tasks:
+        return set()
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    irrelevant_ids: set[str] = set()
+    for res in results:
+        if isinstance(res, Exception):
+            logger.warning("relevance check task error: %s", res)
+            continue
+        for claim_id, is_relevant in res.items():
+            if not is_relevant:
+                irrelevant_ids.add(claim_id)
+
+    if irrelevant_ids:
+        logger.info("relevance filter: %d off-topic claims rejected", len(irrelevant_ids))
+
+    return irrelevant_ids
 
 
 ATTACK_SYSTEM = """你是攻擊型事實核查員。你的任務是嘗試證明待核對 claims 是錯的。
@@ -218,16 +559,17 @@ ATTACK_SYSTEM = """你是攻擊型事實核查員。你的任務是嘗試證明�
 
 
 async def attack_agent_node(state: VerifyState) -> dict:
-    """Adversarial fact-checking via Iterative Refinement.
+    """Adversarial fact-checking via Iterative Refinement — per-subquestion parallel.
 
     Iron rule: sub-agent has NO search tools — only local file reading.
 
-    使用 context.py 的 iterative_refine 管理 context window：
-      - 場景：攻擊式事實核查 — 多針逐字核對（claim_text vs source 原文）
-      - 風險：source 全塞時 Lost in the Middle 效應會讓中間的 source 被忽略，
-              導致本應被推翻的 claim 被放行。
-      - 策略：超過 context_threshold 時切換為 Iterative Refinement，
-              每輪只送一批 sources，確保每份 source 都被完整審閱。
+    Anti-pattern 防護（LLM 專注原則）：
+      - 過去：把所有 claims + 所有 search-results 一起塞給一個 LLM 審。
+              claims 跨子問題、source 跨子問題，LLM 看一堆無關 claim 對不上自己
+              手上 source，就會「任務多 + context 雜訊」雙重 LiM。
+      - 現在：按 claim.subquestion 分組，每組只審自己子問題的 claims + 自己
+              search-results/{subq}/ 下的 source，asyncio.gather 並發。
+              每個 LLM instance 看到的東西都是「聚焦單一子問題」，攻擊更準。
     """
     claims = state.get("claims_to_verify", [])
     workspace = state.get("workspace_path", "")
@@ -235,38 +577,81 @@ async def attack_agent_node(state: VerifyState) -> dict:
     if not claims:
         return {"attack_results": []}
 
-    # 收集所有 source 文件為 list（供 iterative_refine 分批處理）
-    source_texts: list[str] = []
-    source_files = list_workspace_files(workspace, "search-results")
-    for sf in source_files:
-        content = Path(sf).read_text(encoding="utf-8") if Path(sf).exists() else ""
-        if content:
-            source_texts.append(f"--- {Path(sf).name} ---\n{content}")
+    # 依 subquestion 分組待核對 claims
+    from collections import defaultdict
+    import asyncio
 
-    # 待核對 claims 作為 extra_context（每輪固定不變）
-    claims_text = "\n".join(
-        f"- {c.claim_id}: {c.claim_text}" for c in claims
-        if c.status in ("pending", "needs_revision")
-    )
-    extra_context = f"## 待核對 Claims\n\n{claims_text}"
+    by_subq: dict[str, list[Claim]] = defaultdict(list)
+    for c in claims:
+        if c.status in ("pending", "needs_revision"):
+            by_subq[c.subquestion or "_unknown"].append(c)
+
+    if not by_subq:
+        return {"attack_results": []}
 
     # 取 full_research_topic（從 parent state 經 workspace 讀取）
-    from deep_research.tools.workspace import read_workspace_file
     full_research_topic = read_workspace_file(workspace, "research-brief.md") or ""
 
-    # 使用 iterative_refine：context 管理 + BM25 排序 + 分批處理
-    result_text = await iterative_refine(
-        sources=source_texts,
-        full_research_topic=full_research_topic,
-        system_prompt=ATTACK_SYSTEM,
-        extra_context=extra_context,
-        tier="fast",
+    async def _attack_one_subq(subq: str, subq_claims: list[Claim]) -> list:
+        """審單一子問題的 claims — 只讀該子問題的 source。"""
+        # 先鎖定該 subq 下的 source files（支援 q1 / Q1 兩種命名）
+        source_files: list[str] = []
+        if subq and subq != "_unknown":
+            for pat in (
+                f"{subq}/**/*.md",
+                f"{subq.lower()}/**/*.md",
+                f"{subq.upper()}/**/*.md",
+            ):
+                found = list_workspace_files(workspace, "search-results", pat)
+                if found:
+                    source_files = found
+                    break
+
+        # fallback：subq 空或該目錄無檔案 → 用全部 search-results（避免 no-op）
+        if not source_files:
+            source_files = list_workspace_files(workspace, "search-results")
+
+        # 只用 metadata 檔案（S001.md），不用 _raw.md（大型 HTML）
+        # metadata 已含驗證過的逐字引用，足夠 attack agent 核對
+        meta_files = [f for f in source_files if not f.endswith("_raw.md")]
+        if meta_files:
+            source_files = meta_files
+
+        source_texts: list[str] = []
+        for sf in source_files:
+            content = Path(sf).read_text(encoding="utf-8") if Path(sf).exists() else ""
+            if content:
+                source_texts.append(f"--- {Path(sf).name} ---\n{content}")
+
+        # 只放本組 claims 到 extra_context
+        claims_text = "\n".join(
+            f"- {c.claim_id}: {c.claim_text}" for c in subq_claims
+        )
+        extra_context = f"## 待核對 Claims（{subq}）\n\n{claims_text}"
+
+        result_text = await iterative_refine(
+            sources=source_texts,
+            full_research_topic=full_research_topic,
+            system_prompt=ATTACK_SYSTEM,
+            extra_context=extra_context,
+            role="verifier",  # 攻擊式核查 = verifier 任務（Gemini 主導）
+        )
+        return _parse_attack_results(result_text)
+
+    # 每個 subquestion 一個 LLM instance 並發
+    group_results = await asyncio.gather(
+        *[_attack_one_subq(sq, sc) for sq, sc in by_subq.items()],
+        return_exceptions=True,
     )
 
-    # Parse results
-    attack_results = _parse_attack_results(result_text)
+    all_results: list = []
+    for r in group_results:
+        if isinstance(r, Exception):
+            # 個別 subq 失敗不影響其他組，但保留空結果讓後續流程知道
+            continue
+        all_results.extend(r)
 
-    return {"attack_results": attack_results}
+    return {"attack_results": all_results}
 
 
 async def process_attack_node(state: VerifyState) -> dict:
@@ -380,6 +765,15 @@ async def phase1b_verify(state: ResearchState) -> dict:
             grounding_md += f"- {r.get('claim_id', '?')}: score={r.get('score', 0):.2f} verdict={r.get('verdict', '?')}\n"
         write_workspace_file(workspace, "grounding-results/latest.md", grounding_md)
 
+    # Backfill bedrock_score + citation_verdict onto claims
+    if grounding:
+        g_map = {r["claim_id"]: r for r in grounding}
+        for c in updated_claims:
+            r = g_map.get(c.claim_id)
+            if r:
+                c.bedrock_score = r.get("score", 0.0)
+                c.citation_verdict = r.get("verdict", "")
+
     # Write/update claim ledger
     _write_claim_ledger(workspace, updated_claims)
 
@@ -397,7 +791,163 @@ async def phase1b_verify(state: ResearchState) -> dict:
     return {
         "claims": updated_claims,
         "phase1b_result": "pass" if all_resolved and not failed_dims else "fail",
+        "quality_scores": result.get("quality_scores", {}),
         "execution_log": [log_entry],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fallback trigger (parent-graph node, called after phase1b)
+# ---------------------------------------------------------------------------
+
+async def trigger_fallback_node(state: "ResearchState") -> dict:
+    """Determine which SQs need focused re-search based on grounding metrics.
+
+    Conditions for flagging a SQ:
+      - grounded_ratio < 0.3   (too few claims survived grounding)
+      - avg_bedrock   < 0.4   (claims weakly supported on average)
+      - false_dims    >= 2    (multiple quality dimensions failed)
+
+    Additionally: minimum search budget guard — for deep/standard research,
+    ensure at least 40%/50% of the budget is used before quality can pass
+    (prevents 1-round early exit with only ~9 searches out of 150).
+
+    If fallback_count >= 2: emit [BLOCKER] and let graph proceed to phase2.
+    Otherwise: populate needs_refetch and increment fallback_count.
+    """
+    from deep_research.state import ResearchState  # avoid circular import at module level
+    from deep_research.tools.workspace import append_workspace_file
+
+    quality_scores: dict = state.get("quality_scores", {})
+    claims = state.get("claims", [])
+    fallback_count: int = state.get("fallback_count", 0)
+    workspace: str = state.get("workspace_path", "")
+
+    # Normalise claims to Claim objects
+    claim_objects: list[Claim] = []
+    for c in claims:
+        if isinstance(c, Claim):
+            claim_objects.append(c)
+        elif isinstance(c, dict):
+            try:
+                claim_objects.append(Claim(**c))
+            except Exception:
+                pass
+
+    needs_refetch: list[str] = []
+    blocker_msgs: list[str] = []
+
+    # ── Minimum search budget guard ──────────────────────────────────────────
+    # Prevent pipeline from exiting Phase 1a too early (e.g. 9/150 searches).
+    # Uses large needs_refetch (all SQs) as signal; phase1a detects this and
+    # applies a higher budget cap for budget-enforcement rounds (not the 25-cap
+    # used for quality-failure focused refetch).
+    search_count: int = state.get("search_count", 0)
+    search_budget: int = state.get("search_budget", 150)
+    depth: str = state.get("depth", "deep")
+    _MIN_PCT = {"deep": 0.40, "standard": 0.50, "quick": 1.01}  # quick: never enforced
+    min_searches = int(search_budget * _MIN_PCT.get(depth, 0.40))
+    budget_ok = search_count >= min_searches
+
+    if not budget_ok and fallback_count < 2:
+        # Pull all planned SQs from coverage.chk section headers (## Q1:, ## Q2:, ...)
+        # NOTE: old regex extracted checklist items, not SQ IDs → fixed to section headers
+        from deep_research.tools.workspace import read_workspace_file as _rwf
+        coverage_txt = _rwf(workspace, "coverage.chk") or ""
+        import re as _re
+        # Extract unique Q IDs from ## Q{n}: section headers (preserves order, deduplicates)
+        planned_sqs = list(dict.fromkeys(_re.findall(r'^## (Q\d+):', coverage_txt, _re.MULTILINE)))
+        if len(planned_sqs) <= 1:
+            # Fallback: coverage.chk has only the placeholder Q1 — use claim subquestions
+            sq_from_claims = sorted({c.subquestion for c in claim_objects if c.subquestion})
+            if len(sq_from_claims) > len(planned_sqs):
+                planned_sqs = sq_from_claims
+        if len(planned_sqs) <= 1:
+            # Last resort: read subquestions count from phase0-plan.md header
+            plan_txt = _rwf(workspace, "phase0-plan.md") or ""
+            m = _re.search(r"subquestions:\s*(\d+)", plan_txt)
+            if m:
+                sq_count = int(m.group(1))
+                if sq_count > len(planned_sqs):
+                    planned_sqs = [f"Q{i+1}" for i in range(sq_count)]
+        log_msg = (
+            f"trigger_fallback: 搜尋預算不足 ({search_count}/{min_searches})，"
+            f"強制繼續搜尋 {len(planned_sqs)} 個 SQ（不計入品質失敗次數）"
+        )
+        logger.info(log_msg)
+        return {
+            "needs_refetch": planned_sqs,  # large list → phase1a uses full budget, not 25-cap
+            "fallback_count": fallback_count,  # intentionally NOT incremented
+            "execution_log": [log_msg],
+        }
+    # ──────────────────────────────────────────────────────────────────────────
+
+    for subq, dim_scores in quality_scores.items():
+        false_dims = sum(1 for v in dim_scores.values() if not v)
+        subq_claims = [c for c in claim_objects if c.subquestion == subq]
+        if not subq_claims:
+            continue
+
+        # 排除 NO_SOURCE_TEXT / UNAVAILABLE / "" 等「無法驗證」狀態（並非 ungrounded）
+        # 只對確實完成 grounding 的 claims 計算 ratio，避免工具不可用時誤觸 fallback
+        _unverifiable = {"NO_SOURCE_TEXT", "UNAVAILABLE", "ERROR", ""}
+        verifiable = [c for c in subq_claims if c.citation_verdict not in _unverifiable]
+        if verifiable:
+            grounded = [c for c in verifiable if c.citation_verdict == "GROUNDED"]
+            grounded_ratio = len(grounded) / len(verifiable)
+        else:
+            # 全部無法驗證 → ratio 設 1.0（不觸發 refetch，避免無窮迴圈）
+            grounded_ratio = 1.0
+
+        # avg_bedrock：排除預設 0.0（grounding 工具未執行）的 claims
+        scored = [c for c in subq_claims if c.bedrock_score > 0.0]
+        avg_bedrock = (
+            sum(c.bedrock_score for c in scored) / len(scored)
+            if scored else 1.0  # 沒有分數 → 不觸發 bedrock 條件
+        )
+
+        # Check trigger conditions
+        triggered = grounded_ratio < 0.3 or avg_bedrock < 0.4 or false_dims >= 2
+        if not triggered:
+            continue
+
+        reason_parts = []
+        if grounded_ratio < 0.3:
+            reason_parts.append(f"grounded_ratio={grounded_ratio:.2f}")
+        if avg_bedrock < 0.4:
+            reason_parts.append(f"avg_bedrock={avg_bedrock:.2f}")
+        if false_dims >= 2:
+            reason_parts.append(f"false_dims={false_dims}")
+        reason = ", ".join(reason_parts)
+
+        if fallback_count >= 2:
+            # Max retries reached — emit BLOCKER
+            msg = f"[BLOCKER: {subq} grounding 不足 ({reason}), 已達最大補搜次數]"
+            blocker_msgs.append(msg)
+            logger.warning(msg)
+        else:
+            needs_refetch.append(subq)
+            logger.info(f"trigger_fallback: {subq} 補搜 ({reason})")
+
+    # Append BLOCKER entries to gap-log.md for visibility
+    if blocker_msgs and workspace:
+        lines = ["\n\n## 補搜 BLOCKER（已達最大次數，強制出場）"]
+        lines.extend(f"- {m}" for m in blocker_msgs)
+        append_workspace_file(workspace, "gap-log.md", "\n".join(lines) + "\n")
+
+    new_fallback_count = fallback_count + 1 if needs_refetch else fallback_count
+
+    log_msg = (
+        f"trigger_fallback: needs_refetch={needs_refetch or '無'}, "
+        f"fallback_count={new_fallback_count}"
+        + (f", blockers={len(blocker_msgs)}" if blocker_msgs else "")
+    )
+
+    return {
+        "needs_refetch": needs_refetch,
+        "fallback_count": new_fallback_count,
+        "blockers": blocker_msgs,
+        "execution_log": [log_msg],
     }
 
 

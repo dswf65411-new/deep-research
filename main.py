@@ -14,11 +14,21 @@ Turn-based protocol (--json):
     {"status":"NEEDS_INPUT","workspace":"...","type":"clarify_retry","questions":["..."],"missing_indices":[0,2]}
     {"status":"NEEDS_INPUT","workspace":"...","type":"approve","plan_summary":"..."}
     {"status":"DONE","workspace":"..."}
+    {"status":"DONE_ASK_FOLLOWUP","workspace":"...","message":"..."}
     {"status":"ERROR","error":"..."}
 
-    {"status":"DONE_ASK_FOLLOWUP","workspace":"...","message":"..."}
+Exit codes:
+    0 = normal (turn-based pipeline may still need more turns; read stdout JSON
+        `status` field to know the next step):
+          "DONE"              — research complete
+          "NEEDS_INPUT"       — pipeline paused, waiting for user input
+          "DONE_ASK_FOLLOWUP" — done, caller may offer a follow-up round
+    1 = error (stdout JSON has {"status": "ERROR", "error": "..."})
 
-    Exit codes:  0 = done,  1 = error,  10 = needs input
+Rationale: exit code 10 previously signalled NEEDS_INPUT, but Claude Code's
+Bash tool rendered any non-zero exit as a red "Error" and misled users.
+Now only true failures return non-zero; the stdout JSON is the single source
+of truth for pipeline state.
 """
 
 from __future__ import annotations
@@ -35,7 +45,6 @@ load_dotenv(Path(__file__).parent / ".env")
 
 from deep_research.context import read_reference_files  # noqa: E402 — after load_dotenv
 
-EXIT_NEEDS_INPUT = 10
 DEFAULT_MAX_QUESTIONS = 10
 
 
@@ -274,6 +283,7 @@ async def _cli_clarify_loop(
 
     total_asked = 0
     round_num = 0
+    judge_suggested: list[str] | None = None  # Layer 3: 上輪 Judge 針對失敗維度的追問
 
     while True:
         round_num += 1
@@ -282,9 +292,15 @@ async def _cli_clarify_loop(
             _log(f"[deep-research] 已達問題上限 {max_questions}，進入規劃")
             break
 
-        questions, reasoning = await generate_questions(
-            topic, clarifications, max_questions=remaining, round_num=round_num,
-        )
+        # Adaptive Escalation: 優先使用 Judge 針對缺失維度的追問
+        if judge_suggested:
+            questions = judge_suggested[:remaining]
+            reasoning = "根據上一輪 Judge 評估的不足維度生成的針對性追問"
+            judge_suggested = None
+        else:
+            questions, reasoning = await generate_questions(
+                topic, clarifications, max_questions=remaining, round_num=round_num,
+            )
 
         if not questions:
             _log("[deep-research] LLM 認為主題已足夠明確")
@@ -319,6 +335,7 @@ async def _cli_clarify_loop(
             if remaining - len(questions) <= 0:
                 _log(f"[deep-research] 但已達問題上限 {max_questions}，繼續進行")
                 break
+            judge_suggested = suggested  # 保存到下輪使用
 
     return clarifications
 
@@ -380,7 +397,7 @@ async def skill_mode(
                         "missing_indices": real_missing,
                         "message": "以下問題的回答為空或格式不正確，請重新回答：",
                     })
-                    sys.exit(EXIT_NEEDS_INPUT)
+                    sys.exit(0)
 
                 state["clarifications"] = state.get("clarifications", []) + valid
 
@@ -404,7 +421,7 @@ async def skill_mode(
                         "missing_indices": missing,
                         "message": "以下問題的回答為空或格式不正確，請重新回答：",
                     })
-                    sys.exit(EXIT_NEEDS_INPUT)
+                    sys.exit(0)
 
                 state["clarifications"] = state.get("clarifications", []) + valid
 
@@ -439,7 +456,7 @@ async def skill_mode(
                     "max_questions": mq,
                     "judge_reasoning": judge_reason,
                 })
-                sys.exit(EXIT_NEEDS_INPUT)
+                sys.exit(0)
 
             # Clear enough (or hit limit) → generate plan
             await _do_plan_and_maybe_pause(state, ask_mode)
@@ -458,7 +475,7 @@ async def skill_mode(
                         "type": "approve_revision",
                         "message": "請說明需要修改研究計畫的哪些部分：",
                     })
-                    sys.exit(EXIT_NEEDS_INPUT)
+                    sys.exit(0)
                 # Re-generate plan with revision context
                 state["clarifications"] = state.get("clarifications", []) + [
                     {"question": "使用者對研究計畫的修改要求", "answer": revision}
@@ -480,7 +497,7 @@ async def skill_mode(
                     "plan_summary": plan,
                     "message": "已根據修改意見重新生成計畫，請確認：",
                 })
-                sys.exit(EXIT_NEEDS_INPUT)
+                sys.exit(0)
             elif phase == "approve_revision" if False else isinstance(parsed_answer, str):
                 # String answer = revision text, re-generate
                 state["clarifications"] = state.get("clarifications", []) + [
@@ -503,7 +520,7 @@ async def skill_mode(
                     "plan_summary": plan,
                     "message": "已根據修改意見重新生成計畫，請確認：",
                 })
-                sys.exit(EXIT_NEEDS_INPUT)
+                sys.exit(0)
             else:
                 await _run_full(state)
 
@@ -530,7 +547,7 @@ async def skill_mode(
                 "plan_summary": plan,
                 "message": "已根據修改意見重新生成計畫，請確認：",
             })
-            sys.exit(EXIT_NEEDS_INPUT)
+            sys.exit(0)
 
         elif phase == "followup":
             # User wants follow-up research (or says no)
@@ -593,7 +610,7 @@ async def skill_mode(
                         "max_questions": mq,
                         "ref_workspace": prev_workspace,
                     })
-                    sys.exit(EXIT_NEEDS_INPUT)
+                    sys.exit(0)
                 else:
                     await _do_plan_and_maybe_pause(new_state, True)
             else:
@@ -646,7 +663,7 @@ async def skill_mode(
                     "total_asked": len(questions),
                     "max_questions": max_questions,
                 })
-                sys.exit(EXIT_NEEDS_INPUT)
+                sys.exit(0)
             else:
                 await _do_plan_and_maybe_pause(base_state, ask_mode)
         else:
@@ -679,7 +696,7 @@ async def _do_plan_and_maybe_pause(state: dict, ask_mode: bool) -> str:
             "type": "approve",
             "plan_summary": plan,
         })
-        sys.exit(EXIT_NEEDS_INPUT)
+        sys.exit(0)
     else:
         return await _run_full(state)
 
@@ -706,7 +723,7 @@ async def _run_full(state: dict) -> str:
             "workspace": workspace,
             "message": "研究完成。有沒有想要以這份研究為基礎，深入研究的方向？（輸入想研究的方向，或 'n' 結束）",
         })
-        sys.exit(EXIT_NEEDS_INPUT)
+        sys.exit(0)
     else:
         _json_out({"status": "DONE", "workspace": workspace})
         return workspace
