@@ -887,6 +887,32 @@ async def phase1b_verify(state: ResearchState) -> dict:
             grounding_md += f"- {r.get('claim_id', '?')}: score={r.get('score', 0):.2f} verdict={r.get('verdict', '?')}\n"
         write_workspace_file(workspace, "grounding-results/latest.md", grounding_md)
 
+    # Defensive coverage assertion: a healthy run grounds every claim in to_verify
+    # (each gets either a LLM result or a NO_SOURCE_TEXT stub). In the 2026-04-14
+    # failure workspace only 17/208 claims landed a grounding entry, yet the final
+    # report still claimed "all claims verified". Catch that here so downstream
+    # audit sees the broken invariant rather than a silently truncated ledger.
+    if to_verify and len(grounding) < 0.9 * len(to_verify):
+        coverage_ratio = len(grounding) / len(to_verify) if to_verify else 0.0
+        try:
+            import datetime as _dt
+            from deep_research.tools.workspace import append_workspace_file as _append
+            ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _append(
+                workspace,
+                "gap-log.md",
+                f"\n\n## CRITICAL — Phase 1b grounding coverage degraded ({ts})\n"
+                f"- grounding_results covers {len(grounding)}/{len(to_verify)} "
+                f"claims ({coverage_ratio:.1%}), below 90% floor\n"
+                f"- downstream report cannot claim \"all claims verified\"\n",
+            )
+        except Exception:
+            logger.exception("failed to append grounding-coverage warning to gap-log.md")
+        logger.warning(
+            "phase1b grounding coverage %d/%d = %.1f%% (below 90%% floor)",
+            len(grounding), len(to_verify), coverage_ratio * 100,
+        )
+
     # Backfill bedrock_score + citation_verdict onto claims
     if grounding:
         g_map = {r["claim_id"]: r for r in grounding}

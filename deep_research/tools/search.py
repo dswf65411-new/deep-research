@@ -93,6 +93,47 @@ async def serper_search(
     return results
 
 
+async def serper_scholar(query: str, num: int = 10) -> list[dict]:
+    """Call Serper Google Scholar API directly.
+
+    Why: academic subquestions (SOTA tracking, paper comparisons, benchmarks)
+    are severely under-served by generic web search, which returns marketing
+    blogs ahead of the arxiv abstract. Scholar results include publication info,
+    citation counts, and direct PDF links — much higher signal per API call.
+
+    Mirrors the design of Tongyi DeepResearch's `tool_scholar.py`.
+
+    Returns list of {"title", "url", "description", "citedBy", "year"}.
+    """
+    if not SERPER_API_KEY:
+        return []
+
+    url = "https://google.serper.dev/scholar"
+    headers = {
+        "X-API-KEY": SERPER_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {"q": query, "num": num}
+
+    async with httpx.AsyncClient(timeout=_CLIENT_TIMEOUT) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+
+    results = []
+    for item in data.get("organic", []):
+        link = item.get("pdfUrl") or item.get("link", "")
+        results.append({
+            "title": item.get("title", ""),
+            "url": link,
+            "description": item.get("snippet", ""),
+            "citedBy": item.get("citedBy"),
+            "year": item.get("year"),
+        })
+    return results
+
+
 async def serper_scrape(url: str) -> str:
     """Call Serper Scrape API to fetch page content.
 

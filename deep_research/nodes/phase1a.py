@@ -42,10 +42,12 @@ from deep_research.tools.search import (
     BRAVE_API_KEY,
     SERPER_API_KEY,
     brave_search,
+    serper_scholar,
     serper_search,
     serper_scrape,
     web_fetch,
 )
+from deep_research.harness.url_validator import extract_arxiv_ids, extract_urls
 from deep_research.tools.workspace import (
     append_workspace_file,
     init_source_registry,
@@ -104,6 +106,7 @@ async def phase1a_search(state: ResearchState) -> dict:
     coverage = read_workspace_file(workspace, "coverage.chk") or ""
     gap_log = read_workspace_file(workspace, "gap-log.md") or ""
     exec_log = read_workspace_file(workspace, "execution-log.md") or ""
+    sq_progress = read_workspace_file(workspace, "sq-progress.md") or ""
 
     # gap_log accumulates round over round (by round 5 it holds every UNREACHABLE /
     # MISSING / CONFLICT from rounds 1-4). For the Planner, only recent gaps carry
@@ -111,6 +114,13 @@ async def phase1a_search(state: ResearchState) -> dict:
     # (~650 tokens) to avoid context amplifier effects.
     if len(gap_log) > 2000:
         gap_log = "...[earlier content omitted, keeping only recent gaps]...\n\n" + gap_log[-2000:]
+    # sq-progress.md is the Tongyi-style S_t state. Only the latest iteration's
+    # section carries signal; older ones are stale, so slice to the last
+    # "## Iteration N — per-SQ evidence snapshot" section.
+    if sq_progress:
+        last_idx = sq_progress.rfind("## Iteration")
+        if last_idx > 0:
+            sq_progress = sq_progress[last_idx:]
     # If plan exceeds 8000 chars (rare but happens), keep head and tail so the
     # Planner can still see both ends.
     if len(plan) > 8000:
@@ -184,6 +194,7 @@ async def phase1a_search(state: ResearchState) -> dict:
         plan=plan,
         coverage=coverage,
         gap_log=gap_log,
+        sq_progress=sq_progress,
         iteration=iteration,
         remaining_budget=remaining_for_llm,
         already_searched=already_searched,
@@ -217,6 +228,28 @@ async def phase1a_search(state: ResearchState) -> dict:
     url_health = await _verify_urls(search_hits)
     selected = _select_urls_by_quota(search_hits, url_health, queries)
 
+    # ── Stage 2.5: Seed URLs from phase0 plan (round 1 only, non-focus) ─
+    # URLs/arxiv IDs phase0 already validated stream straight into fetch —
+    # zero search-budget cost and no chance of search engines ranking
+    # marketing blogs above them. Closes the Phase0 → Phase1a context
+    # break that caused the 2026-04-14 failure workspace.
+    seed_urls_taken: list[str] = []
+    if iteration == 0 and not focus_mode:
+        seeds = _extract_seed_urls(plan)
+        if seeds:
+            seen_selected = {s["url"] for s in selected}
+            for seed in seeds:
+                if seed["url"] in seen_selected:
+                    continue
+                selected.append(seed)
+                seen_selected.add(seed["url"])
+                seed_urls_taken.append(seed["url"])
+            if seed_urls_taken:
+                logger.info(
+                    "phase1a: seeded %d URLs/arxiv IDs from phase0 plan (budget-free)",
+                    len(seed_urls_taken),
+                )
+
     # Cross-round URL dedup: skip URLs already fetched in prior rounds to avoid
     # wasting budget and producing duplicate claims.
     prior_fetched: set[str] = set(state.get("fetched_urls", []))
@@ -231,13 +264,18 @@ async def phase1a_search(state: ResearchState) -> dict:
     raw_sources = await _fetch_pages(selected, workspace, source_id_start)
 
     # ── Stage 3: Extractor (each page is an independent LLM call with fresh context) ──
-    extractions = await _extract_all_sources(raw_sources, workspace)
+    # Parse the SQ text index once per round — extractor uses it for the goal-aware relevance gate
+    # (Tongyi DeepResearch style: page summary is conditioned on the goal, not just a label).
+    sq_texts = _parse_sq_texts(coverage)
+    extractions = await _extract_all_sources(raw_sources, workspace, sq_texts)
 
     # ── Stage 4: Registry ────────────────────────────────────────────
     _update_source_registry(workspace, raw_sources)
     _append_execution_log(workspace, iteration, queries, searches_used)
     _log_unreachable(workspace, url_health, raw_sources)
     _log_domain_bias(workspace, iteration, existing_sources, raw_sources)
+    _log_off_topic_ratio(workspace, iteration, raw_sources)
+    _build_sq_evidence_snapshot(workspace, iteration, raw_sources, sq_texts)
 
     # Budget guard: update this round's sq_counts; write any still-underfunded SQs to gap-log
     updated_sq_counts = dict(sq_counts)
@@ -308,7 +346,7 @@ _PLANNER_SYSTEM = """You are the research-search Planner. Given the research pla
 - `serper_en`: Google English
 - `serper_tw`: Google Traditional Chinese (zh-TW query only; do not mix with brave/serper_en)
 - `serper_cn`: Google China
-- `serper_scholar`: Google + site:arxiv.org/semanticscholar.org
+- `serper_scholar`: dedicated Google Scholar API — returns pdfUrl + citation counts + publicationInfo; use this (not a `site:arxiv.org` web hack) for every E-type academic query
 
 ## Output (strict JSON, no other text)
 ```json
@@ -339,6 +377,9 @@ Rules:
 - If the Gap Log introduces a new tool name in a later round, add a category-B query for it.
 - When the user_msg contains a "newly discovered entities" field, **produce at least 1 B-type follow-up query per entity** (e.g. `{entity name} review {YEAR}` or `alternative to {entity name}`).
 - **Hard rule for academic / paper topics**: when the research involves keywords like paper, model, agent, SOTA, framework, or benchmark, **every entity in the `known tools` field must have at least 1 category-E query** (arxiv or github, pick one); these queries do not need a zh-TW counterpart.
+- **Year-bias rule for academic topics**: when the research involves paper / arxiv / SOTA / benchmark / framework / model comparison, **category E queries MUST NOT append `{YEAR}`**. Leading papers are often from prior years (e.g. AIDE 2024, MLE-bench 2024) and appending the current year silently excludes them from results. Category A/B/D still append {YEAR} (those track timely tools/prices/alternatives, not paper publication).
+- **Off-topic gap rule**: when the Gap Log flags a subquestion with `[OFF_TOPIC_RATIO >= 0.5]`, do NOT reuse that SQ's previous angles; rewrite from a different angle (e.g. switch advocate phrasing, target a different sub-aspect, or use a different entity). Producing minor rewordings that repeat the same angle counts as a rule violation.
+- **Per-SQ S_t rule** (Tongyi-style evolving state): the "Per-SQ evidence snapshot from last iteration (S_t)" section shows which SQs already have LIVE evidence (title + URL listed) and which still have `no LIVE evidence yet`. For SQs already covered by LIVE evidence, do NOT re-ask queries whose answers are visibly satisfied — probe the remaining gaps instead (missing sub-aspects, contradictions, newer evidence). For SQs marked `no LIVE evidence yet`, treat them as highest priority and rewrite the query angle aggressively.
 - **Adversarial hard rule**: every subquestion must emit at least 1 query whose `role` is `critic` AND whose wording directly attacks the subquestion's premise. Acceptable phrasings: `"{subquestion topic} failures"`, `"why {approach} does not work"`, `"criticism of {approach}"`, `"{approach} antipattern"`, `"{approach} vs alternatives"`. This is separate from general "limitations" queries — it must name a concrete failure mode or alternative. A subquestion with only advocate + generic limitation queries violates this rule.
 - Use the {YEAR} value from the user_msg's "this round's year" field.
 
@@ -363,6 +404,7 @@ async def _plan_queries(
     plan: str,
     coverage: str,
     gap_log: str,
+    sq_progress: str = "",
     iteration: int,
     remaining_budget: int,
     already_searched: list[str],
@@ -438,6 +480,14 @@ Refetch requirements:
     else:
         emerging_section = ""
 
+    # Tongyi-style evolving state S_t: compact view of last round's LIVE evidence
+    # per SQ. Planner uses this to avoid re-asking queries whose answers are
+    # already in hand, and to prioritise SQs with zero LIVE evidence.
+    if sq_progress:
+        sq_progress_section = f"\n## Per-SQ evidence snapshot from last iteration (S_t)\n{sq_progress}\n"
+    else:
+        sq_progress_section = ""
+
     user_msg = f"""## Research plan
 {plan}
 
@@ -446,7 +496,7 @@ Refetch requirements:
 
 ## Gap Log
 {gap_log}
-
+{sq_progress_section}
 ## Already-searched queries (avoid duplicates)
 {searched_text}
 {focus_section}{sq_priority_section}{year_section}{known_tools_section}{emerging_section}
@@ -526,6 +576,103 @@ def _extract_sq_ids(plan: str) -> list[str]:
     return result
 
 
+_REMOVED_MARKER_RE = re.compile(r"\[REMOVED:[^\]]*\]\([^)]+\)")
+
+
+def _extract_seed_urls(plan: str) -> list[dict]:
+    """Pull valid URLs + arxiv IDs out of the phase0 plan so phase1a can
+    directly fetch them in round 1 without spending search budget.
+
+    Why: in the 2026-04-14 failure workspace phase0 listed `arxiv.org/abs/2310.05193`
+    (ResearchAgent) and several other legitimate papers in the plan body, and
+    phase1a completely ignored them — then searched for "ResearchAgent paper"
+    and didn't find this URL. Phase0 already validated these URLs against
+    arxiv's API, so the URLs we see in the post-validation plan are the trusted
+    set (hallucinated ones were replaced with `[REMOVED: ...]` markers).
+
+    Each seed gets tagged with the SQ whose heading most recently preceded it,
+    so coverage is correctly attributed (`## Q3: ...` paragraph containing an
+    arxiv link → the seed is a Q3 source, not a Q1 source).
+
+    Returns list of dicts shaped like search hits so they can be appended to
+    ``selected`` before ``_fetch_pages`` without any pipeline changes.
+    """
+    if not plan:
+        return []
+
+    # First strip `[REMOVED: ...]` markers — we don't want to fetch known-bad URLs
+    # that phase0 already marked as hallucinated.
+    cleaned_plan = _REMOVED_MARKER_RE.sub("", plan)
+
+    # Collect (position, url) so we can resolve the nearest preceding `## Q{n}:` heading.
+    url_positions: list[tuple[int, str]] = []
+    for m in re.finditer(r"https?://[^\s<>\"')\]]+", cleaned_plan):
+        url = m.group(0).rstrip(".,;:!?)]}>，。；：、")
+        if url:
+            url_positions.append((m.start(), url))
+
+    # Synthesize arxiv URLs from bare IDs (the validator already confirmed them).
+    for m in re.finditer(r"\b(\d{4}\.\d{4,5})(?:v\d+)?\b", cleaned_plan):
+        url_positions.append((m.start(), f"https://arxiv.org/abs/{m.group(1)}"))
+
+    if not url_positions:
+        return []
+
+    # Build a list of (position, Q-id) pairs for heading lookup.
+    sq_positions: list[tuple[int, str]] = []
+    for m in re.finditer(r"^##\s+(Q\d+)(?::|\s|$)", cleaned_plan, re.MULTILINE):
+        sq_positions.append((m.start(), m.group(1)))
+
+    def _nearest_sq(pos: int) -> str:
+        nearest = "Q1"
+        for hp, qid in sq_positions:
+            if hp <= pos:
+                nearest = qid
+            else:
+                break
+        return nearest
+
+    # Dedupe while preserving first-occurrence SQ attribution.
+    seeds: list[dict] = []
+    seen_urls: set[str] = set()
+    for pos, url in sorted(url_positions):
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        seeds.append({
+            "url": url,
+            "title": "(seed from phase0 plan)",
+            "description": "",
+            "subquestion": _nearest_sq(pos),
+            "role": "seed",
+            "engines": ["seed"],
+        })
+    return seeds
+
+
+def _parse_sq_texts(coverage_md: str) -> dict[str, str]:
+    """Parse `## Q1: description` entries from coverage.chk into {sq_id: text}.
+
+    Why: the LLM extractor previously saw only "Q1" as a label — not what Q1 was
+    actually asking. So it extracted any reasonable-looking fact from the page,
+    producing on-topic-shaped but off-topic claims. Tongyi DeepResearch's visit
+    tool carries a `goal` on every page read and asks the extractor to first
+    identify which sections are relevant; if none are, the page yields nothing.
+    This function recovers the per-SQ goal text so we can apply the same gate.
+
+    coverage.chk is authoritative: _generate_coverage_checklist already
+    normalizes all phase0 plan formats (Q1:/Subquestion N:/DAG list) into the
+    same `## Q1: text` shape, so we read that rather than re-parsing the plan.
+    Placeholder lines `(to be filled by Phase 1a)` resolve to empty.
+    """
+    result: dict[str, str] = {}
+    for m in re.finditer(r"^##\s+(Q\d+):\s*(.+)$", coverage_md, re.MULTILINE):
+        sid, desc = m.group(1), m.group(2).strip()
+        if desc and "(to be filled" not in desc.lower():
+            result[sid] = desc
+    return result
+
+
 def _count_queries_per_sq(exec_log: str) -> dict[str, int]:
     """Count queries used per SQ from execution-log.md.
 
@@ -539,6 +686,144 @@ def _count_queries_per_sq(exec_log: str) -> dict[str, int]:
         sq = m.group(1)
         counts[sq] = counts.get(sq, 0) + 1
     return counts
+
+
+def _log_off_topic_ratio(
+    workspace: str,
+    iteration: int,
+    raw_sources: list[dict],
+    threshold: float = 0.5,
+) -> None:
+    """Per-SQ, how many sources got flagged OFF_TOPIC by the goal-aware extractor?
+
+    Written into gap-log so the next round's Planner can see which SQs are getting
+    systematically off-topic results and rewrite the angle. Complements
+    `_log_budget_gaps` (quantity) with a quality signal.
+
+    Only SQs whose OFF_TOPIC ratio >= threshold are logged — noise floor filter.
+    """
+    from collections import defaultdict
+    per_sq_total: dict[str, int] = defaultdict(int)
+    per_sq_off: dict[str, int] = defaultdict(int)
+    for s in raw_sources:
+        sq = s.get("subquestion") or ""
+        if not sq or not s.get("content"):
+            continue
+        per_sq_total[sq] += 1
+        if s.get("status") == "OFF_TOPIC":
+            per_sq_off[sq] += 1
+
+    flagged = []
+    for sq, total in per_sq_total.items():
+        if total < 2:
+            continue
+        off = per_sq_off.get(sq, 0)
+        ratio = off / total
+        if ratio >= threshold:
+            flagged.append((sq, off, total, ratio))
+
+    if not flagged:
+        return
+
+    lines = [f"\n\n## off-topic gap (after round {iteration})"]
+    lines.append(
+        "<!-- The goal-aware extractor rejected at least half of these SQs' sources "
+        "as NOT_RELEVANT. Next round, rewrite the SQ's query angle rather than "
+        "re-searching with minor rewording. -->"
+    )
+    for sq, off, total, ratio in flagged:
+        lines.append(
+            f"- {sq}: [OFF_TOPIC_RATIO >= {threshold:.1f}] "
+            f"{off}/{total} sources were rejected as NOT_RELEVANT vs SQ goal — rewrite angle"
+        )
+    append_workspace_file(workspace, "gap-log.md", "\n".join(lines) + "\n")
+
+
+def _build_sq_evidence_snapshot(
+    workspace: str,
+    iteration: int,
+    raw_sources: list[dict],
+    sq_texts: dict[str, str],
+) -> None:
+    """Per-SQ evidence snapshot written to sq-progress.md so the next iteration's
+    Planner sees what was **actually found**, not only what failed.
+
+    Tongyi DeepResearch Tech_Report §3.1 (Context Management): instead of passing
+    the full interaction history, pass a compact "evolving report S_t" that
+    summarises the current investigation state. This enables structured reasoning
+    and prevents the planner from re-asking queries whose answers are already in
+    hand, while still surfacing SQs with zero LIVE evidence as next-round priorities.
+
+    Complements gap-log.md (negative signal: what failed) with a positive signal
+    (what succeeded + which SQs still need help).
+    """
+    from collections import defaultdict
+    if not raw_sources:
+        return
+
+    buckets: dict[str, dict] = defaultdict(
+        lambda: {"live": [], "off_topic": 0, "unreachable": 0, "thin": 0}
+    )
+    for s in raw_sources:
+        sq = s.get("subquestion") or ""
+        if not sq:
+            continue
+        status = s.get("status")
+        b = buckets[sq]
+        if status == "LIVE":
+            title = (s.get("title") or "").strip()[:100]
+            url = s.get("url") or ""
+            if title or url:
+                b["live"].append((title, url))
+        elif status == "OFF_TOPIC":
+            b["off_topic"] += 1
+        elif status == "UNREACHABLE":
+            b["unreachable"] += 1
+        elif status == "THIN_CONTENT":
+            b["thin"] += 1
+
+    if not buckets:
+        return
+
+    def _sort_key(sq: str) -> int:
+        if sq.startswith("Q") and sq[1:].isdigit():
+            return int(sq[1:])
+        return 999
+
+    lines = [f"\n\n## Iteration {iteration + 1} — per-SQ evidence snapshot"]
+    lines.append(
+        "<!-- Tongyi-style evolving state (S_t): compact view of what was found this "
+        "round, so the next iteration's Planner can focus on genuine gaps rather than "
+        "re-asking questions whose answers are already in hand. -->"
+    )
+    for sq in sorted(buckets.keys(), key=_sort_key):
+        b = buckets[sq]
+        sq_text = sq_texts.get(sq, "")
+        header = f"- **{sq}**"
+        if sq_text:
+            header += f" — {sq_text[:80]}"
+        lines.append(header)
+        total = len(b["live"]) + b["off_topic"] + b["unreachable"] + b["thin"]
+        status_parts = [f"{total} sources this round", f"LIVE {len(b['live'])}"]
+        if b["off_topic"]:
+            status_parts.append(f"OFF_TOPIC {b['off_topic']}")
+        if b["unreachable"]:
+            status_parts.append(f"UNREACHABLE {b['unreachable']}")
+        if b["thin"]:
+            status_parts.append(f"THIN {b['thin']}")
+        lines.append(f"  - status: {', '.join(status_parts)}")
+        if b["live"]:
+            lines.append("  - LIVE evidence titles (planner: do not re-ask queries these already cover):")
+            for title, url in b["live"][:5]:
+                entry = f"    - {title or '(no title)'}"
+                if url:
+                    entry += f" — {url}"
+                lines.append(entry)
+        elif total > 0:
+            lines.append(
+                "  - **no LIVE evidence yet** — next iteration should rewrite the query angle for this SQ"
+            )
+    append_workspace_file(workspace, "sq-progress.md", "\n".join(lines) + "\n")
 
 
 def _log_budget_gaps(
@@ -937,9 +1222,10 @@ async def _run_single_search(query: str, engine: str) -> list[dict]:
         if engine == "serper_cn":
             return await serper_search(query, gl="cn", hl="zh-CN", num=10)
         if engine == "serper_scholar":
-            # Prefix the query with site:arxiv.org OR site:semanticscholar.org
-            scholar_q = f"({query}) (site:arxiv.org OR site:semanticscholar.org)"
-            return await serper_search(scholar_q, gl="us", hl="en", num=10)
+            # Hit the real Google Scholar endpoint (not site:arxiv.org on web search):
+            # gives us publication info, citation counts, and pdf links that
+            # generic web search strips out.
+            return await serper_scholar(query, num=10)
     except Exception:
         return []
     return []
@@ -1131,11 +1417,12 @@ async def _fetch_one(item: dict, idx: int) -> tuple[str, str]:
 _EXTRACTOR_SYSTEM = """You are a precise transcriber. Extract evidence relevant to the subquestion from a single source document.
 
 ## Task
-For this one source document:
-1. Locate passages relevant to the subquestion (at most 3)
-2. Copy the key sentences verbatim as QUOTE (no rewriting, summarizing, or merging)
-3. Record sentences containing numbers separately as NUMBER (must include the full original sentence)
-4. Based on these QUOTE/NUMBER items, form 1-3 pending claims
+For this one source document, in this exact order:
+1. **Relevance check** (rational): identify which sections of the source address the research goal. If NO section addresses the goal — even if the page contains well-written, factual-looking content — set rational to "NOT_RELEVANT" and return empty quotes / numbers / claims. Off-topic pages produce off-topic claims that look grounded, so the gate goes here at the entrance, not at scoring time.
+2. Locate passages relevant to the subquestion (at most 3)
+3. Copy the key sentences verbatim as QUOTE (no rewriting, summarizing, or merging)
+4. Record sentences containing numbers separately as NUMBER (must include the full original sentence)
+5. Based on these QUOTE/NUMBER items, form 1-3 pending claims
 
 ## Hard rules
 - QUOTE must be verbatim from the source; rewriting is forbidden
@@ -1172,6 +1459,7 @@ If text appears multiple times in the source, the index of any one occurrence is
 ## Output (strict JSON)
 ```json
 {
+  "rational": "1-2 sentence statement of which passages of the source address the research goal. If none, write exactly NOT_RELEVANT followed by a one-sentence reason.",
   "quotes": [
     {"quote_id": "Q1", "text": "verbatim sentence from source", "start_char": 123, "end_char": 234}
   ],
@@ -1190,7 +1478,7 @@ If text appears multiple times in the source, the index of any one occurrence is
 }
 ```
 
-Only output JSON, no other text."""
+If rational begins with NOT_RELEVANT, quotes / numbers / claims MUST be empty arrays. Only output JSON, no other text."""
 
 
 # Shared index-based quote utilities: resolve_quote_index / verify_indexed_items now live in
@@ -1204,19 +1492,30 @@ def _verify_indexed_items(raw, items, text_field, chunk_offset=0):
     )
 
 
-async def _extract_all_sources(raw_sources: list[dict], workspace: str) -> list[dict]:
+async def _extract_all_sources(
+    raw_sources: list[dict],
+    workspace: str,
+    sq_texts: dict[str, str] | None = None,
+) -> list[dict]:
     """Independent LLM call per source for extraction. rate_limiter is configured in llm.py.
 
     THIN_CONTENT sources are skipped (do not enter claim extraction).
+
+    sq_texts maps each Q id to its goal text (from coverage.chk). Passed through
+    so the extractor can gate off-topic pages; falls back to empty string when
+    the SQ text is unknown, in which case extraction works as before.
     """
+    sq_texts = sq_texts or {}
     eligible = [s for s in raw_sources if s["content"] and s.get("status") != "THIN_CONTENT"]
-    tasks = [_extract_one(src, workspace) for src in eligible]
+    tasks = [_extract_one(src, workspace, sq_texts.get(src.get("subquestion", ""), "")) for src in eligible]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     cleaned: list[dict] = []
     for src, res in zip(eligible, results):
         if isinstance(res, Exception) or not res:
             cleaned.append({"source_id": src["source_id"], "quotes": [], "numbers": [], "claims": []})
             continue
+        if res.get("off_topic"):
+            src["status"] = "OFF_TOPIC"
         cleaned.append({"source_id": src["source_id"], **res})
     return cleaned
 
@@ -1247,12 +1546,18 @@ def _strip_html_for_extraction(content: str) -> str:
     return content.strip()
 
 
-async def _extract_one(src: dict, workspace: str) -> dict | None:
+async def _extract_one(src: dict, workspace: str, sq_text: str = "") -> dict | None:
     """Run the Extractor on a single source and write the final S{id}.md.
 
     Short docs (<= _CHUNK_SIZE) use a single LLM call; long docs use sliding-window
     chunked extraction: each chunk is extracted by an independent LLM call concurrently,
     then merged, deduplicated, and renumbered.
+
+    sq_text is the research-goal body text for the SQ this source was searched
+    under (empty if the coverage.chk has no text for this Q). When non-empty, the
+    extractor is asked to first gate "is any part of this source relevant to the
+    goal?" — a NOT_RELEVANT verdict returns an empty result with off_topic=True
+    so the caller can mark the source and skip claim emission.
 
     Why we chunk: feeding a 25K-char source as a single block to the LLM causes
     mid-document quotes/numbers to be missed due to Lost in the Middle, violating
@@ -1275,9 +1580,15 @@ async def _extract_one(src: dict, workspace: str) -> dict | None:
         return None
 
     if len(raw) <= _CHUNK_SIZE:
-        data_raw = await _extract_one_pass(src, raw)
+        data_raw = await _extract_one_pass(src, raw, sq_text=sq_text)
         if not data_raw:
             return None
+        # Goal-aware gate: NOT_RELEVANT at the entrance short-circuits extraction
+        # so off-topic pages never get a chance to emit claims that look grounded.
+        rational = (data_raw.get("rational") or "").strip()
+        if rational.upper().startswith("NOT_RELEVANT"):
+            logger.info("[%s] extractor marked OFF_TOPIC vs SQ goal; skipping claim emission", src["source_id"])
+            return {"quotes": [], "numbers": [], "claims": [], "off_topic": True, "rational": rational}
         # Short doc: LLM sees the full raw, indices are global. One-pass verification suffices.
         data = {
             "quotes": _verify_indexed_items(raw, data_raw.get("quotes", []), "text"),
@@ -1285,7 +1596,10 @@ async def _extract_one(src: dict, workspace: str) -> dict | None:
             "claims": data_raw.get("claims", []),
         }
     else:
-        data = await _extract_chunked(src, raw)
+        data = await _extract_chunked(src, raw, sq_text=sq_text)
+        if data.get("off_topic"):
+            logger.info("[%s] all chunks NOT_RELEVANT; skipping claim emission", src["source_id"])
+            return {"quotes": [], "numbers": [], "claims": [], "off_topic": True}
 
     if not data:
         return None
@@ -1433,8 +1747,15 @@ async def _extract_one_pass(
     content: str,
     chunk_idx: int | None = None,
     chunk_total: int | None = None,
+    sq_text: str = "",
 ) -> dict | None:
-    """Single LLM call: extract quote/number/claim from a content segment (could be full doc or one chunk)."""
+    """Single LLM call: extract quote/number/claim from a content segment (could be full doc or one chunk).
+
+    sq_text carries the full subquestion description (parsed from coverage.chk) so the
+    LLM can perform the relevance check at the front — mirrors Tongyi DeepResearch's
+    goal-aware `readpage_jina(url, goal)` pattern. Without this, the extractor only sees
+    "Q1" as a label and produces on-topic-shaped claims from off-topic pages.
+    """
     chunk_note = ""
     if chunk_idx is not None and chunk_total is not None:
         chunk_note = (
@@ -1442,10 +1763,17 @@ async def _extract_one_pass(
             f"extract only from this chunk and do not assume surrounding context.)"
         )
 
+    goal_section = ""
+    if sq_text:
+        goal_section = f"""## Research Goal (what this source should answer)
+{src['subquestion']}: {sq_text}
+
+"""
+
     user_msg = f"""## Subquestion
 {src['subquestion']} (role: {src['role']})
 
-## Source metadata
+{goal_section}## Source metadata
 - source_id: {src['source_id']}
 - url: {src['url']}
 - title: {src['title']}{chunk_note}
@@ -1475,8 +1803,12 @@ Based on the source text above, extract QUOTE / NUMBER / claim."""
         return None
 
 
-async def _extract_chunked(src: dict, content: str) -> dict:
+async def _extract_chunked(src: dict, content: str, sq_text: str = "") -> dict:
     """Sliding-window extraction for long docs: split into chunks -> concurrent LLM calls -> merge + dedupe.
+
+    sq_text is piped through to each chunk so every chunk's LLM pass can see the goal and
+    perform its own relevance check. A page is flagged off_topic=True only when EVERY
+    chunk returns NOT_RELEVANT — a page with one relevant section still emits claims.
 
     Within each chunk, quote_id / number_id are prefixed with c{chunk_idx}- to avoid
     collisions; the outer _extract_one will then renumber IDs finally.
@@ -1507,12 +1839,14 @@ async def _extract_chunked(src: dict, content: str) -> dict:
         return {"quotes": [], "numbers": [], "claims": []}
 
     total = len(chunks)
-    tasks = [_extract_one_pass(src, chunk, idx, total) for idx, chunk in enumerate(chunks)]
+    tasks = [_extract_one_pass(src, chunk, idx, total, sq_text=sq_text) for idx, chunk in enumerate(chunks)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     merged_quotes: list[dict] = []
     merged_numbers: list[dict] = []
     merged_claims: list[dict] = []
+    successful_chunks = 0
+    not_relevant_chunks = 0
     seen_quote_spans: set[tuple[int, int]] = set()
     seen_number_spans: set[tuple[int, int]] = set()
     # Upgraded claim dedup: use normalize_for_dedup key instead of raw string
@@ -1524,6 +1858,11 @@ async def _extract_chunked(src: dict, content: str) -> dict:
 
     for chunk_idx, res in enumerate(results):
         if isinstance(res, Exception) or not res:
+            continue
+        successful_chunks += 1
+        rational = (res.get("rational") or "").strip()
+        if rational.upper().startswith("NOT_RELEVANT"):
+            not_relevant_chunks += 1
             continue
         chunk_content = chunks[chunk_idx]
         chunk_offset = offsets[chunk_idx]
@@ -1590,10 +1929,16 @@ async def _extract_chunked(src: dict, content: str) -> dict:
                 ],
             })
 
+    all_chunks_off_topic = (
+        successful_chunks > 0
+        and not_relevant_chunks == successful_chunks
+        and not merged_claims
+    )
     return {
         "quotes": merged_quotes,
         "numbers": merged_numbers,
         "claims": merged_claims,
+        "off_topic": all_chunks_off_topic,
     }
 
 
