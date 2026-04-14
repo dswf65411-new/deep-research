@@ -1,286 +1,286 @@
-# Phase 3: 報告生成 + 最終核對
+# Phase 3: Report Generation + Final Cross-Check
 
-**輸入：** 讀取 workspace 中的：
-- `workspace/report-sections/*.md`（Status: FINAL 的段落）
-- `workspace/claim-ledger.md`（approved claims）
+**Input:** read from the workspace:
+- `workspace/report-sections/*.md` (sections with Status: FINAL)
+- `workspace/claim-ledger.md` (approved claims)
 - `workspace/source-registry.md`
-- `workspace/search-results/`（最終核對用）
-- `workspace/gap-log.md`（未解問題用）
-- `workspace/phase0-plan.md`（元資料用）
+- `workspace/search-results/` (for final cross-check)
+- `workspace/gap-log.md` (for unresolved questions)
+- `workspace/phase0-plan.md` (for metadata)
 
-**輸出：** `workspace/final-report.md` + `workspace/statement-ledger.md` + `workspace/execution-log.md`
+**Output:** `workspace/final-report.md` + `workspace/statement-ledger.md` + `workspace/execution-log.md`
 
-**關鍵順序：先合併 → 先建 statement-ledger → 先核對 → 最後才寫摘要和圖表**
+**Critical ordering: merge first -> build statement-ledger first -> cross-check first -> only then write summary and charts**
 
-**本 Phase 必讀：** `prompts/ref-citation-embedding.md`
-
----
-
-## Step 1: 合併報告段落
-
-讀取所有 `workspace/report-sections/q{n}_section.md`（只讀 Status: FINAL 的），按子問題順序合併成報告主體。
-
-**此時不寫摘要、不生成圖表。** 先完成核對。
+**Required reading for this Phase:** `prompts/ref-citation-embedding.md`
 
 ---
 
-## Step 2: 建立 Statement Ledger
+## Step 1: Merge Report Sections
 
-將合併後的報告切成 statement 級別，寫入 `workspace/statement-ledger.md`：
+Read all `workspace/report-sections/q{n}_section.md` (only those with Status: FINAL) and merge them in subquestion order into the report body.
+
+**At this point do not write the summary or generate charts.** Finish the cross-check first.
+
+---
+
+## Step 2: Build the Statement Ledger
+
+Split the merged report into statement-level rows and write `workspace/statement-ledger.md`:
 
 ```markdown
 # Statement Ledger
 
 | statement_id | section | text | claim_ids | type | verified |
 |-------------|---------|------|-----------|------|----------|
-| ST-1 | Q1-正方 | "{報告中的原句}" | Q1-C1 | fact | pending |
-| ST-2 | Q1-分析 | "{推論句}" | Q1-C1,Q1-C2 | inference | pending |
-| ST-3 | Q2-數字 | "{含數字的句}" | Q2-C3 | numeric | pending |
+| ST-1 | Q1-advocate | "{original sentence in report}" | Q1-C1 | fact | pending |
+| ST-2 | Q1-analysis | "{inferential sentence}" | Q1-C1,Q1-C2 | inference | pending |
+| ST-3 | Q2-number | "{sentence containing number}" | Q2-C3 | numeric | pending |
 ```
 
-**type 分類：**
-- `fact`：直接引用來源的事實
-- `numeric`：含數字的陳述
-- `inference`：跨 claim 推導（應已標記 [INFERENCE]）
-- `opinion`：觀點表達（不需核對）
+**type classification:**
+- `fact`: fact directly quoted from the source
+- `numeric`: statement containing a number
+- `inference`: cross-claim derivation (should already be marked [INFERENCE])
+- `opinion`: opinion expression (no cross-check needed)
 
 ---
 
-## Step 3: Subagent 最終核對
+## Step 3: Subagent Final Cross-Check
 
-Spawn 一個 **Sonnet** subagent 做結構化核對。
+Spawn a **Sonnet** subagent to do a structured cross-check.
 
-**關鍵改進：subagent 核對 statement-ledger vs claim-ledger，不是自由掃全文。**
+**Key improvement: the subagent cross-checks statement-ledger vs claim-ledger, not a free-form full-text scan.**
 
-**Subagent Prompt（model: sonnet）：**
+**Subagent prompt (model: sonnet):**
 
 ```
-你是最終品質攻擊員。嘗試找出報告中的每一個錯誤。
+You are the final quality attacker. Try to find every error in the report.
 
-## 待核對 Statements
-讀取：{workspace 絕對路徑}/statement-ledger.md
-只核對 type = fact / numeric / inference 的行（跳過 opinion）。
+## Statements to cross-check
+Read: {absolute workspace path}/statement-ledger.md
+Only cross-check rows with type = fact / numeric / inference (skip opinion).
 
-## 溯源帳本
-讀取：{workspace 絕對路徑}/claim-ledger.md
+## Citation ledger
+Read: {absolute workspace path}/claim-ledger.md
 
-## 搜尋結果
-讀取：{workspace 絕對路徑}/search-results/ 目錄下所有檔案
-（用 Glob 列出所有 .md 檔，逐一讀取。缺檔跳過。）
+## Search results
+Read every file under: {absolute workspace path}/search-results/
+(Use Glob to list all .md files and read them one by one. Skip missing files.)
 
-## 核對規則（嚴格遵守）
-對每個 statement：
+## Cross-check rules (strict)
+For each statement:
 
-1. 溯源鏈完整？
-   - statement 有 claim_id → claim_id 在 claim-ledger 中 status=approved → claim 有 quote_id → quote_id 在 search-results 中存在
-   - 鏈中任一環斷裂 = BROKEN_CHAIN
+1. Citation chain complete?
+   - statement has claim_id -> claim_id exists in claim-ledger with status=approved -> claim has quote_id -> quote_id exists in search-results
+   - Any broken link = BROKEN_CHAIN
 
-2. 數字逐字核對？
-   - statement 中的數字 vs claim_text 中的數字 vs QUOTE/NUMBER 原文
-   - 任何不一致 = NUMBER_MISMATCH
+2. Numbers checked verbatim?
+   - Number in statement vs number in claim_text vs original QUOTE/NUMBER text
+   - Any mismatch = NUMBER_MISMATCH
 
-3. 語氣一致？
-   - 原文「可能」→ statement「確定」= TONE_MISMATCH
+3. Tone consistent?
+   - Original "may" -> statement "will" = TONE_MISMATCH
 
-4. 組合型幻覺？
-   - statement 引用 2+ claims 推出結論，但沒有任何單一來源說過這個結論 = COMPOSITE_HALLUCINATION
+4. Composite hallucination?
+   - Statement cites 2+ claims to derive a conclusion, but no single source has said that conclusion = COMPOSITE_HALLUCINATION
 
-5. 過度推論？
-   - [INFERENCE] 句的推導是否合理？是否超出 claim 範圍？ = OVER_INFERENCE
+5. Over-inference?
+   - Is the derivation in an [INFERENCE] sentence reasonable? Does it go beyond the scope of the claims? = OVER_INFERENCE
 
-若找不到精確支持，必須報告。禁止用「意思接近」放行。
-禁止跨來源拼出結論後判為 SUPPORTED。
+If you cannot find precise support, you must report it. Passing something as SUPPORTED on "similar meaning" is forbidden.
+Splicing a conclusion across sources and marking it SUPPORTED is forbidden.
 
-## 輸出格式
+## Output format
 STATEMENT_ID: {statement_id}
 ISSUE: NONE / BROKEN_CHAIN / NUMBER_MISMATCH / TONE_MISMATCH / COMPOSITE_HALLUCINATION / OVER_INFERENCE / NO_SOURCE
-DETAIL: {具體問題}
-FIX: {修正建議}
+DETAIL: {specific issue}
+FIX: {fix suggestion}
 ---
 
-最後輸出摘要：
+Finally, output a summary:
 TOTAL: {N} statements checked
 PASS: {N}
-FAIL: {N} (列出所有有問題的 statement_id)
+FAIL: {N} (list all problematic statement_ids)
 ```
 
 ---
 
-## Step 4: 處理 Subagent 結果
+## Step 4: Process Subagent Results
 
-更新 statement-ledger 的 `verified` 欄位：
+Update the `verified` field in statement-ledger:
 
-| Issue | 動作 |
+| Issue | Action |
 |-------|------|
 | NONE | verified = pass |
-| BROKEN_CHAIN | 補上缺失的 claim_id 或 quote_id，或刪除 statement |
-| NUMBER_MISMATCH | 修正為原文數字 |
-| TONE_MISMATCH | 弱化語氣 |
-| COMPOSITE_HALLUCINATION | 標記 [INFERENCE] 或刪除 |
-| OVER_INFERENCE | 加限定詞或移至「未解答問題」 |
-| NO_SOURCE | 刪除或補搜（**補搜最多 2 次，Fail-Fast**） |
+| BROKEN_CHAIN | add the missing claim_id or quote_id, or delete the statement |
+| NUMBER_MISMATCH | correct to the original number |
+| TONE_MISMATCH | weaken tone |
+| COMPOSITE_HALLUCINATION | mark [INFERENCE] or delete |
+| OVER_INFERENCE | add qualifiers or move to "Unanswered questions" |
+| NO_SOURCE | delete or additional search (**at most 2 additional searches, Fail-Fast**) |
 
 ---
 
-## Step 5: 引用元數據檢查（學術來源）
+## Step 5: Citation Metadata Check (academic sources)
 
-對引用**學術論文**的來源，讀取 `prompts/ref-citation-embedding.md` 的五分類學：
+For sources that cite **academic papers**, read the five-way taxonomy in `prompts/ref-citation-embedding.md`:
 
-1. **標題存在性：** 完整標題精確搜尋
-2. **元數據匹配：** 作者 + 標題 + 期刊 + 年份
-3. **識別碼驗證：** DOI/arXiv ID 有效且內容一致
+1. **Title existence:** exact search for full title
+2. **Metadata match:** author + title + journal + year
+3. **Identifier validation:** DOI/arXiv ID valid and content consistent
 
-不通過 → [FABRICATED] → 從報告移除。
+Fail -> [FABRICATED] -> remove from the report.
 
-對**非學術來源**：確認 source-registry 中 `fetched_title` 與實際引用 title 一致。
+For **non-academic sources**: confirm that `fetched_title` in source-registry matches the title actually cited.
 
 ---
 
 ## Step 6: Self-Critique
 
-以「最挑剔的審稿人」角度：
+From the perspective of "the most critical reviewer":
 
-1. 結論支撐度：每個結論有 claim_id 支持？有邏輯跳躍？
-2. 反面充分性：一面倒？
-3. 證據品質：過度依賴 T5-T6？
-4. 完整性：遺漏面向？
-5. 可操作性：結論夠具體？
+1. Conclusion support: does every conclusion have a supporting claim_id? Are there logical leaps?
+2. Counter-side adequacy: one-sided?
+3. Evidence quality: over-reliance on T5-T6?
+4. Completeness: missing facets?
+5. Actionability: are conclusions concrete enough?
 
-嚴重 → 修正（補搜，最多 2 次 Fail-Fast）。中等 → 修正文字。輕微 → 修正格式。
+Severe -> fix (additional search, at most 2, Fail-Fast). Medium -> fix wording. Minor -> fix formatting.
 
 ---
 
-## Step 7: 最終品質掃描
+## Step 7: Final Quality Scan
 
-| 檢查項 | 標準 | 不通過 |
+| Check item | Standard | Fail -> |
 |--------|------|--------|
-| 每個事實 statement 有 approved claim_id | 0 個斷鏈 | 刪除或補 |
-| 每個 claim_id 有 quote_id/number_id | 溯源鏈完整 | 補上或刪除 |
-| 正反方平衡 | 不是一面倒 | 補搜 |
-| 數字有 ORIGINAL/NORMALIZED/DERIVED 標記 | 0 個無標記數字 | 補標記 |
-| 無自我矛盾 | 邏輯一致 | 修正 |
-| **CTran = 1.0** | 所有正反衝突如實呈現 | 加回遺漏的衝突 |
+| Every factual statement has an approved claim_id | 0 broken chains | delete or backfill |
+| Every claim_id has a quote_id/number_id | citation chain complete | backfill or delete |
+| Advocate/critic balance | not one-sided | additional search |
+| Numbers marked ORIGINAL/NORMALIZED/DERIVED | 0 unmarked numbers | backfill marks |
+| No self-contradiction | logically consistent | fix |
+| **CTran = 1.0** | every pro-con conflict faithfully presented | add back missing conflicts |
 
 ---
 
-## Step 8: 現在才寫摘要和圖表
+## Step 8: Only Now Write the Summary and Charts
 
-**所有核對通過後**，才生成：
+**Only after all cross-checks pass** do you generate:
 
-**8a. 摘要（1-3 段）：**
-- 只能從 approved claims（status=approved）重組
-- 禁止從 report-section 的 prose 再自由摘要
-- 每句摘要必須對應 claim_id
+**8a. Summary (1-3 paragraphs):**
+- May only be recomposed from approved claims (status=approved)
+- Re-summarizing freely from report-section prose is forbidden
+- Every summary sentence must correspond to a claim_id
 
-**8b. Mermaid 圖表（自動判斷）：**
+**8b. Mermaid chart (auto-select):**
 
-| 主題特徵 | 圖表類型 |
+| Topic feature | Chart type |
 |---------|---------|
-| 流程/pipeline | `flowchart` |
-| 時間演進 | `timeline` |
-| 分類/結構 | `mindmap` |
-| 比較 | markdown 比較表 |
+| Pipeline/process | `flowchart` |
+| Temporal evolution | `timeline` |
+| Classification/structure | `mindmap` |
+| Comparison | markdown comparison table |
 
-不生成：Quick 模式、純 Q&A。
+Do not generate: Quick mode, pure Q&A.
 
 ---
 
-## Step 9: 組合最終報告
+## Step 9: Assemble the Final Report
 
-將以下內容組合寫入 `workspace/final-report.md`：
+Assemble and write the following into `workspace/final-report.md`:
 
 ```markdown
-# 研究報告：{主題}
+# Research Report: {topic}
 
-**研究日期：** {YYYY-MM-DD}
-**研究模式：** {模式}
-**研究深度：** {深度}
-**整體信心度：** {高/中/低} — {原因}
-**搜尋統計：** {R} 輪，{N} 不重複 URL，{M} 篇深讀
+**Research date:** {YYYY-MM-DD}
+**Research mode:** {mode}
+**Research depth:** {depth}
+**Overall confidence:** {high/medium/low} — {reason}
+**Search stats:** {R} rounds, {N} unique URLs, {M} deep-reads
 
-## 摘要
-{Step 8a 生成，每句附 claim_id}
+## Summary
+{generated in Step 8a, each sentence with claim_id}
 
-## 視覺化概覽
-{Step 8b 生成}
+## Visual Overview
+{generated in Step 8b}
 
-## 詳細分析
-{合併 report-sections}
+## Detailed Analysis
+{merged report-sections}
 
-## 利害關係人視角
-| 視角 | 觀點 | 來源 | Bedrock | claim_id |
+## Stakeholder Perspectives
+| Perspective | Viewpoint | Source | Bedrock | claim_id |
 
-## 正反方辯證記錄
-| 論點 | 正方 | 反方 | Bedrock 正 | Bedrock 反 | 裁判 |
+## Pro-Con Debate Log
+| Claim | Advocate | Critic | Bedrock (advocate) | Bedrock (critic) | Adjudicator |
 
-## 引用來源總表
-| # | 來源 | 層級 | COI | 日期 | URL 狀態 | Bedrock |
+## Citation Source Index
+| # | Source | Tier | COI | Date | URL Status | Bedrock |
 
-## 未解答問題與知識缺口
-{從 gap-log.md 匯入：缺失視角 + 薄弱證據 + 未解矛盾 + BLOCKER 項目}
+## Unanswered Questions and Knowledge Gaps
+{imported from gap-log.md: missing perspectives + weak evidence + unresolved contradictions + BLOCKER items}
 
-## 研究方法論
+## Research Methodology
 ```
 
 ---
 
-## Step 10: 更新 execution-log 最終統計
+## Step 10: Update execution-log Final Statistics
 
 ```
-## 最終統計
+## Final Statistics
 
-📊 報告品質：
-  事實 statements：{n} | 通過核對：{n} | 修正：{n} | 刪除：{n}
-  溯源鏈完整率：{n}/{total} = {pct}%
-  CTran：{x}/{y} = {ratio}
+Report quality:
+  Factual statements: {n} | passed cross-check: {n} | revised: {n} | deleted: {n}
+  Citation-chain completeness: {n}/{total} = {pct}%
+  CTran: {x}/{y} = {ratio}
 
-📊 URL：
-  ✅ LIVE：{n} | ⚠️ STALE：{n} | 🚫 HALLUCINATED：{n}
+URL:
+  LIVE: {n} | STALE: {n} | HALLUCINATED: {n}
 
-📊 不確定性分布：
-  🟢:{n} | 🟡:{n} | 🟠:{n} | 🔴:{n}
+Uncertainty distribution:
+  HIGH:{n} | MEDIUM:{n} | CONFLICTING:{n} | LOW:{n}
 
-📊 Claim Ledger：
-  Total：{n} | Approved：{n} | Rejected：{n}
+Claim Ledger:
+  Total: {n} | Approved: {n} | Rejected: {n}
 
-📊 搜尋總計：
-  搜尋次數：{n}/{budget} | 不重複 URL：{n} | 深讀：{n} 篇 | 迭代：{R} 輪
+Search totals:
+  Search calls: {n}/{budget} | unique URLs: {n} | deep-read: {n} sources | iterations: {R} rounds
 
-📊 Coverage Matrix：
-  evidence_found：{n}/{total_required}
-  searched_no_evidence：{n}
-```
-
----
-
-## Step 11: 呈現給使用者
-
-輸出最終報告，提供後續選項：
-
-```
-📌 後續選項：
-1. 針對某子問題深入研究
-2. 更新特定數據
-3. 匯出 PDF（/markdown-to-pdf）
-4. 針對 🟠/🔴 論點額外驗證
-5. 用測試驗證報告結論
+Coverage Matrix:
+  evidence_found: {n}/{total_required}
+  searched_no_evidence: {n}
 ```
 
 ---
 
-## Phase 3 完成 Checklist
+## Step 11: Present to User
+
+Output the final report and offer follow-up options:
 
 ```
-□ 1. Statement-ledger 已建立？ → {N} statements
-□ 2. Subagent 最終核對完成？ → PASS:{n} FAIL:{n}
-□ 3. 所有 FAIL statements 已處理？ → ✅
-□ 4. 學術引用元數據通過？ → {N} 篇驗證
-□ 5. Self-Critique 完成？ → 嚴重:{n} 中等:{n} 輕微:{n}
-□ 6. 最終品質掃描通過？ → ✅
-□ 7. CTran = 1.0？ → {ratio}
-□ 8. 摘要只從 approved claims 生成？ → ✅
-□ 9. final-report.md 已寫入？ → ✅
-□ 10. execution-log.md 已更新？ → ✅
-□ 11. gap-log.md 的所有項目已反映在「未解答問題」段落？ → ✅
-→ 全部 ✅ → 研究完成
+Follow-up options:
+1. Deep-dive into a specific subquestion
+2. Update specific data
+3. Export to PDF (/markdown-to-pdf)
+4. Additional validation for CONFLICTING/LOW claims
+5. Verify report conclusions via testing
+```
+
+---
+
+## Phase 3 Completion Checklist
+
+```
+[ ] 1. Statement-ledger built? -> {N} statements
+[ ] 2. Subagent final cross-check complete? -> PASS:{n} FAIL:{n}
+[ ] 3. All FAIL statements handled? -> OK
+[ ] 4. Academic-citation metadata passed? -> {N} verified
+[ ] 5. Self-Critique complete? -> severe:{n} medium:{n} minor:{n}
+[ ] 6. Final quality scan passed? -> OK
+[ ] 7. CTran = 1.0? -> {ratio}
+[ ] 8. Summary generated only from approved claims? -> OK
+[ ] 9. final-report.md written? -> OK
+[ ] 10. execution-log.md updated? -> OK
+[ ] 11. All items in gap-log.md reflected in "Unanswered questions" section? -> OK
+-> all OK -> research complete
 ```

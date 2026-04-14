@@ -156,7 +156,7 @@ async def serper_search_en_tool(query: str) -> str:
 
 @tool
 async def serper_search_tw_tool(query: str) -> str:
-    """Search Google (繁體中文) using Serper. Returns titles, URLs, and snippets."""
+    """Search Google (Traditional Chinese, zh-TW) using Serper. Returns titles, URLs, and snippets."""
     results = await serper_search(query, gl="tw", hl="zh-TW")
     if not results:
         return "No results found."

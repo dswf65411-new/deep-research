@@ -15,27 +15,32 @@ from pydantic import BaseModel, Field
 class TextSpan(BaseModel):
     """A verified character-range pointer into some source string.
 
-    語意對齊 Anthropic Claude Citations API（start_char_index/end_char_index，
-    0-based, end-exclusive, Python slice 語意）。
+    Semantics align with the Anthropic Claude Citations API (start_char_index /
+    end_char_index, 0-based, end-exclusive, Python slice semantics).
 
-    用途：引用某段文字時，不複製文字，只記 (source_ref, start, end, text)。
-      - text：引用建立當下從 source 切出的真值（保留防斷鏈）
-      - resolve(raw)：需要渲染時用 raw[start:end] 取出，避免抄字幻覺
-      - source_ref：pointer 指到哪個 raw — 通常是 source_id，但 phase3 的
-        report_span 可能指向 report 草稿字串，所以 source_ref 接受自由字串
+    Purpose: when quoting text, do not copy the text; only record
+    (source_ref, start, end, text).
+      - text: the verified value sliced from the source at quote-creation time
+        (kept as a safeguard against broken citation chains)
+      - resolve(raw): when rendering, extract via raw[start:end] to avoid
+        transcription hallucination
+      - source_ref: which raw string the pointer refers to — typically a
+        source_id, but phase3's report_span may point to the report draft
+        string, so source_ref accepts any free-form string
 
-    Invariants（phase1a 產生時已驗證）：
+    Invariants (verified at phase1a creation time):
       - 0 <= start < end <= len(original_raw)
       - original_raw[start:end] == text
     """
-    source_ref: str = Field(description="raw 的識別符（source_id / report-draft 等）")
+    source_ref: str = Field(description="identifier of raw (source_id / report-draft / etc.)")
     start: int = Field(description="start char index, 0-based, Python slice")
     end: int = Field(description="end char index, exclusive")
-    text: str = Field(description="驗證當下從 raw 切出的文字，作為斷鏈備援")
+    text: str = Field(description="text sliced from raw at verification time, used as fallback when citation chain breaks")
 
     def resolve(self, raw: str) -> str:
-        """從 raw 取回這段文字。優先走 slice；若 slice 與 text 不符（raw 被動過）
-        則退回記錄的 text（寧可用舊真值也不要抄錯）。"""
+        """Retrieve this text from raw. Prefer slicing; if the slice no longer
+        matches text (raw has been modified) fall back to the recorded text
+        (prefer the old verified value over a wrong transcription)."""
         if 0 <= self.start < self.end <= len(raw):
             sliced = raw[self.start : self.end]
             if sliced == self.text:
@@ -135,19 +140,19 @@ _upsert_sources = _upsert_by_id("source_id")
 class ResearchState(TypedDict, total=False):
     # Phase 0
     topic: str
-    full_research_topic: str  # 統整後的研究任務書（topic + refs + clarifications → LLM synthesis）
+    full_research_topic: str  # integrated research brief (topic + refs + clarifications → LLM synthesis)
     plan: str
     depth: Literal["quick", "standard", "deep"]
     search_budget: int
     search_count: Annotated[int, _replace]
     ask_mode: bool  # True = interactive (--ask), False = autonomous (--noask)
     clarifications: Annotated[list[dict], operator.add]  # Q&A pairs from clarify
-    refs: list[dict]  # 參考文件（text/image/pdf），格式見 context.py
+    refs: list[dict]  # reference files (text/image/pdf); format defined in context.py
 
     # Phase 1a
     sources: Annotated[list[Source], _upsert_sources]
     workspace_path: str
-    fetched_urls: Annotated[list[str], operator.add]  # 跨輪已抓 URL，防止重複 fetch
+    fetched_urls: Annotated[list[str], operator.add]  # URLs already fetched across rounds, to prevent re-fetching
 
     # Phase 1b
     claims: Annotated[list[Claim], _upsert_claims]

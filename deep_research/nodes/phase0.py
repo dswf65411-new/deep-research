@@ -20,6 +20,11 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from deep_research.config import get_prompt
 from deep_research.context import synthesize_research_topic
+from deep_research.harness.url_validator import (
+    annotate_invalid,
+    invalid_items,
+    validate_plan_text,
+)
 from deep_research.llm import get_llm, safe_ainvoke, safe_ainvoke_chain
 from deep_research.state import ResearchState
 
@@ -42,7 +47,7 @@ DEPTH_CONFIG = {
 # Default question limit per round
 DEFAULT_MAX_QUESTIONS = 10
 
-# QA 壓縮閾值：超過此數時，舊輪 QA 壓成主題列表
+# QA compaction threshold: when exceeded, older rounds are compressed into a topic list
 QA_COMPACT_THRESHOLD = 15
 QA_KEEP_LATEST = 5
 
@@ -50,27 +55,30 @@ QA_KEEP_LATEST = 5
 def _compact_clarifications(qas: list[dict]) -> str:
     """Format prior clarifications as context — compact when too many.
 
-    Anti-pattern 防護（LLM 專注原則）：
-      - 場景：multi-round clarification 累積到 20+ 條 QA 時，全展開塞進 LLM
-              context，模型只需「不要重複問」這個訊號，不需逐字看完整答案。
-      - 策略：QA <= 15 條全展開；> 15 條時，舊 N-5 條壓成「主題行」
-              （Q 截 30 字 + A 截 20 字），最新 5 條保留完整供深挖。
+    Anti-pattern guard (LLM focused-task principle):
+      - Scenario: when multi-round clarification accumulates 20+ QA entries,
+              dumping them all into LLM context wastes attention — the model
+              only needs the "don't re-ask" signal, not every verbatim answer.
+      - Strategy: QA <= 15 expanded in full; > 15 collapses older N-5 entries
+              into topic lines (Q truncated to 30 chars, A to 20 chars), while
+              the latest 5 stay fully expanded for deeper follow-up.
     """
     if not qas:
         return ""
 
     if len(qas) <= QA_COMPACT_THRESHOLD:
         body = "\n".join(
-            f"{i}. **問：** {qa['question']}\n   **答：** {qa['answer']}"
+            f"{i}. **Q:** {qa['question']}\n   **A:** {qa['answer']}"
             for i, qa in enumerate(qas, 1)
         )
         return (
-            "\n\n## 已取得的澄清資訊（前幾輪的結果）\n"
+            "\n\n## Clarifications collected so far (from prior rounds)\n"
             f"{body}\n"
-            "\n請不要重複問已經回答過的問題。只問新的、之前沒涵蓋到的面向。\n"
+            "\nDo not re-ask questions already answered. Only ask new aspects "
+            "not previously covered.\n"
         )
 
-    # 壓縮：舊的只留主題行，最新 5 條完整
+    # Compaction: older entries collapsed to topic lines, latest 5 kept in full
     old_qas = qas[:-QA_KEEP_LATEST]
     recent_qas = qas[-QA_KEEP_LATEST:]
 
@@ -84,16 +92,17 @@ def _compact_clarifications(qas: list[dict]) -> str:
     start_idx = len(old_qas) + 1
     for i, qa in enumerate(recent_qas, start_idx):
         recent_lines.append(
-            f"{i}. **問：** {qa['question']}\n   **答：** {qa['answer']}"
+            f"{i}. **Q:** {qa['question']}\n   **A:** {qa['answer']}"
         )
 
     return (
-        "\n\n## 已取得的澄清資訊（前幾輪的結果）\n"
-        f"### 舊輪主題（共 {len(old_qas)} 條，已壓縮為主題列表）\n"
+        "\n\n## Clarifications collected so far (from prior rounds)\n"
+        f"### Older rounds ({len(old_qas)} entries, collapsed to topic list)\n"
         + "\n".join(old_lines)
-        + f"\n\n### 最新 {len(recent_qas)} 條完整 QA\n"
+        + f"\n\n### Latest {len(recent_qas)} full QA entries\n"
         + "\n".join(recent_lines)
-        + "\n\n請不要重複問已經回答過的主題（含上方壓縮列表）。只問新的、之前沒涵蓋到的面向。\n"
+        + "\n\nDo not re-ask topics already answered (including the collapsed list above). "
+        "Only ask new aspects not previously covered.\n"
     )
 
 
@@ -122,37 +131,40 @@ async def generate_questions(
 
     round_note = ""
     if round_num > 1:
-        round_note = f"\n這是第 {round_num} 輪澄清。請根據前幾輪的回答，挖掘更深層的細節或補充遺漏的面向。\n"
+        round_note = (
+            f"\nThis is clarification round {round_num}. Based on the previous rounds' answers, "
+            "dig deeper or cover any aspects still missing.\n"
+        )
 
-    system_msg = SystemMessage(content=f"""你是深度研究規劃器的澄清模組。
+    system_msg = SystemMessage(content=f"""You are the clarification module of a deep-research planner.
 
-根據使用者的研究主題，判斷是否需要澄清。盡量多問多釐清 — 澄清是提升研究品質最重要的環節。
+Given the user's research topic, decide whether clarification is needed. Ask generously — clarification is the single most important lever for research quality.
 
-如果主題已經完全明確（所有面向都已涵蓋），才回覆空的 questions 陣列。
+Only return an empty `questions` array when the topic is fully clear on every aspect.
 {round_note}
-生成最多 {max_questions} 個問題。每個問題都要說明「為什麼需要知道這個」。
+Generate at most {max_questions} questions. Each question must state "why do we need to know this".
 
-考慮以下面向（只問需要的）：
-1. 研究目的：做決策？寫報告？學習？解決具體問題？
-2. 期望產出：比較表？推薦結論？客觀呈現？深度技術分析？
-3. 範圍邊界：包含/排除什麼？時間範圍？地域限制？
-4. 背景知識：使用者已經了解什麼？已經排除什麼選項？
-5. 特定偏好：技術棧限制、預算範圍、團隊規模？
-6. 成功標準：什麼樣的研究結果對使用者最有價值？
-7. 利害關係人：研究結果的受眾是誰？需要說服誰？
-8. 時效性：需要多新的資料？是否有截止日期？
-9. 深度 vs 廣度：偏好全面概覽還是某幾個面向的深入分析？
-10. 已知限制：有什麼已知的約束條件？
+Consider the following aspects (only ask what's needed):
+1. Research purpose: making a decision? writing a report? learning? solving a concrete problem?
+2. Expected output: comparison table? recommendation? objective presentation? in-depth technical analysis?
+3. Scope boundaries: what is included/excluded? time range? geographic constraints?
+4. Background knowledge: what does the user already know? which options have been ruled out?
+5. Specific preferences: tech stack constraints, budget range, team size?
+6. Success criteria: what kind of result would be most valuable to the user?
+7. Stakeholders: who is the audience for the result? who needs to be convinced?
+8. Recency: how fresh must the data be? is there a deadline?
+9. Depth vs breadth: broad overview, or deep analysis of a few aspects?
+10. Known constraints: any known limitations?
 {context}
 
-回覆格式（嚴格 JSON）：
-{{"questions": ["問題1（為什麼需要知道：原因）", "問題2（為什麼需要知道：原因）"], "reasoning": "這輪為什麼要問這些"}}
+Reply format (strict JSON):
+{{"questions": ["Question 1 (why we need to know: reason)", "Question 2 (why we need to know: reason)"], "reasoning": "why this round asks these"}}
 
-如果不需要再問：
-{{"questions": [], "reasoning": "主題已完全明確，原因是..."}}""")
+If no further questions are needed:
+{{"questions": [], "reasoning": "Topic is fully clear because..."}}""")
 
-    human_msg = HumanMessage(content=f"研究主題：{topic}")
-    # role="writer" — 規劃 / 提問類，Claude Opus 主導
+    human_msg = HumanMessage(content=f"Research topic: {topic}")
+    # role="writer" — planning / question generation, Claude Opus leads
     response = await safe_ainvoke_chain(
         role="writer",
         messages=[system_msg, human_msg],
@@ -234,59 +246,59 @@ def validate_answers(
 CLARITY_DIMENSIONS = [
     {
         "id": "purpose",
-        "name": "研究目的",
+        "name": "research purpose",
         "required": True,
-        "question": "使用者的研究目的是否具體到可以判斷研究成功還是失敗？",
-        "pass_example": "「為公司客服系統選擇 AI 框架」→ 有具體場景和目標",
-        "fail_example": "「了解 AI」→ 太模糊，無法判斷成敗",
+        "question": "Is the user's research purpose concrete enough to tell success from failure?",
+        "pass_example": "\"Pick an AI framework for our customer-service system\" → concrete scenario and goal",
+        "fail_example": "\"Understand AI\" → too vague, no way to judge success",
     },
     {
         "id": "scope",
-        "name": "範圍界定",
+        "name": "scope",
         "required": True,
-        "question": "研究的邊界（時間範圍、地域範圍、技術範圍）是否明確？是否有可能無限發散？",
-        "pass_example": "「2024 年後的開源框架，排除付費 SaaS」→ 有明確邊界",
-        "fail_example": "沒有任何邊界條件的說明 → 可能無限發散",
+        "question": "Are the research boundaries (time, geography, technical scope) explicit? Could it diverge indefinitely?",
+        "pass_example": "\"Open-source frameworks after 2024, excluding paid SaaS\" → clear boundaries",
+        "fail_example": "No boundary statement at all → could diverge without end",
     },
     {
         "id": "output_format",
-        "name": "產出格式",
+        "name": "output format",
         "required": True,
-        "question": "使用者期望什麼形式的研究結果？",
-        "pass_example": "「需要比較表 + 最終推薦 + 風險評估」→ 交付物明確",
-        "fail_example": "不知道要比較表、推薦結論、還是客觀呈現",
+        "question": "What form of research result does the user expect?",
+        "pass_example": "\"Need a comparison table + final recommendation + risk assessment\" → deliverables are clear",
+        "fail_example": "Unclear whether a comparison table, a recommendation, or objective presentation is expected",
     },
     {
         "id": "success_criteria",
-        "name": "成功標準",
+        "name": "success criteria",
         "required": True,
-        "question": "有沒有明確的評估維度或標準來判斷研究成果好壞？",
-        "pass_example": "「從效能、成本、社群活躍度三個維度比較」→ 有評估框架",
-        "fail_example": "沒有評估維度或標準 → 無法判斷好壞",
+        "question": "Are there explicit evaluation dimensions or criteria for judging the result?",
+        "pass_example": "\"Compare along performance, cost, and community activity\" → has an evaluation framework",
+        "fail_example": "No evaluation dimensions or criteria → no way to tell good from bad",
     },
     {
         "id": "consistency",
-        "name": "一致性",
+        "name": "consistency",
         "required": True,
-        "question": "問答記錄中的所有回答是否邏輯一致、沒有自相矛盾？",
-        "pass_example": "所有回答邏輯一致，沒有矛盾",
-        "fail_example": "說「不限預算」但又說「越便宜越好」→ 存在矛盾",
+        "question": "Are all answers in the Q&A record logically consistent, with no self-contradiction?",
+        "pass_example": "All answers logically consistent, no contradictions",
+        "fail_example": "Says \"no budget limit\" but also \"cheaper the better\" → contradictory",
     },
     {
         "id": "constraints",
-        "name": "已知約束",
+        "name": "known constraints",
         "required": False,
-        "question": "使用者有沒有說明硬性限制（技術棧、預算、團隊規模、合規要求）？",
-        "pass_example": "「必須支持 Python，預算 1000 美元以內」→ 約束明確",
-        "fail_example": "未提及任何限制（可能有但沒說）",
+        "question": "Has the user stated hard constraints (tech stack, budget, team size, compliance)?",
+        "pass_example": "\"Must support Python, budget under US$1000\" → constraints are clear",
+        "fail_example": "No constraints mentioned (may exist but not stated)",
     },
     {
         "id": "depth_breadth",
-        "name": "深度 vs 廣度",
+        "name": "depth vs breadth",
         "required": False,
-        "question": "使用者偏好全面概覽還是聚焦特定面向的深入分析？",
-        "pass_example": "「深入比較前 3 名的技術細節」→ 偏好明確",
-        "fail_example": "未表達偏好 → 不知道該做廣還是深",
+        "question": "Does the user prefer a broad overview or deep analysis of specific aspects?",
+        "pass_example": "\"Deep dive into the technical details of the top 3\" → preference is clear",
+        "fail_example": "No preference stated → unclear whether to go broad or deep",
     },
 ]
 
@@ -294,18 +306,19 @@ CLARITY_DIMENSIONS = [
 def _build_rubric_system_prompt(dims: list[dict] | None = None) -> str:
     """Build the rubric evaluation system prompt for a given dimension subset.
 
-    傳入 None 時用全部 7 dim（向後相容）；正式呼叫應傳子集，每組 3-4 dim 避免
-    LLM 對中段 dim 注意力下降（Lost in the Middle）。
+    Passing None uses all 7 dims (backward compatible); production calls should
+    pass a subset of 3-4 dims per group to avoid Lost-in-the-Middle attention
+    drop on dims in the middle of a longer list.
     """
     target = dims if dims is not None else CLARITY_DIMENSIONS
     dims_text = ""
     for i, dim in enumerate(target, 1):
-        req_label = "必要" if dim["required"] else "加分"
+        req_label = "required" if dim["required"] else "bonus"
         dims_text += f"""
-### {i}. {dim['name']} ({dim['id']}) 【{req_label}】
-判定：{dim['question']}
-- PASS：{dim['pass_example']}
-- FAIL：{dim['fail_example']}
+### {i}. {dim['name']} ({dim['id']}) [{req_label}]
+Judge: {dim['question']}
+- PASS: {dim['pass_example']}
+- FAIL: {dim['fail_example']}
 """
 
     dim_ids_json = ", ".join(
@@ -313,32 +326,33 @@ def _build_rubric_system_prompt(dims: list[dict] | None = None) -> str:
         for d in target
     )
 
-    return f"""你是獨立的研究品質評審（Judge）。你與提問的 LLM 完全獨立 — 你沒有看到它的推理過程，你只看到研究主題和問答記錄。
+    return f"""You are an independent research-quality Judge. You are fully independent of the asking LLM — you do not see its reasoning, only the research topic and the Q&A record.
 
-## Evidence-Anchored 規則（鐵律）
-1. 每個維度的判定必須引述使用者的原文作為依據
-2. 若使用者原文中找不到支持「已充分」的證據 → 必須判定 FAIL
-3. 不可推測使用者可能的意圖，只根據已明確提供的資訊判斷
-4. 每個維度獨立評估 — 不要讓某個維度的判定影響其他維度
-5. FAIL 的維度必須提供一個針對性的追問問題（說明「為什麼需要知道」）
+## Evidence-Anchored rules (hard rules)
+1. Every dimension's verdict must quote the user's original text as evidence.
+2. If the user's text contains no evidence supporting "sufficient" → the verdict must be FAIL.
+3. Do not infer user intent; judge only based on information that was explicitly provided.
+4. Evaluate each dimension independently — do not let one dimension's verdict influence another.
+5. Any FAIL dimension must produce a targeted follow-up question (including "why we need to know").
 
-## 評估維度（本批共 {len(target)} 個，逐一獨立評估）
+## Evaluation dimensions ({len(target)} in this batch; judge each independently)
 {dims_text}
-## 回覆格式（嚴格 JSON，不要加任何其他文字）
+## Reply format (strict JSON, no other text)
 {{"dimensions": [{dim_ids_json}]}}
 
-每個維度的欄位：
-- id: 維度 ID（必須與上方一致）
-- verdict: "PASS" 或 "FAIL"
-- evidence: 使用者原文中支持此判定的直接引述（FAIL 則說明缺少什麼）
-- reason: 判定理由（一句話）
-- question: 若 FAIL，追問問題（為什麼需要知道：原因）；若 PASS 則空字串 ""
+Fields per dimension:
+- id: dimension ID (must match above)
+- verdict: "PASS" or "FAIL"
+- evidence: direct quote from user's original text supporting the verdict (for FAIL, state what is missing)
+- reason: one-line justification
+- question: for FAIL, the follow-up question (with "why we need to know: reason"); for PASS, empty string ""
 """
 
 
-# Group A：required 維度（核心，前 4 個）
-# Group B：optional 維度（後 3 個）
-# 拆兩組各別 call，每次只評 3-4 dim，避免 LiM 影響中段判斷品質
+# Group A: required dimensions (core, first 4)
+# Group B: optional dimensions (last 3)
+# Two separate calls, each judging only 3-4 dims, to avoid LiM degrading the
+# middle dimensions' judgment quality.
 _DIM_GROUP_A = [d for d in CLARITY_DIMENSIONS if d["required"]]
 _DIM_GROUP_B = [d for d in CLARITY_DIMENSIONS if not d["required"]]
 
@@ -367,13 +381,13 @@ async def _evaluate_dim_group(
     group: str,
     tier: str,
 ) -> list[dict]:
-    """評估一組 dim（3-4 個），回傳 list of dim verdict dict。失敗回空 list。"""
+    """Evaluate one group of dims (3-4). Returns a list of dim verdict dicts; empty on failure."""
     try:
         llm = get_llm(tier=tier, max_tokens=4096, temperature=0.0, provider=provider)
         system_msg = SystemMessage(content=_get_rubric_prompt(group))
         human_msg = HumanMessage(content=(
-            f"## 研究主題\n{topic}\n\n"
-            f"## 已完成的澄清問答\n{qa_text or '（尚未進行任何澄清）'}"
+            f"## Research topic\n{topic}\n\n"
+            f"## Completed clarification Q&A\n{qa_text or '(no clarification yet)'}"
         ))
         response = await safe_ainvoke(llm, [system_msg, human_msg])
         text = response.content.strip()
@@ -396,10 +410,10 @@ async def _evaluate_single_judge(
 ) -> dict | None:
     """One provider evaluates all dimensions via rubric — split into 2 groups.
 
-    Group A: required 維度（核心 4 個）
-    Group B: optional 維度（3 個）
-    並發兩次 call，每次只評 3-4 dim。比一次評 7 dim 顯著降低 Lost in the Middle
-    對中段維度的影響。
+    Group A: required dimensions (4 core)
+    Group B: optional dimensions (3)
+    Two concurrent calls, each judging only 3-4 dims. Substantially reduces
+    Lost-in-the-Middle impact on middle dims vs judging all 7 at once.
     """
     import asyncio as _asyncio
     a_results, b_results = await _asyncio.gather(
@@ -492,7 +506,7 @@ def _build_judge_verdict(
     # --- Build reasoning string ---
     n_providers = len(providers_used)
     provider_names = ", ".join(providers_used)
-    lines = [f"## 澄清充分性評估（{n_providers} 模型: {provider_names}）\n"]
+    lines = [f"## Clarification sufficiency evaluation ({n_providers} models: {provider_names})\n"]
 
     for dim in CLARITY_DIMENSIONS:
         dim_id = dim["id"]
@@ -500,7 +514,7 @@ def _build_judge_verdict(
             "verdict": "FAIL", "pass_count": 0, "fail_count": 0, "total": 0,
             "reasons": [], "questions": [],
         })
-        req_label = "必要" if dim["required"] else "加分"
+        req_label = "required" if dim["required"] else "bonus"
         verdict = result["verdict"]
         marker = "[PASS]" if verdict == "PASS" else "[FAIL]"
         votes = f"{result['pass_count']}/{result['total']}"
@@ -512,15 +526,15 @@ def _build_judge_verdict(
 
     lines.append("")
     if is_clear:
-        lines.append("結論：所有必要維度通過。")
+        lines.append("Conclusion: all required dimensions passed.")
         if optional_fails:
             names = ", ".join(d["name"] for d in optional_fails)
-            lines.append(f"  （{names} 未明確，但不影響研究進行）")
+            lines.append(f"  ({names} unclear, but does not block the research)")
     else:
         fail_names = ", ".join(d["name"] for d in required_fails)
         lines.append(
-            f"結論：{len(required_fails)} 個必要維度未通過（{fail_names}），"
-            f"建議針對性追問。"
+            f"Conclusion: {len(required_fails)} required dimensions failed ({fail_names}); "
+            f"targeted follow-up recommended."
         )
 
     reasoning = "\n".join(lines)
@@ -559,7 +573,7 @@ async def judge_clarity(
     # Format Q&A text
     qa_text = ""
     for i, qa in enumerate(clarifications, 1):
-        qa_text += f"{i}. 問：{qa['question']}\n   答：{qa['answer']}\n\n"
+        qa_text += f"{i}. Q: {qa['question']}\n   A: {qa['answer']}\n\n"
 
     # Layer 2: Get available providers for PoLL (up to 3 diverse families)
     providers = get_available_providers()[:3]
@@ -584,7 +598,7 @@ async def judge_clarity(
             valid_results = [fallback]
         else:
             # Total failure — default to clear to not block the user
-            return (True, "（所有評估模型均失敗，預設通過）", [])
+            return (True, "(all evaluation models failed; defaulting to pass)", [])
 
     providers_used = [r["provider"] for r in valid_results]
 
@@ -600,8 +614,9 @@ async def judge_clarity(
 async def phase0_plan(state: ResearchState) -> dict:
     """Generate research plan from topic + clarifications (graph node).
 
-    同時統整 topic + refs + clarifications → full_research_topic，
-    作為整個研究流程的固定 context（prompt prefix caching 友善）。
+    Also integrates topic + refs + clarifications → full_research_topic,
+    which acts as the stable context for the whole research pipeline
+    (prompt prefix caching friendly).
     """
     topic = state["topic"]
     depth = state.get("depth", "deep")
@@ -613,20 +628,27 @@ async def phase0_plan(state: ResearchState) -> dict:
     instructions = get_prompt("phase0-clarify.md")
     workspace_path = create_workspace(topic)
 
-    # Step 1: 先統整 research brief（topic + refs + clarifications → 結構化任務書）
-    # 這份任務書消除矛盾、補充隱含需求，品質遠高於 raw QA 對
+    # Step 1: integrate into a research brief (topic + refs + clarifications → structured brief).
+    # The brief resolves contradictions and surfaces implicit requirements — much higher
+    # quality than raw QA pairs.
     full_research_topic = await synthesize_research_topic(topic, refs, clarifications)
 
-    # Step 2: 用統整後的 research brief 生成計畫（而非 raw clarifications）
+    # Step 2: generate the plan using the integrated research brief (not the raw clarifications).
     plan_content = await _generate_plan(
         topic, depth, budget, config, clarifications, instructions,
         research_brief=full_research_topic,
     )
 
+    # Step 2b: verify that every arxiv ID / URL the plan cites really exists (guard against LLM hallucination).
+    # The failure workspace from 2026-04-14 had 4 future-dated arxiv IDs in the plan; this step catches them at the source.
+    plan_content, validation_log = await _validate_and_annotate_plan(
+        plan_content, workspace_path
+    )
+
     # Write workspace files
     _write_workspace_files(workspace_path, topic, budget, clarifications, plan_content)
 
-    # 也將 full_research_topic 寫入 workspace 供參考
+    # Also write full_research_topic to the workspace for reference
     write_workspace_file(workspace_path, "research-brief.md", full_research_topic)
 
     return {
@@ -638,7 +660,10 @@ async def phase0_plan(state: ResearchState) -> dict:
         "workspace_path": workspace_path,
         "iteration_count": 0,
         "coverage_status": {},
-        "execution_log": [f"Phase 0 完成：workspace={workspace_path}，研究任務書已統整"],
+        "execution_log": [
+            f"Phase 0 complete: workspace={workspace_path}, research brief integrated",
+            *validation_log,
+        ],
     }
 
 
@@ -671,81 +696,83 @@ async def phase0_plan_standalone(
 # ---------------------------------------------------------------------------
 
 def _build_plan_system_prompt(depth: str, budget: int, config: dict) -> str:
-    """Plan 生成專用 system prompt — 從 phase0-clarify.md 抽取出 Step 9 的必要規則。
+    """System prompt dedicated to plan generation — extracts the essential rules from
+    Step 9 of phase0-clarify.md.
 
-    原本 `_generate_plan` 把整份 phase0-clarify.md（~2500 tokens）塞 system_msg，
-    但 Step 1-8（澄清提問 / 題型分流 / perspective discovery / 搜尋策略流程等）
-    和「只產出 plan markdown」無關 — 純 distractor。這裡 inline ~500 tokens 精簡版，
-    只保留 plan 生成需要的格式範本 + 硬性規則。
+    Originally `_generate_plan` stuffed the entire phase0-clarify.md (~2500 tokens)
+    into the system message, but Steps 1-8 (clarifying questions, topic triage,
+    perspective discovery, search strategy flow, etc.) are unrelated to the task of
+    producing plan markdown — pure distractors. This inlines a ~500-token distilled
+    version keeping only the format template plus hard rules that plan generation needs.
     """
     subq_cap = config["subquestions"]
     iter_cap = config["iterations"]
     current_year = datetime.now().year
-    return f"""你是深度研究規劃器。根據研究主題和任務書，產出 markdown 格式的完整研究計畫。
+    return f"""You are a deep-research planner. Given the research topic and brief, produce a complete research plan in markdown.
 
-## 時間背景
-- 當前年份：{current_year}
-- freshness_sla 的「最新」和「近期」均指 {current_year} 年以內
-- 搜尋 query 中的年份請使用 {current_year}（例如 "best tools {current_year}"、"最新 {current_year} 推薦"）
-- 不得在 query 中使用 {current_year - 1} 或更早年份作為「最新」
+## Time context
+- Current year: {current_year}
+- "latest" and "recent" in freshness_sla refer to within {current_year}
+- Use {current_year} for the year in search queries (e.g. "best tools {current_year}", "top tools {current_year} recommendation")
+- Do not use {current_year - 1} or earlier years as "latest" in queries
 
-## 必須覆蓋的八個要素
-1. 題型分流（Adversarial / Temporal / Funnel / Multi-Stakeholder）
-2. Query Enrichment（PICO + 來源優先級 + 防幻覺錨點）
-3. 利害關係人視角（至少 1 advocate + 1 critic）
-4. 子問題 DAG（含 facets、依賴、執行順序）— 數量上限 {subq_cap}
-5. 搜尋策略（第一輪最小 query 集 + 後續觸發規則）
-6. 預算分配（每子問題配額 × 迭代數），總預算 {budget} 次
-7. 幻覺高風險區域（數字型 / 因果型 / 趨勢型 / 比較型）
-8. 納入/排除標準
+## Eight required elements
+1. Topic triage (Adversarial / Temporal / Funnel / Multi-Stakeholder)
+2. Query Enrichment (PICO + source priority + anti-hallucination anchors)
+3. Stakeholder perspectives (at least 1 advocate + 1 critic)
+4. Subquestion DAG (facets, dependencies, execution order) — at most {subq_cap}
+5. Search strategy (minimum query set for round 1 + triggers for later rounds)
+6. Budget allocation (quota per subquestion × iterations), total budget {budget}
+7. High-hallucination-risk areas (numeric / causal / trend / comparative)
+8. Inclusion / exclusion criteria
 
-## 輸出格式（嚴格遵循）
+## Output format (strict)
 ```markdown
-# 研究計畫
+# Research Plan
 
-## 結構化 Header
-- topic: {{主題}}
-- mode: {{Adversarial / Temporal / Funnel / Multi-Stakeholder / 組合}}
+## Structured Header
+- topic: {{topic}}
+- mode: {{Adversarial / Temporal / Funnel / Multi-Stakeholder / combination}}
 - depth: {depth}
 - budget: {budget}
 - freshness_sla:
-  - numeric: {{N}} 個月
-  - policy: {{N}} 個月
-  - background: {{N}} 個月
+  - numeric: {{N}} months
+  - policy: {{N}} months
+  - background: {{N}} months
   - historical_exempt: true/false
-- subquestions: {{N}} 個
-- perspectives: {{N}} 個
-- total_coverage_units: {{N}} 個（required: {{M}}）
+- subquestions: {{N}}
+- perspectives: {{N}}
+- total_coverage_units: {{N}} (required: {{M}})
 
 ## Query Enrichment
-{{PICO + 來源優先級 + 防幻覺錨點}}
+{{PICO + source priority + anti-hallucination anchors}}
 
-## 利害關係人視角
-{{視角清單 + 各自關注和搜尋角度}}
+## Stakeholder perspectives
+{{perspective list + each one's concerns and search angles}}
 
-## 子問題 DAG
-{{子問題 + facets + 依賴 + 執行順序}}
+## Subquestion DAG
+{{subquestions + facets + dependencies + execution order}}
 
-## 搜尋策略
-{{第一輪最小 query 集 + 後續觸發規則}}
+## Search Strategy
+{{minimum query set for round 1 + triggers for later rounds}}
 
-## 預算分配
-{{分配表}}
+## Budget Allocation
+{{allocation table}}
 
-## 幻覺高風險區域
-{{哪些論點需特別驗證}}
+## High-hallucination-risk areas
+{{which claims need extra verification}}
 
-## 納入/排除標準
-- 納入：{{語言、時間、地域、來源類型}}
-- 排除：{{排除項}}
+## Inclusion / Exclusion criteria
+- Include: {{language, time, geography, source types}}
+- Exclude: {{exclusions}}
 ```
 
-## 硬性規則
-- 子問題數量 <= {subq_cap}
-- 迭代輪次 <= {iter_cap}
-- 每個子問題必須 advocate + critic 雙視角覆蓋
-- 語言：繁體中文（技術術語保留原文）
-- 研究深度：{depth}"""
+## Hard rules
+- Subquestions <= {subq_cap}
+- Iterations <= {iter_cap}
+- Every subquestion must cover both advocate and critic perspectives
+- Language: English (keep technical terms in their original form)
+- Research depth: {depth}"""
 
 
 async def _generate_plan(
@@ -760,30 +787,33 @@ async def _generate_plan(
     """Call LLM to generate research plan.
 
     Args:
-        research_brief: 統整後的研究任務書（優先使用）。
-            若提供，作為主要 context；raw clarifications 僅作為補充附錄。
-            若未提供（standalone 模式），退化為直接使用 raw clarifications。
-        instructions: 保留參數向後相容，但實際不再整份塞入 system_msg
-            （原本塞 phase0-clarify.md 全文 ~2500 tokens 是 distractor）。
+        research_brief: The integrated research brief (preferred).
+            If provided, used as the primary context; raw clarifications act as a
+            supplementary appendix only. If not provided (standalone mode), falls
+            back to using raw clarifications directly.
+        instructions: Kept for backward compatibility, but the full text is no
+            longer stuffed into system_msg (dumping the whole phase0-clarify.md
+            ~2500 tokens was a distractor).
     """
-    _ = instructions  # 顯式棄用，保留簽名避免 caller 破壞
+    _ = instructions  # explicitly deprecated; signature kept to avoid breaking callers
 
     if research_brief:
-        # 統整後的 brief 已消除矛盾、補充隱含需求，品質更高
-        context_section = f"\n\n## 研究任務書（統整後）\n\n{research_brief}"
+        # The integrated brief already resolves contradictions and surfaces implicit
+        # requirements — higher quality than raw QA.
+        context_section = f"\n\n## Research brief (integrated)\n\n{research_brief}"
     elif clarifications:
-        # Fallback: standalone 模式沒有 brief，用 raw QA
-        context_section = "\n\n## 使用者澄清資訊\n"
+        # Fallback: standalone mode has no brief — use raw QA
+        context_section = "\n\n## User clarifications\n"
         for qa in clarifications:
-            context_section += f"- **問：** {qa['question']}\n  **答：** {qa['answer']}\n"
+            context_section += f"- **Q:** {qa['question']}\n  **A:** {qa['answer']}\n"
     else:
         context_section = ""
 
     system_msg = SystemMessage(
         content=_build_plan_system_prompt(depth, budget, config) + context_section
     )
-    human_msg = HumanMessage(content=f"研究主題：{topic}")
-    # role="writer" — 規劃任務書，Claude Opus 主導
+    human_msg = HumanMessage(content=f"Research topic: {topic}")
+    # role="writer" — brief / plan generation, Claude Opus leads
     response = await safe_ainvoke_chain(
         role="writer",
         messages=[system_msg, human_msg],
@@ -791,6 +821,84 @@ async def _generate_plan(
         temperature=0.3,
     )
     return response.content
+
+
+async def _validate_and_annotate_plan(
+    plan_content: str,
+    workspace_path: str,
+) -> tuple[str, list[str]]:
+    """Check every arxiv ID / URL the planner produced and tag hallucinated ones.
+
+    Runs against:
+      - https://export.arxiv.org/api/query (arxiv IDs)
+      - HEAD requests for any URL in the plan
+
+    Known-bad references are replaced with a ``[REMOVED: hallucinated ...]``
+    marker so downstream phases can't accidentally use them as seeds.
+    Unreachable (timeout / 500) URLs are left alone — absence of evidence
+    is not evidence of absence.
+
+    Validation results are written to
+    ``<workspace>/plan-url-validation.json`` and a human-readable summary
+    is appended to ``execution-log.md``. Cache lives in
+    ``<workspace>/.arxiv-validation-cache.json`` (per-workspace; cross-
+    workspace caching is P3 scope).
+    """
+    from pathlib import Path as _Path
+
+    cache_path = _Path(workspace_path) / ".arxiv-validation-cache.json"
+    log_entries: list[str] = []
+
+    try:
+        validation = await validate_plan_text(plan_content, cache_path=cache_path)
+    except Exception as exc:
+        logger.warning("phase0 plan validation skipped due to error: %s", exc)
+        log_entries.append(f"Phase 0 plan validation skipped ({exc})")
+        return plan_content, log_entries
+
+    bad = invalid_items(validation)
+    annotated = annotate_invalid(plan_content, validation)
+
+    try:
+        write_workspace_file(
+            workspace_path,
+            "plan-url-validation.json",
+            json.dumps(
+                {
+                    "arxiv": validation.get("arxiv", {}),
+                    "urls": validation.get("urls", {}),
+                    "summary": bad,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+        )
+    except Exception:
+        logger.exception("phase0: failed to write plan-url-validation.json")
+
+    if bad["hallucinated_arxiv"] or bad["hallucinated_urls"]:
+        log_entries.append(
+            f"⚠️ Phase 0 plan validation: removed {len(bad['hallucinated_arxiv'])} hallucinated arxiv IDs, "
+            f"{len(bad['hallucinated_urls'])} hallucinated URLs"
+        )
+        if bad["hallucinated_arxiv"]:
+            log_entries.append(
+                "  - hallucinated arxiv: " + ", ".join(bad["hallucinated_arxiv"][:10])
+            )
+        if bad["hallucinated_urls"]:
+            log_entries.append(
+                "  - hallucinated URLs: " + ", ".join(bad["hallucinated_urls"][:5])
+            )
+    else:
+        arxiv_count = len(validation.get("arxiv", {}))
+        url_count = len(validation.get("urls", {}))
+        if arxiv_count or url_count:
+            log_entries.append(
+                f"✅ Phase 0 plan validation: {arxiv_count} arxiv IDs all validation passed, "
+                f"0 hallucinated out of {url_count} URLs ({len(bad['unreachable_urls'])} temporarily unreachable)"
+            )
+
+    return annotated, log_entries
 
 
 def _write_workspace_files(
@@ -807,7 +915,7 @@ def _write_workspace_files(
     init_gap_log(workspace_path)
 
     if clarifications:
-        clarify_log = "# 澄清記錄\n\n"
+        clarify_log = "# Clarifications\n\n"
         for i, qa in enumerate(clarifications, 1):
             clarify_log += f"## Q{i}: {qa['question']}\n\n{qa['answer']}\n\n"
         write_workspace_file(workspace_path, "clarifications.md", clarify_log)
@@ -819,31 +927,39 @@ def _write_workspace_files(
 def _generate_coverage_checklist(plan: str) -> str:
     """Extract a basic coverage checklist skeleton from the plan text.
 
-    Handles three common plan formats:
-      1. "Q1: description" / "Q1：description" (English-style, e.g. "Q1: iPhone 錄音方案")
-      2. "子問題 N: description" / "子問題 N：description" (Chinese with colon)
-      3. Numbered list under "子問題 DAG": "1. **title**" or "1.  **title (Execution Order: N)**"
+    Handles these common plan formats:
+      1. "Q1: description" / "Q1: description" (English-style)
+      2. "Subquestion N: description" (English with colon)
+      3. Numbered list under "Subquestion DAG": "1. **title**" or "1.  **title (Execution Order: N)**"
 
     Deduplicates by Q ID (first occurrence wins) and truncates long
     descriptions (e.g. lines containing embedded \\n ASCII diagrams).
 
-    Last resort: parse "- subquestions: N 個" from the plan header and generate
+    Last resort: parse "- subquestions: N" from the plan header and generate
     N placeholder sections so budget guard never gets a degenerate 1-SQ list.
     """
     lines = ["# Coverage Checklist\n"]
 
     # Format 1: Q1/Q2 style
-    raw_matches = re.findall(r"\b(Q\d+)\s*[:：]\s*(.+)", plan)
+    raw_matches = re.findall(r"\b(Q\d+)\s*:\s*(.+)", plan)
 
     if not raw_matches:
-        # Format 2: 子問題 N: style (possibly wrapped in **)
-        sq_raw = re.findall(r"子問題\s*(\d+)\s*[:：]\s*([^*\n]+)", plan)
+        # Format 2: "Subquestion N:" style (possibly wrapped in **)
+        sq_raw = re.findall(
+            r"subquestion\s*(\d+)\s*:\s*([^*\n]+)",
+            plan,
+            re.IGNORECASE,
+        )
         if sq_raw:
             raw_matches = [(f"Q{n}", desc.strip()) for n, desc in sq_raw]
 
     if not raw_matches:
-        # Format 3: numbered list items within "子問題 DAG" section
-        dag_match = re.search(r"## 子問題 DAG\s*\n(.*?)(?=\n## |\Z)", plan, re.DOTALL)
+        # Format 3: numbered list items within "Subquestion DAG" section
+        dag_match = re.search(
+            r"##\s+subquestion\s+dag\s*\n(.*?)(?=\n## |\Z)",
+            plan,
+            re.DOTALL | re.IGNORECASE,
+        )
         if dag_match:
             dag_content = dag_match.group(1)
             # Match "N.  **title (Execution Order: N)**" or "N. **title**"
@@ -867,7 +983,7 @@ def _generate_coverage_checklist(plan: str) -> str:
         sq_count_match = re.search(r"subquestions:\s*(\d+)", plan)
         sq_count = int(sq_count_match.group(1)) if sq_count_match else 1
         for i in range(1, sq_count + 1):
-            lines.append(f"\n## Q{i}: (待 Phase 1a 填入)")
+            lines.append(f"\n## Q{i}: (to be filled by Phase 1a)")
             lines.append("- [ ] advocate — not_started")
             lines.append("- [ ] critic — not_started")
 

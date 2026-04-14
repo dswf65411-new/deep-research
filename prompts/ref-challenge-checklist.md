@@ -1,54 +1,54 @@
-# 22 項質疑清單（正反方互相適用）
+# 22-Item Challenge Checklist (mutually applicable to advocate and critic)
 
-Phase 1b Step 5 辯證時使用。正反方互相用這份清單攻擊對方論點，質疑成立就觸發補搜。
+Used during Phase 1b Step 5 debate. Advocate and critic use this checklist to attack each other's claims; a sustained challenge triggers an additional search.
 
-## 一、來源可信度（#1-4）
+## I. Source Credibility (#1-4)
 
-| # | 質疑 | 判定 | 動作 |
+| # | Challenge | Decision | Action |
 |---|------|------|------|
-| 1 | **利益衝突**：來源方有商業動機？ | 被評對象的官方/合作方 | 標記 [COI]，搜獨立第三方 |
-| 2 | **來源層級低**：只有 T5-T6？ | 對照 source-criteria.md | 搜更高層級來源 |
-| 3 | **同源**：多來源轉述同一原始資料？ | 追溯引用鏈 | 只計 1 個獨立來源，補搜 |
-| 4 | **無法存取**：URL 打不開 | WebFetch+瀏覽器都失敗 | 標記 [UNVERIFIABLE] |
+| 1 | **Conflict of interest**: does the source party have a commercial motive? | Official/partner of the evaluation target | Mark [COI], search independent third parties |
+| 2 | **Low tier**: only T5-T6? | Compare against source-criteria.md | Search higher-tier sources |
+| 3 | **Same origin**: multiple sources relaying the same original material? | Trace the citation chain | Count as 1 independent source, additional search |
+| 4 | **Inaccessible**: URL won't open | WebFetch + browser both fail | Mark [UNVERIFIABLE] |
 
-## 二、數據品質（#5-9）
+## II. Data Quality (#5-9)
 
-| # | 質疑 | 判定 | 動作 |
+| # | Challenge | Decision | Action |
 |---|------|------|------|
-| 5 | **過時**：超過 12 個月？ | 檢查日期 | 搜最新數據 |
-| 6 | **樣本不足**：benchmark 太小？ | 檢查樣本量 | 搜更大規模測試 |
-| 7 | **方法論不透明** | 無測試方法描述 | 標記 [METHODOLOGY UNCLEAR] |
-| 8 | **精度可疑**：無統計檢定？ | 無 p-value/CI | 標記 [UNVERIFIED PRECISION] |
-| 9 | **Cherry-picking** | 與其他來源矛盾 | 搜完整數據集 |
+| 5 | **Stale**: over 12 months? | Check the date | Search for latest data |
+| 6 | **Sample too small**: benchmark too small? | Check sample size | Search larger-scale tests |
+| 7 | **Opaque methodology** | No description of test method | Mark [METHODOLOGY UNCLEAR] |
+| 8 | **Suspicious precision**: no statistical test? | No p-value/CI | Mark [UNVERIFIED PRECISION] |
+| 9 | **Cherry-picking** | Contradicts other sources | Search the full dataset |
 
-## 三、邏輯推理（#10-14）
+## III. Logical Reasoning (#10-14)
 
-| # | 質疑 | 判定 | 動作 |
+| # | Challenge | Decision | Action |
 |---|------|------|------|
-| 10 | **因果謬誤**：相關≠因果 | A+B 同時 ≠ A→B | 搜因果實驗 |
-| 11 | **倖存者偏差** | 只有成功案例 | 搜失敗案例 |
-| 12 | **過度概化** | 少數推整體 | 搜反例 |
-| 13 | **稻草人** | 曲解對方論點 | 回原始來源 |
-| 14 | **訴諸權威** | 無實質論據 | 搜實質證據 |
+| 10 | **Causation fallacy**: correlation != causation | A+B together != A->B | Search causal experiments |
+| 11 | **Survivorship bias** | Only success cases | Search failure cases |
+| 12 | **Overgeneralization** | From minority to whole | Search counter-examples |
+| 13 | **Straw-man** | Distorts opponent's claim | Return to original source |
+| 14 | **Appeal to authority** | No substantive argument | Search substantive evidence |
 
-## 四、完整性（#15-19）
+## IV. Completeness (#15-19)
 
-| # | 質疑 | 判定 | 動作 |
+| # | Challenge | Decision | Action |
 |---|------|------|------|
-| 15 | **地域偏見** | 來源集中某地區 | 搜其他地區 |
-| 16 | **語言偏見** | 只有英文 | 搜其他語言 |
-| 17 | **時間軸不完整** | 缺歷史或趨勢 | 搜 history/trend |
-| 18 | **利害關係人遺漏** | 未涵蓋受影響方 | 搜 impact/regulation |
-| 19 | **替代方案未考慮** | 遺漏重要選項 | 搜 alternatives |
+| 15 | **Geographic bias** | Sources concentrated in one region | Search other regions |
+| 16 | **Language bias** | English only | Search other languages |
+| 17 | **Incomplete timeline** | No history or trend | Search history/trend |
+| 18 | **Missing stakeholders** | Impacted parties not covered | Search impact/regulation |
+| 19 | **Alternatives not considered** | Important options missing | Search alternatives |
 
-## 五、量化支撐（#20-22）
+## V. Quantitative Support (#20-22)
 
-| # | 質疑 | 判定 | 動作 |
+| # | Challenge | Decision | Action |
 |---|------|------|------|
-| 20 | **空泛評價**：沒數字 | 無具體數字 | 搜 benchmark |
-| 21 | **缺比較基準** | 無 baseline | 搜競品數據 |
-| 22 | **單位不一致** | 無法比較 | 新增 [DERIVED] 欄位換算（保留 ORIGINAL 不動），列出公式和來源 |
+| 20 | **Vague assessment**: no numbers | No specific numbers | Search benchmarks |
+| 21 | **No baseline for comparison** | No baseline | Search competitor data |
+| 22 | **Unit inconsistency** | Cannot compare | Add [DERIVED] column for conversion (keep ORIGINAL intact), list formula and source |
 
-## Grounding 加持
+## Grounding Augmentation
 
-質疑時用 Bedrock 量化比較：「正方 grounding 0.85 vs 反方 0.62 → 正方更有根據」。
+When challenging, use Bedrock for quantitative comparison: "advocate grounding 0.85 vs critic grounding 0.62 -> advocate is better grounded".

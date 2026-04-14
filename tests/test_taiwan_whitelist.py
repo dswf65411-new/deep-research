@@ -1,8 +1,8 @@
-"""Smoke tests for Taiwan Whitelist + serper_tw enforcement — issue #3 fix.
+"""Smoke tests for Taiwan Whitelist + serper_tw enforcement - issue #3 fix.
 
 Verifies:
 - _TAIWAN_DOMAIN_WHITELIST contains expected Taiwan domains
-- _PLANNER_SYSTEM enforces zh-TW → serper_tw only rule
+- _PLANNER_SYSTEM enforces zh-TW -> serper_tw only rule
 - _PLANNER_SYSTEM has Taiwan site: locking section
 - brave_search accepts country and search_lang optional params
 """
@@ -43,7 +43,7 @@ def test_taiwan_whitelist_no_english_only_domains():
 
 
 # ---------------------------------------------------------------------------
-# _PLANNER_SYSTEM — zh-TW → serper_tw rule
+# _PLANNER_SYSTEM - zh-TW -> serper_tw rule
 # ---------------------------------------------------------------------------
 
 def test_planner_system_enforces_zhtw_serper_tw():
@@ -56,22 +56,22 @@ def test_planner_system_enforces_zhtw_serper_tw():
 def test_planner_system_no_mixing_rule():
     """Must state that zh-TW must NOT mix with brave/serper_en."""
     from deep_research.nodes.phase1a import _PLANNER_SYSTEM
-    assert "不可加 brave" in _PLANNER_SYSTEM or "不可與 brave" in _PLANNER_SYSTEM
+    assert "must not add brave" in _PLANNER_SYSTEM or "must not mix with brave" in _PLANNER_SYSTEM
 
 
 def test_planner_system_serper_tw_exclusive_note():
     """serper_tw engine description must note it's exclusive to zh-TW queries."""
     from deep_research.nodes.phase1a import _PLANNER_SYSTEM
-    assert "zh-TW query 專用" in _PLANNER_SYSTEM
+    assert "zh-TW query only" in _PLANNER_SYSTEM
 
 
 # ---------------------------------------------------------------------------
-# _PLANNER_SYSTEM — Taiwan site: locking section
+# _PLANNER_SYSTEM - Taiwan site: locking section
 # ---------------------------------------------------------------------------
 
 def test_planner_system_has_taiwan_locking_section():
     from deep_research.nodes.phase1a import _PLANNER_SYSTEM
-    assert "台灣來源鎖定" in _PLANNER_SYSTEM
+    assert "Taiwan source locking" in _PLANNER_SYSTEM
 
 
 def test_planner_system_has_ithome_site():
@@ -88,15 +88,15 @@ def test_planner_system_taiwan_queries_use_serper_tw():
     """Taiwan site: section must instruct to use serper_tw exclusively."""
     from deep_research.nodes.phase1a import _PLANNER_SYSTEM
     # Both the section header and the engine rule must appear
-    assert "台灣來源鎖定" in _PLANNER_SYSTEM
+    assert "Taiwan source locking" in _PLANNER_SYSTEM
     # After the section header, serper_tw must be mentioned as the required engine
-    section_start = _PLANNER_SYSTEM.index("台灣來源鎖定")
+    section_start = _PLANNER_SYSTEM.index("Taiwan source locking")
     section_text = _PLANNER_SYSTEM[section_start:section_start + 600]
     assert "serper_tw" in section_text
 
 
 # ---------------------------------------------------------------------------
-# brave_search — country and search_lang params
+# brave_search - country and search_lang params
 # ---------------------------------------------------------------------------
 
 def test_brave_search_signature_has_country():

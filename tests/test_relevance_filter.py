@@ -22,34 +22,34 @@ from deep_research.state import Claim
 
 
 # ---------------------------------------------------------------------------
-# _extract_sq_descriptions — pure function, no LLM
+# _extract_sq_descriptions - pure function, no LLM
 # ---------------------------------------------------------------------------
 
 SAMPLE_CHECKLIST = """# Coverage Checklist
 
 
-## Q1: 市場概覽與初步篩選
-- [ ] advocate — not_started
-- [ ] critic — not_started
+## Q1: market overview and initial screening
+- [ ] advocate - not_started
+- [ ] critic - not_started
 
-## Q2: 中文（台灣）轉譯準確性與說話者分離能力評估
-- [ ] advocate — not_started
-- [ ] critic — not_started
+## Q2: Chinese (Taiwan) transcription accuracy and speaker diarization assessment
+- [ ] advocate - not_started
+- [ ] critic - not_started
 
-## Q3: 使用者介面、操作體驗與編輯功能比較
-- [x] advocate — done
+## Q3: UI, operating experience, and editing feature comparison
+- [x] advocate - done
 
-## Q4: 定價模式與性價比分析
-- [ ] advocate — not_started
+## Q4: pricing model and value analysis
+- [ ] advocate - not_started
 """
 
 
 def test_extract_sq_descriptions_parses_correctly():
     desc = _extract_sq_descriptions(SAMPLE_CHECKLIST)
-    assert desc["Q1"] == "市場概覽與初步篩選"
-    assert desc["Q2"] == "中文（台灣）轉譯準確性與說話者分離能力評估"
-    assert desc["Q3"] == "使用者介面、操作體驗與編輯功能比較"
-    assert desc["Q4"] == "定價模式與性價比分析"
+    assert desc["Q1"] == "market overview and initial screening"
+    assert desc["Q2"] == "Chinese (Taiwan) transcription accuracy and speaker diarization assessment"
+    assert desc["Q3"] == "UI, operating experience, and editing feature comparison"
+    assert desc["Q4"] == "pricing model and value analysis"
 
 
 def test_extract_sq_descriptions_empty_text():
@@ -73,28 +73,28 @@ def test_extract_sq_descriptions_deduplicates():
 
 def test_extract_sq_descriptions_handles_mixed_format():
     """Only ## Q{n}: format matched; inline Q1 text not captured."""
-    text = "## Q1: 主題一\n\nSome text mentioning Q1 again.\n\n## Q2: 主題二"
+    text = "## Q1: topic one\n\nSome text mentioning Q1 again.\n\n## Q2: topic two"
     desc = _extract_sq_descriptions(text)
     assert set(desc.keys()) == {"Q1", "Q2"}
 
 
 # ---------------------------------------------------------------------------
-# _run_relevance_checks — no workspace / no coverage.chk → returns empty set
+# _run_relevance_checks - no workspace / no coverage.chk -> returns empty set
 # ---------------------------------------------------------------------------
 
 def test_run_relevance_checks_no_workspace():
-    """Empty workspace path → skip relevance check → return empty set."""
+    """Empty workspace path -> skip relevance check -> return empty set."""
     claims = [
-        _approved_claim("Q1-C1", "Q1", "Whisper Large v3 WER 為 8.3%"),
+        _approved_claim("Q1-C1", "Q1", "Whisper Large v3 WER is 8.3%"),
     ]
     result = asyncio.run(
         _run_relevance_checks(claims, "")
     )
-    assert result == set(), "No workspace → conservative, no rejections"
+    assert result == set(), "No workspace -> conservative, no rejections"
 
 
 def test_run_relevance_checks_no_approved_claims():
-    """All claims still pending → nothing to check → empty set."""
+    """All claims still pending -> nothing to check -> empty set."""
     claims = [
         _pending_claim("Q1-C1", "Q1", "some text"),
         _rejected_claim("Q1-C2", "Q1", "other text"),
@@ -106,7 +106,7 @@ def test_run_relevance_checks_no_approved_claims():
 
 
 # ---------------------------------------------------------------------------
-# quality_eval_node — relevance dimension in dim_scores
+# quality_eval_node - relevance dimension in dim_scores
 # Note: this test mocks _run_relevance_checks to avoid LLM calls.
 # ---------------------------------------------------------------------------
 
@@ -125,8 +125,8 @@ def test_quality_eval_relevance_dim_in_scores(monkeypatch):
     )
 
     claims = [
-        _approved_claim("Q1-C1", "Q1", "Whisper WER 為 8.3%"),
-        _approved_claim("Q1-C2", "Q1", "MacWhisper 支援本機端模型"),
+        _approved_claim("Q1-C1", "Q1", "Whisper WER is 8.3%"),
+        _approved_claim("Q1-C2", "Q1", "MacWhisper supports local models"),
     ]
     grounding = [
         {"claim_id": "Q1-C1", "score": 0.9, "verdict": "GROUNDED"},
@@ -161,8 +161,8 @@ def test_quality_eval_relevance_false_when_offtopic(monkeypatch):
     )
 
     claims = [
-        _approved_claim("Q1-C1", "Q1", "Whisper WER 為 8.3%"),
-        _approved_claim("Q1-C2", "Q1", "公司地址: 台北市信義路 1 號"),
+        _approved_claim("Q1-C1", "Q1", "Whisper WER is 8.3%"),
+        _approved_claim("Q1-C2", "Q1", "company address: 1 Xinyi Road, Taipei"),
     ]
     grounding = [
         {"claim_id": "Q1-C1", "score": 0.9, "verdict": "GROUNDED"},
@@ -192,7 +192,7 @@ def test_quality_eval_relevance_false_when_offtopic(monkeypatch):
 
 
 def test_quality_eval_offtopic_reduces_actionability(monkeypatch):
-    """If all claims for a SQ are off-topic → actionability=False → needs_attack."""
+    """If all claims for a SQ are off-topic -> actionability=False -> needs_attack."""
     from deep_research.nodes.phase1b import quality_eval_node
     from deep_research.state import VerifyState
 
@@ -205,8 +205,8 @@ def test_quality_eval_offtopic_reduces_actionability(monkeypatch):
     )
 
     claims = [
-        _approved_claim("Q1-C1", "Q1", "地址資訊 A"),
-        _approved_claim("Q1-C2", "Q1", "地址資訊 B"),
+        _approved_claim("Q1-C1", "Q1", "address information A"),
+        _approved_claim("Q1-C2", "Q1", "address information B"),
     ]
     grounding = [
         {"claim_id": "Q1-C1", "score": 0.9, "verdict": "GROUNDED"},
@@ -223,7 +223,7 @@ def test_quality_eval_offtopic_reduces_actionability(monkeypatch):
     scores = result["quality_scores"]
     failed = result["failed_dimensions"]
 
-    # All claims rejected → actionability=False
+    # All claims rejected -> actionability=False
     assert scores["Q1"]["actionability"] is False
     assert "actionability" in failed
 

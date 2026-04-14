@@ -1,8 +1,8 @@
-# 本地驗證工具 CLI 參考
+# Local Validation Tools CLI Reference
 
-所有驗證工具為 CLI 模式，腳本位於專案內 `grounding_scripts/`。統一透過 Bash tool 呼叫，輸入 JSON 至 stdin，輸出 JSON 至 stdout。
+All validation tools run in CLI mode; scripts live under `grounding_scripts/` in the project. They are called uniformly via the Bash tool, with JSON piped into stdin and JSON emitted to stdout.
 
-## 路徑設定
+## Path Setup
 ```
 PY=<project>/.venv/bin/python3
 GS=<project>/grounding_scripts
@@ -11,37 +11,37 @@ MINICHECK_PY=<project>/.minicheck-venv/bin/python3
 
 ---
 
-## 1. Bedrock Grounding Check（主要驗證）
+## 1. Bedrock Grounding Check (primary validator)
 
 ```bash
 echo '{"claims":["claim1","claim2"],"sources":["source text"]}' | $PY $GS/bedrock-guardrails.py --cli
 ```
 
-可選參數：`guardrail_id`（預設 981o7pz3ze8q）、`threshold`（預設 0.7）、`region`（預設 us-east-1）
+Optional arguments: `guardrail_id` (default 981o7pz3ze8q), `threshold` (default 0.7), `region` (default us-east-1)
 
-輸出：`summary.grounding_rate` + 每個 claim 的 `grounding_score` 和 `verdict`（GROUNDED / NOT_GROUNDED）
+Output: `summary.grounding_rate` + per-claim `grounding_score` and `verdict` (GROUNDED / NOT_GROUNDED)
 
 ---
 
-## 2. MiniCheck（備用驗證）
+## 2. MiniCheck (fallback validator)
 
 ```bash
 echo '{"claims":["claim1"],"sources":["source text"]}' | $MINICHECK_PY $GS/minicheck.py --cli
 ```
 
-注意：首次呼叫需載入模型 ~30 秒，後續 ~1 秒/claim。
+Note: the first call loads the model in ~30 seconds; subsequent calls are ~1 second per claim.
 
-輸出：`summary.support_rate` + 每個 claim 的 `confidence` 和 `supported`（true/false）
+Output: `summary.support_rate` + per-claim `confidence` and `supported` (true/false)
 
 ---
 
-## 3. NeMo Grounding Check（第三備用）
+## 3. NeMo Grounding Check (third fallback)
 
 ```bash
 echo '{"claims":["claim1"],"sources":["source text"],"threshold":0.7}' | $PY $GS/nemo-guardrails.py --cli
 ```
 
-輸出：`summary.grounding_rate` + 每個 claim 的 `grounding_score` 和 `verdict`
+Output: `summary.grounding_rate` + per-claim `grounding_score` and `verdict`
 
 ---
 
@@ -51,23 +51,23 @@ echo '{"claims":["claim1"],"sources":["source text"],"threshold":0.7}' | $PY $GS
 echo '{"urls":["https://example.com"],"timeout":15}' | $PY $GS/urlhealth.py --cli
 ```
 
-輸出：每個 URL 的 `status`（LIVE / STALE / LIKELY_HALLUCINATED / UNKNOWN）
+Output: per-URL `status` (LIVE / STALE / LIKELY_HALLUCINATED / UNKNOWN)
 
 ---
 
-## Grounding 工具可用性檢查
+## Grounding Tool Availability Check
 
-Phase 1b 開始前必須執行：
+Must be run before Phase 1b:
 
 ```bash
-# 測試 Bedrock
+# Test Bedrock
 echo '{"claims":["The sky is blue."],"sources":["The sky is blue during a clear day."]}' | $PY $GS/bedrock-guardrails.py --cli 2>/dev/null
 
-# 若失敗，測試 MiniCheck
+# If it fails, test MiniCheck
 echo '{"claims":["The sky is blue."],"sources":["The sky is blue during a clear day."]}' | $MINICHECK_PY $GS/minicheck.py --cli 2>/dev/null
 
-# 若也失敗，測試 Nemo
+# If that also fails, test Nemo
 echo '{"claims":["The sky is blue."],"sources":["The sky is blue during a clear day."]}' | $PY $GS/nemo-guardrails.py --cli 2>/dev/null
 ```
 
-三者全部失敗 → 停止研究，報錯 `[GROUNDING-UNAVAILABLE]`。
+All three fail -> stop research, raise `[GROUNDING-UNAVAILABLE]`.

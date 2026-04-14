@@ -44,8 +44,27 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 from deep_research.context import read_reference_files  # noqa: E402 — after load_dotenv
+from deep_research.harness.secret_scanner import redact_secrets  # noqa: E402
 
 DEFAULT_MAX_QUESTIONS = 10
+
+
+def _redact_user_text(text: str, source_label: str) -> str:
+    """Redact secrets from ``text`` and warn the user via stderr.
+
+    Used at all user-input entry points (answers, follow-ups, reference files)
+    so secrets never enter the pipeline in the clear.
+    """
+    redacted, secrets = redact_secrets(text)
+    if secrets:
+        types = ", ".join(sorted({s.type for s in secrets}))
+        print(
+            f"\n[WARN] Detected {len(secrets)} sensitive credential(s) in {source_label} ({types}); "
+            f"automatically masked as [REDACTED_<TYPE>]. Consider passing the environment variable "
+            f"name instead of the actual value.",
+            flush=True,
+        )
+    return redacted
 
 
 def format_references_as_context(refs: list[dict]) -> str:
@@ -59,9 +78,10 @@ def format_references_as_context(refs: list[dict]) -> str:
     parts = []
     for ref in refs:
         if ref["type"] == "text":
-            parts.append(f"### 參考資料：{ref['name']}\n\n{ref['content']}")
+            safe_content = _redact_user_text(ref["content"], f"reference file {ref['name']}")
+            parts.append(f"### Reference: {ref['name']}\n\n{safe_content}")
         elif ref["type"] == "image":
-            parts.append(f"### 參考圖片：{ref['name']}（圖片內容，將由 LLM 視覺理解）")
+            parts.append(f"### Reference image: {ref['name']} (image content, to be interpreted by LLM vision)")
     return "\n\n---\n\n".join(parts)
 
 
@@ -76,7 +96,7 @@ def refs_to_clarification(refs: list[dict]) -> dict | None:
     context = format_references_as_context(refs)
     filenames = ", ".join(r["name"] for r in refs)
     return {
-        "question": f"使用者提供的參考資料（{filenames}）",
+        "question": f"Reference materials supplied by the user ({filenames})",
         "answer": context,
     }
 
@@ -87,7 +107,11 @@ def refs_to_clarification(refs: list[dict]) -> dict | None:
 
 def save_state(workspace: str, state: dict) -> None:
     path = Path(workspace) / ".state.json"
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = json.dumps(state, ensure_ascii=False, indent=2)
+    # `[REDACTED_<TYPE>]` placeholders remain valid JSON string content, so
+    # redacting the serialised form is safe.
+    redacted, _ = redact_secrets(payload)
+    path.write_text(redacted, encoding="utf-8")
 
 
 def load_state(workspace: str) -> dict | None:
@@ -113,8 +137,9 @@ async def run_graph(
     """Run the research graph. Returns workspace path.
 
     Args:
-        refs: 參考文件（from context.read_reference_files），傳入 graph state
-              供 phase0 的 synthesize_research_topic 使用（支援文字+圖片+PDF）。
+        refs: reference files (from context.read_reference_files), passed into
+              graph state for phase0's synthesize_research_topic (supports
+              text + image + PDF).
     """
     import uuid
     from langgraph.types import Command
@@ -143,8 +168,8 @@ async def run_graph(
         "coverage_status": {},
     }
 
-    _log(f"[deep-research] 啟動研究：{topic}")
-    _log(f"[deep-research] 模式={'互動' if ask_mode else '自動'}, 深度={depth}, 預算={budget}")
+    _log(f"[deep-research] Starting research: {topic}")
+    _log(f"[deep-research] mode={'interactive' if ask_mode else 'autonomous'}, depth={depth}, budget={budget}")
 
     async for event in graph.astream(initial_state, config, stream_mode="updates"):
         for node_name, update in event.items():
@@ -162,20 +187,20 @@ async def run_graph(
             while True:
                 plan = snapshot.values.get("plan", "")
                 print("\n" + "=" * 60)
-                print("研究計畫：")
+                print("Research Plan:")
                 print("=" * 60)
                 print(plan)
-                print("\n是否開始研究？(y/n): ", end="", flush=True)
+                print("\nStart research? (y/n): ", end="", flush=True)
                 confirm = input().strip().lower()
 
-                if confirm in ("y", "yes", "是"):
+                if confirm in ("y", "yes"):
                     resume_value = {"approved": True}
                     break
-                elif confirm in ("n", "no", "否"):
-                    print("請說明需要修改的地方: ", end="", flush=True)
+                elif confirm in ("n", "no"):
+                    print("Please describe the revisions needed: ", end="", flush=True)
                     revision = input().strip()
                     if not revision:
-                        print("⚠️  請提供修改說明")
+                        print("[WARN] Please provide revision notes")
                         continue
                     # Re-generate plan with revision
                     from deep_research.nodes.phase0 import phase0_plan_standalone
@@ -188,7 +213,7 @@ async def run_graph(
                     snapshot.values["plan"] = new_plan
                     continue
                 else:
-                    print("⚠️  請回答 y（是）或 n（否）")
+                    print("[WARN] Please answer y (yes) or n (no)")
                     continue
         else:
             resume_value = {"approved": True}
@@ -205,9 +230,9 @@ async def run_graph(
     state_values = final_state.values if hasattr(final_state, "values") else {}
     workspace = state_values.get("workspace_path", "")
 
-    _log(f"\n[deep-research] 研究完成")
+    _log(f"\n[deep-research] Research complete")
     if workspace:
-        _log(f"[deep-research] 報告位於：{workspace}/final-report.md")
+        _log(f"[deep-research] Report at: {workspace}/final-report.md")
 
     return workspace
 
@@ -232,7 +257,8 @@ async def cli_interactive(
         )
 
         # --- Run research ---
-        # refs 傳入 graph state → phase0 用於 synthesize_research_topic（支援圖片+PDF）
+        # refs are passed into graph state → phase0 uses them in
+        # synthesize_research_topic (supports image + PDF)
         workspace = await run_graph(
             topic=current_topic, depth=depth, budget=budget,
             ask_mode=ask_mode, clarifications=clarifications,
@@ -240,27 +266,28 @@ async def cli_interactive(
         )
 
         if workspace:
-            print(f"\n完成。報告位於：{workspace}/final-report.md")
+            print(f"\nDone. Report at: {workspace}/final-report.md")
 
         if not ask_mode:
             break
 
         # --- Follow-up loop ---
         print(f"\n{'=' * 60}")
-        print("有沒有想要以這份研究為基礎，深入研究的方向？")
-        print("（直接輸入想深入的方向，或輸入 n 結束）")
+        print("Is there a direction you'd like to dig into further based on this research?")
+        print("(Type the direction to explore, or 'n' to finish)")
         print(f"{'=' * 60}")
         print("  > ", end="", flush=True)
         followup = input().strip()
 
-        if not followup or followup.lower() in ("n", "no", "否", "沒有"):
+        if not followup or followup.lower() in ("n", "no"):
             break
+        followup = _redact_user_text(followup, "follow-up research topic")
 
         # New cycle: previous workspace's report becomes a reference
         current_topic = followup
         current_refs = read_reference_files([workspace]) if workspace else []  # workspace dir → reads final-report.md
-        _log(f"\n[deep-research] 開始追加研究：{followup}")
-        _log(f"[deep-research] 參考前次研究：{workspace}")
+        _log(f"\n[deep-research] Starting follow-up research: {followup}")
+        _log(f"[deep-research] Referencing previous research: {workspace}")
 
 
 async def _cli_clarify_loop(
@@ -283,19 +310,19 @@ async def _cli_clarify_loop(
 
     total_asked = 0
     round_num = 0
-    judge_suggested: list[str] | None = None  # Layer 3: 上輪 Judge 針對失敗維度的追問
+    judge_suggested: list[str] | None = None  # Layer 3: follow-up questions from the previous round's Judge targeting failed dimensions
 
     while True:
         round_num += 1
         remaining = max_questions - total_asked
         if remaining <= 0:
-            _log(f"[deep-research] 已達問題上限 {max_questions}，進入規劃")
+            _log(f"[deep-research] Reached question cap {max_questions}, moving to plan")
             break
 
-        # Adaptive Escalation: 優先使用 Judge 針對缺失維度的追問
+        # Adaptive Escalation: prefer Judge's targeted follow-ups for missing dimensions
         if judge_suggested:
             questions = judge_suggested[:remaining]
-            reasoning = "根據上一輪 Judge 評估的不足維度生成的針對性追問"
+            reasoning = "Targeted follow-ups generated from the previous round's Judge-identified missing dimensions"
             judge_suggested = None
         else:
             questions, reasoning = await generate_questions(
@@ -303,39 +330,40 @@ async def _cli_clarify_loop(
             )
 
         if not questions:
-            _log("[deep-research] LLM 認為主題已足夠明確")
+            _log("[deep-research] LLM considers the topic sufficiently clear")
             break
 
         total_asked += len(questions)
 
         print(f"\n{'=' * 60}")
-        print(f"第 {round_num} 輪澄清（已問 {total_asked - len(questions)} 題，本輪 {len(questions)} 題，上限 {max_questions}）")
+        print(f"Clarification round {round_num} (asked {total_asked - len(questions)} so far, {len(questions)} this round, cap {max_questions})")
         print(f"{'=' * 60}")
 
         round_answers = {}
         for i, q in enumerate(questions):
             while True:
                 print(f"\n  [{i+1}] {q}")
-                print("  回答: ", end="", flush=True)
+                print("  Answer: ", end="", flush=True)
                 ans = input().strip()
                 if ans:
+                    ans = _redact_user_text(ans, f"answer to question {i+1}")
                     round_answers[str(i)] = ans
                     break
-                print("  ⚠️  請提供回答（不能為空）")
+                print("  [WARN] Please provide an answer (cannot be empty)")
 
         valid, _ = validate_answers(questions, round_answers)
         clarifications.extend(valid)
 
         is_clear, judge_reason, suggested = await judge_clarity(topic, clarifications)
         if is_clear:
-            _log(f"[deep-research] Judge 判定：主題已足夠清楚 — {judge_reason}")
+            _log(f"[deep-research] Judge verdict: topic is clear enough — {judge_reason}")
             break
         else:
-            _log(f"[deep-research] Judge 判定：還需要更多澄清 — {judge_reason}")
+            _log(f"[deep-research] Judge verdict: more clarification needed — {judge_reason}")
             if remaining - len(questions) <= 0:
-                _log(f"[deep-research] 但已達問題上限 {max_questions}，繼續進行")
+                _log(f"[deep-research] But question cap {max_questions} reached, proceeding anyway")
                 break
-            judge_suggested = suggested  # 保存到下輪使用
+            judge_suggested = suggested  # keep for next round
 
     return clarifications
 
@@ -362,7 +390,7 @@ async def skill_mode(
     if resume_workspace:
         state = load_state(resume_workspace)
         if state is None:
-            _json_out({"status": "ERROR", "error": f"找不到 state：{resume_workspace}/.state.json"})
+            _json_out({"status": "ERROR", "error": f"state not found: {resume_workspace}/.state.json"})
             sys.exit(1)
 
         phase = state.get("phase", "unknown")
@@ -395,7 +423,7 @@ async def skill_mode(
                         "type": "clarify_retry",
                         "questions": retry_qs,
                         "missing_indices": real_missing,
-                        "message": "以下問題的回答為空或格式不正確，請重新回答：",
+                        "message": "Answers to the following questions were empty or malformed; please answer again:",
                     })
                     sys.exit(0)
 
@@ -419,7 +447,7 @@ async def skill_mode(
                         "type": "clarify_retry",
                         "questions": missing_qs,
                         "missing_indices": missing,
-                        "message": "以下問題的回答為空或格式不正確，請重新回答：",
+                        "message": "Answers to the following questions were empty or malformed; please answer again:",
                     })
                     sys.exit(0)
 
@@ -473,12 +501,12 @@ async def skill_mode(
                         "status": "NEEDS_INPUT",
                         "workspace": resume_workspace,
                         "type": "approve_revision",
-                        "message": "請說明需要修改研究計畫的哪些部分：",
+                        "message": "Please describe which parts of the research plan need revision:",
                     })
                     sys.exit(0)
                 # Re-generate plan with revision context
                 state["clarifications"] = state.get("clarifications", []) + [
-                    {"question": "使用者對研究計畫的修改要求", "answer": revision}
+                    {"question": "User's revision request for the research plan", "answer": revision}
                 ]
                 plan = await phase0_plan_standalone(
                     topic=state["topic"],
@@ -495,13 +523,13 @@ async def skill_mode(
                     "workspace": state["workspace"],
                     "type": "approve",
                     "plan_summary": plan,
-                    "message": "已根據修改意見重新生成計畫，請確認：",
+                    "message": "Plan regenerated based on revision feedback; please confirm:",
                 })
                 sys.exit(0)
             elif phase == "approve_revision" if False else isinstance(parsed_answer, str):
                 # String answer = revision text, re-generate
                 state["clarifications"] = state.get("clarifications", []) + [
-                    {"question": "使用者對研究計畫的修改要求", "answer": parsed_answer}
+                    {"question": "User's revision request for the research plan", "answer": parsed_answer}
                 ]
                 plan = await phase0_plan_standalone(
                     topic=state["topic"],
@@ -518,7 +546,7 @@ async def skill_mode(
                     "workspace": state["workspace"],
                     "type": "approve",
                     "plan_summary": plan,
-                    "message": "已根據修改意見重新生成計畫，請確認：",
+                    "message": "Plan regenerated based on revision feedback; please confirm:",
                 })
                 sys.exit(0)
             else:
@@ -528,7 +556,7 @@ async def skill_mode(
             # User provided revision text
             revision = parsed_answer if isinstance(parsed_answer, str) else str(parsed_answer)
             state["clarifications"] = state.get("clarifications", []) + [
-                {"question": "使用者對研究計畫的修改要求", "answer": revision}
+                {"question": "User's revision request for the research plan", "answer": revision}
             ]
             plan = await phase0_plan_standalone(
                 topic=state["topic"],
@@ -545,7 +573,7 @@ async def skill_mode(
                 "workspace": state["workspace"],
                 "type": "approve",
                 "plan_summary": plan,
-                "message": "已根據修改意見重新生成計畫，請確認：",
+                "message": "Plan regenerated based on revision feedback; please confirm:",
             })
             sys.exit(0)
 
@@ -553,7 +581,7 @@ async def skill_mode(
             # User wants follow-up research (or says no)
             followup_text = parsed_answer if isinstance(parsed_answer, str) else str(parsed_answer)
 
-            if followup_text.lower().strip() in ("n", "no", "否", "沒有", ""):
+            if followup_text.lower().strip() in ("n", "no", ""):
                 _json_out({"status": "DONE", "workspace": state["workspace"]})
                 sys.exit(0)
 
@@ -581,7 +609,7 @@ async def skill_mode(
                 initial_clarifications = []
                 if ref_report:
                     initial_clarifications.append({
-                        "question": "前次研究報告（作為本次研究的參考背景）",
+                        "question": "Previous research report (background reference for this research)",
                         "answer": ref_report,
                     })
                 new_state["clarifications"] = initial_clarifications
@@ -617,13 +645,13 @@ async def skill_mode(
                 await _run_full(new_state)
 
         else:
-            _json_out({"status": "ERROR", "error": f"未知 phase：{phase}"})
+            _json_out({"status": "ERROR", "error": f"unknown phase: {phase}"})
             sys.exit(1)
 
     else:
         # New run
         if not topic:
-            _json_out({"status": "ERROR", "error": "缺少研究主題"})
+            _json_out({"status": "ERROR", "error": "Missing research topic"})
             sys.exit(1)
 
         from deep_research.tools.workspace import create_workspace
@@ -721,7 +749,7 @@ async def _run_full(state: dict) -> str:
         _json_out({
             "status": "DONE_ASK_FOLLOWUP",
             "workspace": workspace,
-            "message": "研究完成。有沒有想要以這份研究為基礎，深入研究的方向？（輸入想研究的方向，或 'n' 結束）",
+            "message": "Research complete. Is there a direction you'd like to dig into further based on this research? (Type the direction, or 'n' to finish)",
         })
         sys.exit(0)
     else:
@@ -745,34 +773,35 @@ def cli():
     parser = argparse.ArgumentParser(
         description="deep-research: LangGraph deep research workflow"
     )
-    parser.add_argument("topic", nargs="*", help="研究主題")
+    parser.add_argument("topic", nargs="*", help="research topic")
 
     mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument("--ask", action="store_true", default=True, help="互動模式（預設）")
-    mode_group.add_argument("--noask", action="store_true", help="自動模式")
+    mode_group.add_argument("--ask", action="store_true", default=True, help="interactive mode (default)")
+    mode_group.add_argument("--noask", action="store_true", help="autonomous mode")
 
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--standard", action="store_true")
     parser.add_argument("--deep", action="store_true")
     parser.add_argument("--budget", type=int, default=0)
     parser.add_argument("--model", type=str, default="auto",
-                        help="LLM 模型選擇：auto（預設，按 claude>gemini>openai 偵測）、"
-                             "claude/gemini/openai（用該家最強模型）、"
-                             "或完整模型版號如 gemini-3.1-pro")
+                        help="LLM model selection: auto (default, detect in order claude>gemini>openai), "
+                             "claude/gemini/openai (use that vendor's strongest model), "
+                             "or a full model version string such as gemini-3.1-pro")
     parser.add_argument("--max-questions", type=int, default=DEFAULT_MAX_QUESTIONS,
-                        help=f"澄清問題上限（預設 {DEFAULT_MAX_QUESTIONS}）")
+                        help=f"maximum number of clarification questions (default {DEFAULT_MAX_QUESTIONS})")
 
     parser.add_argument("--context-threshold", type=float, default=0.3,
-                        help="Context 填充率閾值（0.0-1.0，預設 0.3）。"
-                             "超過此比例時切換為 Iterative Refinement 模式。"
-                             "值越小越保守（精度高但慢），值越大越激進（快但可能 lost in middle）")
+                        help="context fill-rate threshold (0.0-1.0, default 0.3). "
+                             "Switch to Iterative Refinement mode when exceeded. "
+                             "Lower is more conservative (higher precision, slower); higher is more aggressive "
+                             "(faster, but may trigger lost-in-the-middle)")
     parser.add_argument("--ref", type=str, nargs="+", metavar="FILE",
-                        help="參考資料（前次研究 workspace 目錄、文件、筆記等，可多個）")
+                        help="reference materials (previous research workspace dirs, documents, notes, etc.; one or more)")
     parser.add_argument("--resume", type=str, metavar="WORKSPACE")
     parser.add_argument("--answer", type=str)
-    parser.add_argument("--json", action="store_true", help="JSON 輸出（skill 用）")
+    parser.add_argument("--json", action="store_true", help="JSON output (for skill use)")
 
-    parser.add_argument("--auto", action="store_true", help="（已棄用，請用 --noask）")
+    parser.add_argument("--auto", action="store_true", help="(deprecated; use --noask)")
 
     args = parser.parse_args()
 
@@ -783,7 +812,7 @@ def cli():
     topic = " ".join(args.topic) if args.topic else None
 
     if not topic and not args.resume:
-        parser.error("請提供研究主題，或用 --resume 繼續執行")
+        parser.error("Please provide a research topic, or use --resume to continue execution")
 
     depth = "quick" if args.quick else "standard" if args.standard else "deep"
     budget = args.budget or {"quick": 30, "standard": 60, "deep": 150}[depth]
@@ -806,7 +835,7 @@ def cli():
                 ref_paths=args.ref,
             ))
     except KeyboardInterrupt:
-        _log("\n[deep-research] 使用者中斷")
+        _log("\n[deep-research] User interrupted")
         sys.exit(1)
     except SystemExit:
         raise
@@ -814,7 +843,7 @@ def cli():
         if args.json or args.resume:
             _json_out({"status": "ERROR", "error": str(e)})
         else:
-            _log(f"\n[deep-research] 錯誤：{e}")
+            _log(f"\n[deep-research] error: {e}")
             import traceback
             traceback.print_exc(file=sys.stderr)
         sys.exit(1)

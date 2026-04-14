@@ -1,13 +1,13 @@
-"""Context Window 管理 — Iterative Refinement / Incremental Summarization.
+"""Context Window management — Iterative Refinement / Incremental Summarization.
 
-核心職責：
-  1. 估算 token 數量
-  2. 判斷全塞 or Iterative Refinement
-  3. BM25 + Query Expansion 排序 sources
-  4. 迴圈增量整合 sources 進 draft
-  5. 統整 topic + refs + clarifications → full_research_topic
+Core responsibilities:
+  1. Estimate token count
+  2. Decide between fit-all-at-once vs. Iterative Refinement
+  3. BM25 + Query Expansion ranking of sources
+  4. Loop incrementally integrating sources into the draft
+  5. Integrate topic + refs + clarifications -> full_research_topic
 
-設計細節見 llm.py 頂部的 Context Window 管理策略註解。
+See the Context Window management strategy comments at the top of llm.py for design details.
 """
 
 from __future__ import annotations
@@ -36,66 +36,67 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Token 估算
+# Token estimation
 # ---------------------------------------------------------------------------
 
 def estimate_tokens(text: str) -> int:
-    """粗估 token 數。中文約 1-2 tokens/字，英文約 1 token/4 chars，取保守值。"""
+    """Rough token count estimate. Chinese is about 1-2 tokens/char; English is about 1 token/4 chars; take the conservative value."""
     return len(text) // 3
 
 
 # ---------------------------------------------------------------------------
-# 參考文件讀取（支援文字、圖片、PDF）
+# Reference file reading (supports text, images, PDF)
 # ---------------------------------------------------------------------------
 
 def read_reference_files(paths: list[str]) -> list[dict]:
-    """讀取參考檔案，回傳統一格式。
+    """Read reference files and return them in a unified format.
 
     ============================================================
-    ✅ 支援格式
+    Supported formats
     ============================================================
 
-    【文字類 — 走 UTF-8 直讀，副檔名無限制，只要能 UTF-8 decode】
-      - Markdown：  .md, .markdown
-      - 純文字：    .txt, .log
-      - 結構化：    .json, .yaml, .yml, .toml, .xml, .csv, .tsv
-      - 原始碼：    .py, .js, .ts, .go, .rs, .java, .c, .cpp, .sh
-      - 網頁：      .html, .htm
-      - 任何其他 UTF-8 可讀的純文字檔
-      → 格式：{"type": "text", "name": ..., "content": ...}
+    [Text — read directly as UTF-8; no extension restriction so long as it UTF-8 decodes]
+      - Markdown:  .md, .markdown
+      - Plain text:    .txt, .log
+      - Structured:    .json, .yaml, .yml, .toml, .xml, .csv, .tsv
+      - Source code:    .py, .js, .ts, .go, .rs, .java, .c, .cpp, .sh
+      - Web:      .html, .htm
+      - Any other UTF-8 readable plain text file
+      -> Format: {"type": "text", "name": ..., "content": ...}
 
-    【PDF — 用 pymupdf 提取純文字（圖表/排版會遺失）】
+    [PDF — extract plain text with pymupdf (images/layout are lost)]
       - .pdf
-      → 格式：{"type": "text", "name": ..., "content": 提取的純文字}
-      - ⚠️ 需 pip install pymupdf，否則 content 會是錯誤訊息字串
-      - ⚠️ 掃描檔 PDF（無 OCR 文字層）提取結果為空
+      -> Format: {"type": "text", "name": ..., "content": extracted plain text}
+      - Requires pip install pymupdf; otherwise content is an error message string
+      - Scanned PDFs (no OCR text layer) produce empty output
 
-    【圖片 — base64 編碼送 LLM 視覺理解】
-      - PNG、JPEG / JPG、GIF、WebP、BMP、TIFF、SVG（任何 mime = image/*）
-      → 格式：{"type": "image", "name": ..., "mime": ..., "data": base64}
-      - ⚠️ 實務上 LLM provider 通常只認 PNG / JPEG / GIF / WebP
-        TIFF / BMP / SVG 可能被 LLM 拒絕或誤判
+    [Images — base64 encoded and sent to the LLM for visual understanding]
+      - PNG, JPEG / JPG, GIF, WebP, BMP, TIFF, SVG (anything with mime = image/*)
+      -> Format: {"type": "image", "name": ..., "mime": ..., "data": base64}
+      - In practice, LLM providers usually accept only PNG / JPEG / GIF / WebP;
+        TIFF / BMP / SVG may be rejected or misidentified
 
-    【Workspace 目錄 — 研究追加功能】
-      - 傳入的 path 是目錄時，讀裡面的 final-report.md
-      → 格式：{"type": "text", "name": "{dir}/final-report.md", "content": ...}
-      - 用途：把前一次研究的報告當作新研究的 context
+    [Workspace directory — research follow-up feature]
+      - When the path is a directory, read the final-report.md inside it
+      -> Format: {"type": "text", "name": "{dir}/final-report.md", "content": ...}
+      - Use case: feed a previous research report as context for new research
 
     ============================================================
-    ❌ 不支援格式（會被 skip + 印 warning）
+    Unsupported formats (skipped + warning printed)
     ============================================================
 
-      - Office 文件：.docx, .xlsx, .pptx（zip 容器，走文字 fallback 會 UnicodeDecodeError）
-      - 壓縮檔：.zip, .tar, .gz, .7z
-      - 音訊：.mp3, .wav, .m4a, .ogg
-      - 影片：.mp4, .mov, .avi, .webm
-      - 非 UTF-8 文字檔（Big5、GBK、Shift-JIS）— 編碼硬寫死 utf-8
+      - Office documents: .docx, .xlsx, .pptx (zip containers, will UnicodeDecodeError via text fallback)
+      - Archives: .zip, .tar, .gz, .7z
+      - Audio: .mp3, .wav, .m4a, .ogg
+      - Video: .mp4, .mov, .avi, .webm
+      - Non-UTF-8 text files (Big5, GBK, Shift-JIS) — encoding is hard-coded to utf-8
 
-    若需支援上述格式，需擴充此函式的分支邏輯。
+    To support any of the above, you must extend the branching logic in this function.
 
     Raises:
-        ValueError: 當使用者傳入明確不支援的格式時，立刻拋錯（fail-fast），
-                    而不是 skip 後讓使用者後面才發現 ref 沒被讀到。
+        ValueError: when the user passes an explicitly unsupported format,
+                    raise immediately (fail-fast) rather than skipping and
+                    letting the user discover that a ref was dropped later.
     Returns:
         list of ref dicts
     """
@@ -104,7 +105,7 @@ def read_reference_files(paths: list[str]) -> list[dict]:
         path = Path(p)
 
         if path.is_dir():
-            # Workspace 目錄 — 讀 final-report.md
+            # Workspace directory — read final-report.md
             report = path / "final-report.md"
             if report.exists():
                 refs.append({
@@ -114,54 +115,54 @@ def read_reference_files(paths: list[str]) -> list[dict]:
                 })
             else:
                 raise ValueError(
-                    f"❌ 目錄 {path} 內沒有 final-report.md。\n"
-                    f"   目錄參考僅支援讀取先前研究的 workspace（必須包含 final-report.md）。"
+                    f"Directory {path} does not contain final-report.md.\n"
+                    f"   Directory references only support reading a previous research workspace (which must contain final-report.md)."
                 )
             continue
 
         if not path.is_file():
-            raise ValueError(f"❌ 參考檔案不存在：{path}")
+            raise ValueError(f"Reference file does not exist: {path}")
 
-        # ─── Fail-fast：明確不支援的格式立刻拋錯 ───────────────────
-        # 這些格式就算走 UTF-8 fallback 也必定失敗（zip 容器、二進位）
-        # 與其 skip 讓使用者後面才發現少了 ref，不如當下就明確告知
+        # Fail-fast: raise immediately on explicitly unsupported formats
+        # These formats are guaranteed to fail even through the UTF-8 fallback (zip containers, binaries).
+        # Rather than skipping and letting the user discover the missing ref later, notify them now.
         UNSUPPORTED_EXTS = {
-            # Office 文件（zip 容器，無法 UTF-8 讀）
-            ".docx": "Word 文件", ".xlsx": "Excel 試算表", ".pptx": "PowerPoint 簡報",
-            ".doc":  "Word 文件（舊版）", ".xls": "Excel 試算表（舊版）",
-            ".ppt":  "PowerPoint 簡報（舊版）", ".odt": "OpenDocument 文字",
-            ".ods":  "OpenDocument 試算表", ".odp": "OpenDocument 簡報",
-            ".rtf":  "RTF 格式文件",
-            # 電子書
-            ".epub": "EPUB 電子書", ".mobi": "Kindle 電子書", ".azw3": "Kindle 電子書",
-            # 壓縮檔
-            ".zip": "ZIP 壓縮檔", ".tar": "TAR 封存檔", ".gz": "Gzip 壓縮檔",
-            ".bz2": "Bzip2 壓縮檔", ".7z": "7-Zip 壓縮檔", ".rar": "RAR 壓縮檔",
-            # 音訊
-            ".mp3": "MP3 音訊", ".wav": "WAV 音訊", ".m4a": "M4A 音訊",
-            ".ogg": "OGG 音訊", ".flac": "FLAC 音訊", ".aac": "AAC 音訊",
-            # 影片
-            ".mp4": "MP4 影片", ".mov": "MOV 影片", ".avi": "AVI 影片",
-            ".mkv": "MKV 影片", ".webm": "WebM 影片", ".flv": "FLV 影片",
-            # 其他二進位
-            ".exe": "執行檔", ".dll": "動態連結庫", ".so": "共享函式庫",
-            ".dmg": "macOS 磁碟映像", ".iso": "ISO 映像檔",
+            # Office documents (zip containers, cannot be read as UTF-8)
+            ".docx": "Word document", ".xlsx": "Excel spreadsheet", ".pptx": "PowerPoint presentation",
+            ".doc":  "Word document (legacy)", ".xls": "Excel spreadsheet (legacy)",
+            ".ppt":  "PowerPoint presentation (legacy)", ".odt": "OpenDocument text",
+            ".ods":  "OpenDocument spreadsheet", ".odp": "OpenDocument presentation",
+            ".rtf":  "RTF document",
+            # E-books
+            ".epub": "EPUB e-book", ".mobi": "Kindle e-book", ".azw3": "Kindle e-book",
+            # Archives
+            ".zip": "ZIP archive", ".tar": "TAR archive", ".gz": "Gzip archive",
+            ".bz2": "Bzip2 archive", ".7z": "7-Zip archive", ".rar": "RAR archive",
+            # Audio
+            ".mp3": "MP3 audio", ".wav": "WAV audio", ".m4a": "M4A audio",
+            ".ogg": "OGG audio", ".flac": "FLAC audio", ".aac": "AAC audio",
+            # Video
+            ".mp4": "MP4 video", ".mov": "MOV video", ".avi": "AVI video",
+            ".mkv": "MKV video", ".webm": "WebM video", ".flv": "FLV video",
+            # Other binary
+            ".exe": "executable", ".dll": "dynamic-link library", ".so": "shared library",
+            ".dmg": "macOS disk image", ".iso": "ISO image",
         }
         suffix = path.suffix.lower()
         if suffix in UNSUPPORTED_EXTS:
             raise ValueError(
-                f"❌ 不支援的檔案格式：{path.name}（{UNSUPPORTED_EXTS[suffix]}）\n"
-                f"   ✅ 目前僅支援：\n"
-                f"      • 純文字類：.md, .txt, .json, .yaml, .csv, .html, 程式原始碼等\n"
-                f"      • PDF：.pdf（只讀文字，圖表/圖片會被忽略）\n"
-                f"      • 圖片：.png, .jpg, .jpeg, .gif, .webp\n"
-                f"   如需提供 Office 文件，請先轉為 PDF 或貼成純文字。"
+                f"Unsupported file format: {path.name} ({UNSUPPORTED_EXTS[suffix]})\n"
+                f"   Currently supported:\n"
+                f"      - Plain text: .md, .txt, .json, .yaml, .csv, .html, source code, etc.\n"
+                f"      - PDF: .pdf (text only; charts/images are ignored)\n"
+                f"      - Images: .png, .jpg, .jpeg, .gif, .webp\n"
+                f"   To supply an Office document, first convert it to PDF or paste it as plain text."
             )
 
         mime, _ = mimetypes.guess_type(str(path))
 
         if mime and mime.startswith("image/"):
-            # 圖片 → base64
+            # Image -> base64
             with open(path, "rb") as f:
                 b64 = base64.b64encode(f.read()).decode()
             refs.append({
@@ -172,23 +173,23 @@ def read_reference_files(paths: list[str]) -> list[dict]:
             })
 
         elif mime == "application/pdf":
-            # ─── PDF：提取純文字，並明確告知使用者限制 ────────────
-            # 使用者常誤以為 LLM 能「看」PDF 的圖表/排版，實際只讀到文字。
-            # 在讀取當下就用 stderr 印提醒，確保使用者知道限制。
+            # PDF: extract plain text and explicitly tell the user about the limitations
+            # Users often assume the LLM can "see" charts/layout in a PDF; in reality only text is read.
+            # Print a reminder to stderr on read so the user is aware of the limitations.
             print(
-                f"📄 偵測到 PDF：{path.name}\n"
-                f"   ⚠️  只會讀取『文字內容』。以下資訊會被忽略：\n"
-                f"       • 圖片、圖表、示意圖\n"
-                f"       • 表格的排版結構（文字仍可讀到，但可能錯位）\n"
-                f"       • 掃描檔若無 OCR 文字層，將完全無法讀取\n"
-                f"   如有關鍵圖表，建議另存為 PNG/JPG 一併提供。",
+                f"PDF detected: {path.name}\n"
+                f"   Only the 'text content' will be read. The following is ignored:\n"
+                f"       - Images, charts, diagrams\n"
+                f"       - Table layout structure (text can still be read, but may be misaligned)\n"
+                f"       - Scanned files without an OCR text layer cannot be read at all\n"
+                f"   If critical charts exist, it is recommended to also provide them as PNG/JPG.",
                 file=sys.stderr,
             )
             text = _extract_pdf_text(path)
             if not text.strip():
                 raise ValueError(
-                    f"❌ 無法從 PDF 提取任何文字：{path.name}\n"
-                    f"   可能原因：掃描檔無 OCR 文字層 / 加密 / 檔案損毀。"
+                    f"Unable to extract any text from PDF: {path.name}\n"
+                    f"   Possible causes: scanned file without OCR text layer / encrypted / corrupted file."
                 )
             refs.append({
                 "type": "text",
@@ -197,7 +198,7 @@ def read_reference_files(paths: list[str]) -> list[dict]:
             })
 
         else:
-            # 其他檔案：嘗試用 UTF-8 讀（純文字副檔名會走到這裡）
+            # Other files: try reading as UTF-8 (plain-text extensions fall here)
             try:
                 content = path.read_text(encoding="utf-8")
                 refs.append({
@@ -206,20 +207,20 @@ def read_reference_files(paths: list[str]) -> list[dict]:
                     "content": content,
                 })
             except UnicodeDecodeError:
-                # 讀不到表示檔案不是 UTF-8 文字（可能是未列入黑名單的二進位格式
-                # 或是 Big5/GBK 等非 UTF-8 編碼），一樣拋錯
+                # Unreadable means the file is not UTF-8 text (possibly a binary format not in the blacklist
+                # or a non-UTF-8 encoding such as Big5/GBK); raise in either case.
                 raise ValueError(
-                    f"❌ 無法以 UTF-8 讀取 {path.name}\n"
-                    f"   可能是未被明確列入支援清單的二進位檔、\n"
-                    f"   或是非 UTF-8 編碼的文字檔（如 Big5, GBK）。\n"
-                    f"   請先轉為 UTF-8 或另存為支援的格式。"
+                    f"Unable to read {path.name} as UTF-8.\n"
+                    f"   It may be a binary file not explicitly listed as supported,\n"
+                    f"   or a non-UTF-8-encoded text file (e.g. Big5, GBK).\n"
+                    f"   Please convert it to UTF-8 or save it as a supported format."
                 )
 
     return refs
 
 
 def _extract_pdf_text(path: Path) -> str:
-    """從 PDF 提取文字。"""
+    """Extract text from a PDF."""
     try:
         import pymupdf
         doc = pymupdf.open(str(path))
@@ -229,29 +230,29 @@ def _extract_pdf_text(path: Path) -> str:
         doc.close()
         return "\n\n".join(pages)
     except ImportError:
-        logger.warning("pymupdf 未安裝，無法提取 PDF 文字。請執行 pip install pymupdf")
-        return f"(PDF 檔案 {path.name}，需安裝 pymupdf 才能提取文字)"
+        logger.warning("pymupdf is not installed; unable to extract PDF text. Run pip install pymupdf.")
+        return f"(PDF file {path.name}; pymupdf must be installed to extract text)"
     except Exception as e:
-        logger.warning(f"PDF 提取失敗 {path}: {e}")
-        return f"(PDF 提取失敗: {e})"
+        logger.warning(f"PDF extraction failed {path}: {e}")
+        return f"(PDF extraction failed: {e})"
 
 
 def refs_to_message_content(refs: list[dict]) -> list[dict]:
-    """將 refs 轉成 LangChain 的 multimodal content blocks。
+    """Convert refs into LangChain multimodal content blocks.
 
-    用於 HumanMessage(content=blocks) 格式，支援文字+圖片混合。
+    Used in the HumanMessage(content=blocks) form, supporting mixed text+image.
     """
     blocks = []
     for ref in refs:
         if ref["type"] == "text":
             blocks.append({
                 "type": "text",
-                "text": f"\n--- 參考文件：{ref['name']} ---\n{ref['content']}",
+                "text": f"\n--- Reference document: {ref['name']} ---\n{ref['content']}",
             })
         elif ref["type"] == "image":
             blocks.append({
                 "type": "text",
-                "text": f"\n--- 參考圖片：{ref['name']} ---",
+                "text": f"\n--- Reference image: {ref['name']} ---",
             })
             blocks.append({
                 "type": "image_url",
@@ -261,40 +262,40 @@ def refs_to_message_content(refs: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 研究任務書統整（topic + refs + clarifications → full_research_topic）
+# Research brief integration (topic + refs + clarifications -> full_research_topic)
 # ---------------------------------------------------------------------------
 
-SYNTHESIZE_PROMPT = """你是研究需求分析師。請將以下資訊統整為一份結構化的研究任務書（research brief）。
+SYNTHESIZE_PROMPT = """You are a research-requirements analyst. Integrate the information below into a structured research brief.
 
-這份任務書將作為整個研究流程的核心指令，所有後續的搜尋、分析、報告都依據這份任務書執行。
-請用第三人稱描述委託者的需求，確保任何人讀到這份任務書都能獨立理解完整的研究需求。
+This brief will be the core instruction for the entire research pipeline; all subsequent search, analysis, and reporting will be executed according to it.
+Describe the requester's needs in the third person so that anyone reading this brief can independently understand the full research requirement.
 
-## 統整規則
-1. 將使用者的原始主題、參考文件中的關鍵資訊、澄清問答中的所有細節，融合成一份完整敘述
-2. 參考文件中的具體數據、結論、觀點要保留並標註來源檔名
-3. 消除矛盾：如果參考文件和問答有衝突，以問答（使用者最新意見）為準
-4. 補充隱含需求：從問答中推斷出使用者沒有明說但顯然需要的面向
-5. 圖片內容用文字描述其關鍵資訊（數據、架構圖的結構、趨勢等）
+## Integration rules
+1. Fuse the user's original topic, the key information from the reference documents, and every detail from the clarification Q&A into a complete narrative.
+2. Keep the specific data points, conclusions, and opinions from the reference documents and tag them with the source filename.
+3. Eliminate contradictions: when reference documents and the Q&A conflict, follow the Q&A (the user's latest view).
+4. Fill in implicit requirements: infer aspects the user did not state explicitly but clearly needs from the Q&A.
+5. Describe image content in words (data values, architecture diagram structure, trends, etc.).
 
-## 輸出格式
+## Output format
 
-### 研究目標
-（一段話，清楚說明為什麼做這個研究、期望得到什麼）
+### Research objective
+(One paragraph clearly explaining why this research is being conducted and what is expected.)
 
-### 核心問題
-（條列，這個研究需要回答的具體問題）
+### Core questions
+(Bulleted list of the specific questions this research must answer.)
 
-### 範圍與限制
-（時間範圍、地域、技術邊界、排除項目、預算等硬性約束）
+### Scope and constraints
+(Time range, region, technical boundaries, exclusions, budget, and any other hard constraints.)
 
-### 評估標準
-（用什麼維度判斷好壞、怎麼比較、成功的定義）
+### Evaluation criteria
+(Which dimensions to use for judgment, how to compare, and the definition of success.)
 
-### 已知背景
-（從參考文件和問答中提取的已知事實，避免重複搜尋）
+### Known context
+(Known facts extracted from the reference documents and Q&A to avoid redundant searching.)
 
-### 產出要求
-（報告格式、受眾、深度偏好、特殊要求）"""
+### Output requirements
+(Report format, audience, depth preference, and any special requirements.)"""
 
 
 async def synthesize_research_topic(
@@ -302,21 +303,21 @@ async def synthesize_research_topic(
     refs: list[dict],
     clarifications: list[dict],
 ) -> str:
-    """統整 topic + refs + clarifications → full_research_topic.
+    """Integrate topic + refs + clarifications -> full_research_topic.
 
-    一次性呼叫，在 Phase 0 澄清完成後執行。
-    產出的 full_research_topic 會作為整個研究的 fixed context。
+    One-shot call, executed after Phase 0 clarification completes.
+    The resulting full_research_topic serves as fixed context for the entire research run.
 
-    Anti-pattern 防護（LLM 專注原則）：
-      - 場景：使用者可能丟入整份長 PDF / 大型文字檔當 refs，
-              一次性呼叫無 Iterative Refinement 保護，易觸發 LiM。
-      - 策略：文字 refs 總量軟上限 30K tokens 警告，硬上限 50K tokens 截斷。
-              圖片 refs 不動（圖片 token 計費方式不同，交給模型處理）。
+    Anti-pattern protection (LLM focus principle):
+      - Scenario: the user may drop an entire long PDF / large text file as refs;
+              a single one-shot call has no Iterative Refinement protection and is prone to LiM.
+      - Strategy: warn at a soft limit of 30K tokens total text refs, truncate at a hard limit of 50K tokens.
+              Image refs are left alone (image tokens are billed differently; leave it to the model).
     """
     import logging
     log = logging.getLogger(__name__)
 
-    # refs 大小保護：文字類累積估 tokens，超過上限截斷
+    # refs size protection: accumulate text-token count and truncate above the limit
     safe_refs: list[dict] = []
     if refs:
         SOFT_LIMIT = 30_000
@@ -331,59 +332,59 @@ async def synthesize_research_topic(
                     safe_refs.append(ref)
                     accumulated += ref_tokens
                 else:
-                    # 只留頭尾各 ~1500 tokens (4500 chars) 摘要
+                    # Keep only ~1500 tokens (4500 chars) at head and tail
                     remaining = HARD_LIMIT - accumulated
                     if remaining > 3000:
                         keep_chars = (remaining - 500) * 3 // 2
                         head = content[:keep_chars]
                         tail = content[-keep_chars:] if len(content) > keep_chars * 2 else ""
                         if tail:
-                            new_content = f"{head}\n\n...[中段省略 ~{ref_tokens - remaining} tokens 以符合 50K 上限]...\n\n{tail}"
+                            new_content = f"{head}\n\n...[middle omitted ~{ref_tokens - remaining} tokens to fit the 50K limit]...\n\n{tail}"
                         else:
-                            new_content = head + "\n\n...[尾段省略以符合 50K 上限]..."
+                            new_content = head + "\n\n...[tail omitted to fit the 50K limit]..."
                         safe_refs.append({**ref, "content": new_content})
                         accumulated = HARD_LIMIT
                     truncated_count += 1
             else:
-                # 圖片直接放行
+                # Pass images through
                 safe_refs.append(ref)
         if accumulated > SOFT_LIMIT:
             log.warning(
-                "[synthesize] refs 文字總量 %d tokens 超過軟上限 %d — 建議拆分或先自行摘要",
+                "[synthesize] refs total text %d tokens exceeds soft limit %d — consider splitting or summarizing first",
                 accumulated,
                 SOFT_LIMIT,
             )
         if truncated_count:
             log.warning(
-                "[synthesize] 已截斷 %d 份 refs（超過 50K tokens 硬上限）",
+                "[synthesize] %d refs were truncated (exceeded the 50K-token hard limit)",
                 truncated_count,
             )
 
-    # 組裝 multimodal content blocks
+    # Assemble multimodal content blocks
     content_blocks: list[dict] = [
-        {"type": "text", "text": f"## 原始研究主題\n\n{topic}"},
+        {"type": "text", "text": f"## Original research topic\n\n{topic}"},
     ]
 
-    # 參考文件（文字+圖片）
+    # Reference documents (text + image)
     if safe_refs:
         ref_blocks = refs_to_message_content(safe_refs)
         content_blocks.extend(ref_blocks)
 
-    # 澄清問答
+    # Clarification Q&A
     if clarifications:
-        qa_text = "\n## 澄清問答\n\n"
+        qa_text = "\n## Clarification Q&A\n\n"
         for i, qa in enumerate(clarifications, 1):
             qa_text += f"**Q{i}:** {qa['question']}\n**A{i}:** {qa['answer']}\n\n"
         content_blocks.append({"type": "text", "text": qa_text})
 
-    # Prompt caching 標記
-    # Anthropic: cache_control 在 system message 上（整個 SYNTHESIZE_PROMPT 會被 cache）
-    # OpenAI: 自動 prefix caching（prompt > 1024 tokens 時自動啟用）
-    # Gemini: 自動 prefix caching
+    # Prompt caching markers
+    # Anthropic: cache_control on the system message (the whole SYNTHESIZE_PROMPT will be cached)
+    # OpenAI: automatic prefix caching (automatically enabled when prompt > 1024 tokens)
+    # Gemini: automatic prefix caching
     system_msg = SystemMessage(content=SYNTHESIZE_PROMPT)
     human_msg = HumanMessage(content=content_blocks)
 
-    # role="writer" — 規劃 / 統整類，Claude Opus 主導，內含 fallback chain
+    # role="writer" — planning / integration category, Claude Opus-led, with a fallback chain
     response = await safe_ainvoke_chain(
         role="writer",
         messages=[system_msg, human_msg],
@@ -394,22 +395,22 @@ async def synthesize_research_topic(
 
 
 # ---------------------------------------------------------------------------
-# BM25 排序（Query Expansion + ranking）
+# BM25 ranking (Query Expansion + ranking)
 # ---------------------------------------------------------------------------
 
 async def _expand_query(topic: str) -> str:
-    """LLM 生成加長版 query，提升 BM25 的 recall。
+    """Use the LLM to generate an expanded query that improves BM25 recall.
 
-    包含：同義詞、相關術語、多語言對應、領域慣用詞。
-    成本很低（一次 verifier chain call，output ~200 tokens）。
+    Includes: synonyms, related terms, cross-language equivalents, domain jargon.
+    Cost is low (a single verifier chain call; output ~200 tokens).
     """
     response = await safe_ainvoke_chain(
         role="verifier",
         messages=[
-            SystemMessage(content="""根據研究主題，生成一段用於資訊檢索的加長查詢。
-包含：同義詞、相關術語、英文對應詞、領域慣用詞、相關概念。
-目的是提升 BM25 關鍵字匹配的 recall。
-直接輸出查詢文字，不要解釋。"""),
+            SystemMessage(content="""Based on the research topic, generate one expanded query string for information retrieval.
+Include: synonyms, related terms, English equivalents, domain jargon, related concepts.
+The goal is to improve the recall of BM25 keyword matching.
+Output the query text directly; do not explain."""),
             HumanMessage(content=topic),
         ],
         max_tokens=1024,
@@ -419,7 +420,7 @@ async def _expand_query(topic: str) -> str:
 
 
 def _rank_sources_bm25(sources: list[str], query: str) -> list[str]:
-    """用 BM25 依相關性排序 sources。
+    """Rank sources by BM25 relevance.
 
     Args:
         sources: list of source text strings
@@ -431,22 +432,22 @@ def _rank_sources_bm25(sources: list[str], query: str) -> list[str]:
     try:
         from rank_bm25 import BM25Okapi
     except ImportError:
-        logger.warning("rank-bm25 未安裝，跳過排序。請執行 pip install rank-bm25")
+        logger.warning("rank-bm25 is not installed; skipping ranking. Run pip install rank-bm25.")
         return sources
 
     if not sources or not query:
         return sources
 
-    # Tokenize（簡單分詞：中文逐字、英文空格分）
+    # Tokenize (simple tokenization: one Chinese char per token, English split on whitespace)
     def tokenize(text: str) -> list[str]:
         import re
-        # 中英文混合分詞：英文按空格+標點，中文逐字
+        # Mixed-language tokenization: English splits on whitespace + punctuation, Chinese one char per token
         tokens = []
         for segment in re.split(r'(\s+)', text):
             segment = segment.strip()
             if not segment:
                 continue
-            # 如果包含 CJK 字元，逐字切
+            # If it contains CJK characters, split per character
             if any('\u4e00' <= c <= '\u9fff' for c in segment):
                 tokens.extend(list(segment))
             else:
@@ -459,43 +460,43 @@ def _rank_sources_bm25(sources: list[str], query: str) -> list[str]:
     bm25 = BM25Okapi(tokenized_sources)
     scores = bm25.get_scores(tokenized_query)
 
-    # 按 score 降序排
+    # Sort by score descending
     ranked = sorted(zip(scores, sources), reverse=True)
     return [s for _, s in ranked]
 
 
 # ---------------------------------------------------------------------------
-# Iterative Refinement 核心迴圈
+# Iterative Refinement core loop
 # ---------------------------------------------------------------------------
 
-ITERATIVE_SYSTEM = """你是深度研究分析師。你的任務是根據研究任務書，將新的搜尋結果整合進目前的研究草稿中。
+ITERATIVE_SYSTEM = """You are a deep-research analyst. Your task is to integrate new search results into the current research draft according to the research brief.
 
-## 整合規則
+## Integration rules
 
-1. 逐篇審閱本輪新資訊，判斷是否與研究任務相關
-2. 相關且有價值 → 整合進草稿的適當位置
-3. 與草稿現有內容重複 → 跳過，但如果新資訊有更精確的數據或更新的日期，替換舊的
-4. 與草稿現有內容矛盾 → 兩者都保留，標記 [矛盾待查] 並註明來源
-5. 不相關或低品質 → 跳過，不要加入
+1. Review this round's new information one item at a time and decide whether it is relevant to the research task.
+2. Relevant and valuable -> integrate into the appropriate place in the draft.
+3. Duplicates existing draft content -> skip; but if the new information has more precise numbers or a newer date, replace the old content.
+4. Conflicts with existing draft content -> keep both, mark with [conflict pending] and note the source.
+5. Irrelevant or low-quality -> skip; do not add.
 
-## 溯源要求
+## Citation requirements
 
-每個事實、數據、觀點都必須標註來源：
-- 格式：「內容文字 [來源：檔名或URL]」
-- 數字必須逐字引用原文，不可四捨五入或改寫
-- 推論必須標記 [推論] 並說明依據哪些事實推導
+Every fact, datum, and opinion must be tagged with its source:
+- Format: "content text [source: filename or URL]"
+- Numbers must be quoted verbatim from the original; no rounding or rewording.
+- Inferences must be labelled [inference] and state the facts they derive from.
 
-## 草稿結構
+## Draft structure
 
-維持以下結構，新內容插入到對應段落的末尾（不改動已有段落的順序和內容）：
-1. 每個核心問題一個段落
-2. 段落內按「事實 → 數據 → 分析 → 矛盾/待查」排列
-3. 段落末尾可以有 [待補充] 標記
+Preserve the following structure; new content is inserted at the end of the relevant section (do not change the order or content of existing sections):
+1. One section per core question.
+2. Within each section, arrange content as "facts -> data -> analysis -> conflicts/pending".
+3. The end of a section may carry a [to be supplemented] marker.
 
-## 輸出
+## Output
 
-直接輸出更新後的完整草稿。不要輸出解釋、不要輸出 diff、不要說「我更新了什麼」。
-只輸出草稿本身。"""
+Output the updated, complete draft directly. Do not output explanations, do not output a diff, do not say "what I updated".
+Output only the draft itself."""
 
 
 async def iterative_refine(
@@ -507,40 +508,40 @@ async def iterative_refine(
     provider: str | None = None,
     role: str | None = None,
 ) -> str:
-    """Iterative Refinement 核心：將所有 sources 增量整合進 draft。
+    """Iterative Refinement core: incrementally integrate all sources into the draft.
 
-    決策流程：
-      1. total_tokens < budget → 全塞，一次 LLM call
-      2. total_tokens >= budget → 迴圈，每輪塞到 budget 為止
-      3. fixed_cost > budget → 一篇一篇送
-      4. fixed_cost + 單篇 > 100% context → role 模式 raise；tier 模式換最大 provider
+    Decision flow:
+      1. total_tokens < budget -> fit all at once in a single LLM call
+      2. total_tokens >= budget -> loop, packing up to budget each round
+      3. fixed_cost > budget -> send one source per round
+      4. fixed_cost + single source > 100% context -> role mode raises; tier mode switches to the largest provider
 
     Args:
-        sources: list of source text strings（搜尋結果原文）
-        full_research_topic: 統整後的研究任務書
-        system_prompt: 自訂 system prompt（預設用 ITERATIVE_SYSTEM）。
-            各 phase 傳入各自的 prompt：
-            - Phase 1b: 攻擊式事實核查 prompt
-            - Phase 2: 報告整合 prompt（預設）
-            - Phase 3: 最終審計 prompt
-        extra_context: 額外固定 context（如待核對 claims、statements），
-            會放在 research_topic 之後、draft 之前。
-        tier: LLM tier ("strong" or "fast") — 僅在 role=None 時使用
-        provider: override provider — 僅在 role=None 時使用
-        role: 角色化 fallback chain 模式（推薦）。
-            "writer"   → Claude Opus → Sonnet → GPT-pro（規劃 / 整合 / 報告）
-            "verifier" → Gemini → GPT-mini → Claude Haiku（抽取 / 核對 / 審計）
-            設定後，內部走 safe_ainvoke_chain（自動 fallback），
-            context_limit / cache 格式以 chain 第一個 model 為準。
+        sources: list of source text strings (original search result text)
+        full_research_topic: the integrated research brief
+        system_prompt: custom system prompt (defaults to ITERATIVE_SYSTEM).
+            Each phase supplies its own prompt:
+            - Phase 1b: adversarial fact-check prompt
+            - Phase 2: report integration prompt (default)
+            - Phase 3: final audit prompt
+        extra_context: additional fixed context (e.g. claims or statements to verify);
+            placed after research_topic and before the draft.
+        tier: LLM tier ("strong" or "fast") — used only when role=None
+        provider: override provider — used only when role=None
+        role: role-based fallback chain mode (recommended).
+            "writer"   -> Claude Opus -> Sonnet -> GPT-pro (planning / integration / reporting)
+            "verifier" -> Gemini -> GPT-mini -> Claude Haiku (extraction / verification / audit)
+            Once set, the internal path uses safe_ainvoke_chain (automatic fallback);
+            context_limit / cache format are taken from the first model in the chain.
 
     Returns:
-        最終的 draft / 核查結果 / 審計結果
+        the final draft / verification result / audit result
     """
     if not system_prompt:
         system_prompt = ITERATIVE_SYSTEM
 
     if role is not None:
-        # Role 模式：用 chain 第一個 model 的 context limit，cache 格式取第一家 provider
+        # Role mode: use the chain's first model's context limit; cache format uses the first provider
         primary_provider, _primary_model = _available_chain(role)[0]
         p = primary_provider
         context_limit = get_role_context_limit(role)
@@ -551,47 +552,47 @@ async def iterative_refine(
     threshold = get_context_threshold()
     budget = int(context_limit * threshold)
 
-    # extra_context 放大器檢查 —
-    # iterative_refine 每輪都會重傳 extra_context，分批模式下實際消耗 = extra × 輪數。
-    # 呼叫端若塞了整份登記表 / 全部 claims / 全部 statements，這裡會放大成雜訊主因。
-    # 軟上限 2K tokens（警告），硬上限 4K tokens（截斷保護）。
+    # extra_context amplifier check —
+    # iterative_refine re-sends extra_context every round; in batched mode actual consumption = extra * rounds.
+    # If the caller stuffs in the entire ledger / all claims / all statements, this becomes the main source of noise.
+    # Soft limit 2K tokens (warning), hard limit 4K tokens (truncation protection).
     if extra_context:
         extra_tokens = estimate_tokens(extra_context)
         if extra_tokens > 2000:
             logger.warning(
-                f"iterative_refine: extra_context 過大 ({extra_tokens:,} tokens)。"
-                f"每輪都會重傳 → 分批模式下實際消耗 = {extra_tokens:,} × 輪數。"
-                f"建議呼叫端拆成多個獨立 call（per-section / per-group）或精簡 context。"
+                f"iterative_refine: extra_context is too large ({extra_tokens:,} tokens). "
+                f"It is re-sent every round -> in batched mode actual consumption = {extra_tokens:,} * rounds. "
+                f"Consider splitting the caller into multiple independent calls (per-section / per-group) or trimming the context."
             )
         if extra_tokens > 4000:
             char_cap = 12000  # ~4000 tokens
             extra_context = (
                 extra_context[:char_cap]
-                + "\n\n...[extra_context 超過 4K tokens 硬上限，已截斷]..."
+                + "\n\n...[extra_context exceeds the 4K-token hard limit; truncated]..."
             )
             logger.warning(
-                f"extra_context 硬截斷至 ~{estimate_tokens(extra_context):,} tokens"
+                f"extra_context hard-truncated to ~{estimate_tokens(extra_context):,} tokens"
             )
 
-    # 估算 fixed 部分的 tokens
+    # Estimate tokens of the fixed portion
     fixed_prompt_tokens = estimate_tokens(system_prompt + full_research_topic + extra_context)
     total_source_tokens = sum(estimate_tokens(s) for s in sources)
     total_tokens = fixed_prompt_tokens + total_source_tokens
 
     logger.info(
-        f"Context 決策: fixed={fixed_prompt_tokens:,} sources={total_source_tokens:,} "
+        f"Context decision: fixed={fixed_prompt_tokens:,} sources={total_source_tokens:,} "
         f"total={total_tokens:,} budget={budget:,} ({threshold:.0%} of {context_limit:,})"
     )
 
-    # --- Step 1: 全塞判斷 ---
+    # --- Step 1: fit-all-at-once check ---
     if total_tokens < budget:
-        logger.info("全塞模式：所有 sources 一次送入")
+        logger.info("Fit-all-at-once mode: all sources sent in a single call")
         return await _single_pass(sources, full_research_topic, system_prompt, extra_context, tier, p, role)
 
     # --- Step 2+: Iterative Refinement ---
-    logger.info(f"Iterative Refinement 模式：{len(sources)} sources 分批處理")
+    logger.info(f"Iterative Refinement mode: {len(sources)} sources processed in batches")
 
-    # BM25 排序（最相關的先處理）
+    # BM25 ranking (most relevant processed first)
     expanded_query = await _expand_query(full_research_topic)
     sorted_sources = _rank_sources_bm25(sources, expanded_query)
 
@@ -599,70 +600,70 @@ async def iterative_refine(
     processed = 0
 
     while processed < len(sorted_sources):
-        # 計算本輪 budget
+        # Compute this round's budget
         draft_tokens = estimate_tokens(draft)
         fixed_cost = fixed_prompt_tokens + draft_tokens
         remaining = budget - fixed_cost
 
         if remaining <= 0:
-            # fixed_cost 超過 budget → 一篇一篇送
-            remaining_for_one = context_limit - fixed_cost  # 用 100% limit 而非 threshold
+            # fixed_cost exceeds budget -> send one source per round
+            remaining_for_one = context_limit - fixed_cost  # use the 100% limit, not the threshold
 
             if remaining_for_one <= 0:
                 if role is not None:
-                    # Role 模式：fallback chain 自己會挑可用的 provider，
-                    # 此處若仍超 limit 表示研究任務書過長，無解。
+                    # Role mode: the fallback chain itself picks an available provider;
+                    # if it still exceeds the limit here, the research brief is too long — no way out.
                     raise RuntimeError(
-                        f"[role={role}] fixed_prompt + draft ({fixed_cost:,} tokens) 超過 "
-                        f"chain primary model 的 100% context limit ({context_limit:,} tokens)。"
-                        f"請縮短研究任務書或調高 --context-threshold。"
+                        f"[role={role}] fixed_prompt + draft ({fixed_cost:,} tokens) exceeds "
+                        f"the chain primary model's 100% context limit ({context_limit:,} tokens). "
+                        f"Shorten the research brief or raise --context-threshold."
                     )
-                # tier 模式：連 100% context 都不夠 → 換最大 provider
+                # Tier mode: even 100% context is not enough -> switch to the largest provider
                 larger = find_largest_available_provider(tier)
                 if larger:
                     larger_limit = get_context_limit(larger, tier)
                     remaining_for_one = larger_limit - fixed_cost
                     if remaining_for_one <= 0:
                         raise RuntimeError(
-                            f"fixed_prompt + draft ({fixed_cost:,} tokens) 超過最大可用 provider "
-                            f"({larger}, {larger_limit:,} tokens) 的 100% context limit。"
-                            f"請縮短研究任務書或調高 --context-threshold。"
+                            f"fixed_prompt + draft ({fixed_cost:,} tokens) exceeds the 100% context limit of the largest available provider "
+                            f"({larger}, {larger_limit:,} tokens). "
+                            f"Shorten the research brief or raise --context-threshold."
                         )
-                    logger.warning(f"切換到 {larger} (context: {larger_limit:,}) 處理剩餘 sources")
+                    logger.warning(f"Switching to {larger} (context: {larger_limit:,}) to process remaining sources")
                     p = larger
                 else:
                     raise RuntimeError(
-                        f"fixed_prompt + draft ({fixed_cost:,} tokens) 超過 {p} 的 100% context limit "
-                        f"({context_limit:,} tokens)，且無更大的 provider 可用。"
+                        f"fixed_prompt + draft ({fixed_cost:,} tokens) exceeds {p}'s 100% context limit "
+                        f"({context_limit:,} tokens), and no larger provider is available."
                     )
 
-            # 一篇一篇送
+            # Send one source per round
             source = sorted_sources[processed]
             source_tokens = estimate_tokens(source)
             if source_tokens > remaining_for_one:
-                # 單篇太長，截取能放的部分（這是唯一允許截斷的地方）
-                char_limit = remaining_for_one * 3  # 反向估算字元數
-                source = source[:char_limit] + "\n\n[...此來源因篇幅過長被截斷...]"
-                logger.warning(f"Source {processed+1} 過長 ({source_tokens:,} tokens)，截斷至 {remaining_for_one:,} tokens")
+                # Single source too long; take what fits (this is the only place truncation is allowed)
+                char_limit = remaining_for_one * 3  # reverse-estimate character count
+                source = source[:char_limit] + "\n\n[...this source was truncated because it was too long...]"
+                logger.warning(f"Source {processed+1} too long ({source_tokens:,} tokens); truncated to {remaining_for_one:,} tokens")
 
             draft = await _refine_once(draft, [source], full_research_topic, system_prompt, extra_context, tier, p, role)
             processed += 1
         else:
-            # 正常情況：貪心塞多篇
+            # Normal case: greedily pack multiple sources
             batch = []
             batch_tokens = 0
             while processed < len(sorted_sources):
                 source = sorted_sources[processed]
                 source_tokens = estimate_tokens(source)
                 if batch and batch_tokens + source_tokens > remaining:
-                    break  # 這批滿了
+                    break  # this batch is full
                 batch.append(source)
                 batch_tokens += source_tokens
                 processed += 1
 
             draft = await _refine_once(draft, batch, full_research_topic, system_prompt, extra_context, tier, p, role)
 
-        logger.info(f"已處理 {processed}/{len(sorted_sources)} sources, draft: {estimate_tokens(draft):,} tokens")
+        logger.info(f"Processed {processed}/{len(sorted_sources)} sources, draft: {estimate_tokens(draft):,} tokens")
 
     return draft
 
@@ -676,26 +677,26 @@ async def _single_pass(
     provider: str,
     role: str | None = None,
 ) -> str:
-    """全塞模式：一次 LLM call 處理所有 sources。"""
+    """Fit-all-at-once mode: a single LLM call handles all sources."""
     all_sources = "\n\n---\n\n".join(
-        f"### 來源 {i+1}\n{s}" for i, s in enumerate(sources)
+        f"### Source {i+1}\n{s}" for i, s in enumerate(sources)
     )
 
-    # Prompt caching 設計：
-    #   Anthropic: system message + human message 前段（research_topic）會被 cache
-    #              需要在 content block 加 cache_control
-    #   OpenAI:    自動 prefix caching（prompt > 1024 tokens 時啟用，無需額外參數）
-    #   Gemini:    自動 prefix caching
+    # Prompt caching design:
+    #   Anthropic: system message + the prefix of the human message (research_topic) are cached;
+    #              cache_control must be added to the content block.
+    #   OpenAI:    automatic prefix caching (enabled when prompt > 1024 tokens; no extra parameter needed)
+    #   Gemini:    automatic prefix caching
     system_content = _build_system_with_cache(system_prompt, provider)
 
     extra_section = f"\n\n---\n\n{extra_context}" if extra_context else ""
-    human_text = f"""## 研究任務書
+    human_text = f"""## Research brief
 
 {full_research_topic}{extra_section}
 
 ---
 
-## 搜尋結果（共 {len(sources)} 篇）
+## Search results ({len(sources)} total)
 
 {all_sources}"""
 
@@ -728,33 +729,33 @@ async def _refine_once(
     provider: str,
     role: str | None = None,
 ) -> str:
-    """一輪 Iterative Refinement：draft + 一批 sources → 更新後的 draft。"""
+    """One round of Iterative Refinement: draft + a batch of sources -> updated draft."""
     batch_text = "\n\n---\n\n".join(
-        f"### 來源 {i+1}\n{s}" for i, s in enumerate(source_batch)
+        f"### Source {i+1}\n{s}" for i, s in enumerate(source_batch)
     )
 
-    draft_section = draft if draft else "（尚無結果，這是第一輪）"
+    draft_section = draft if draft else "(No results yet; this is the first round.)"
 
-    # Prompt caching 設計：
-    #   fixed_prompt（SYSTEM + 研究任務書 + extra_context）每輪不變 → cached
-    #   draft 每輪成長但前段不變 → 部分 cached
-    #   source_batch 每輪全新 → 不 cached
+    # Prompt caching design:
+    #   fixed_prompt (SYSTEM + research brief + extra_context) is stable every round -> cached
+    #   the draft grows each round but its prefix is stable -> partially cached
+    #   source_batch is fresh every round -> not cached
     system_content = _build_system_with_cache(system_prompt, provider)
 
     extra_section = f"\n\n---\n\n{extra_context}" if extra_context else ""
-    human_text = f"""## 研究任務書
+    human_text = f"""## Research brief
 
 {full_research_topic}{extra_section}
 
 ---
 
-## 目前累積結果
+## Current accumulated draft
 
 {draft_section}
 
 ---
 
-## 本輪新資訊（共 {len(source_batch)} 篇）
+## New information this round ({len(source_batch)} total)
 
 {batch_text}"""
 
@@ -784,10 +785,10 @@ async def _refine_once(
 def _build_system_with_cache(system_text: str, provider: str) -> str | list[dict]:
     """Build system message content with provider-specific cache control.
 
-    Anthropic: 使用 cache_control 標記，讓 system prompt 被 cache。
-               cache_control: {"type": "ephemeral"} 表示這個 block 應被 cache，
-               TTL 為 5 分鐘（Anthropic 自動管理）。
-    OpenAI/Gemini: 自動 prefix caching，不需要額外參數，回傳純字串。
+    Anthropic: use the cache_control marker so the system prompt is cached.
+               cache_control: {"type": "ephemeral"} means this block should be
+               cached with a 5-minute TTL (managed automatically by Anthropic).
+    OpenAI/Gemini: automatic prefix caching; no extra parameter needed, return a plain string.
     """
     if provider == "claude":
         return [
@@ -807,16 +808,16 @@ def _build_human_with_cache(
 ) -> str | list[dict]:
     """Build human message content with cache control on the fixed prefix.
 
-    將 research_topic 標記為 cacheable prefix：
-      - 它在每輪迴圈中都不變
-      - 它通常是最長的固定部分
-      - cache 命中後，後面的 draft + sources 是增量付費
+    Mark research_topic as the cacheable prefix because:
+      - It does not change across loop rounds.
+      - It is usually the longest fixed portion.
+      - After the cache hits, subsequent draft + sources are paid for incrementally.
 
-    Anthropic: 拆成兩個 content block，第一個（research_topic）加 cache_control。
-    OpenAI/Gemini: 自動 prefix caching，不需要拆分。
+    Anthropic: split into two content blocks; the first (research_topic) gets cache_control.
+    OpenAI/Gemini: automatic prefix caching; no splitting needed.
     """
     if provider == "claude":
-        # 找到 research_topic 在 full_text 中的結束位置，拆成兩段
+        # Find where research_topic ends within full_text and split into two segments
         topic_end = full_text.find(research_topic) + len(research_topic)
         prefix = full_text[:topic_end]
         suffix = full_text[topic_end:]

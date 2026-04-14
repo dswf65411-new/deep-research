@@ -1,4 +1,4 @@
-"""Smoke tests for Fallback Loop — issue #8 fix.
+"""Smoke tests for Fallback Loop - issue #8 fix.
 
 Verifies:
 - ResearchState has needs_refetch, fallback_count, quality_scores
@@ -40,7 +40,7 @@ def test_state_has_quality_scores():
 
 
 # ---------------------------------------------------------------------------
-# trigger_fallback_node — returns needs_refetch for low-grounding SQs
+# trigger_fallback_node - returns needs_refetch for low-grounding SQs
 # ---------------------------------------------------------------------------
 
 def _make_claim(claim_id, subquestion, bedrock, verdict):
@@ -68,7 +68,7 @@ def test_trigger_flags_low_grounding(tmp_path):
         "quality_scores": {"Q1": {"actionability": True, "freshness": True, "plurality": True, "completeness": True}},
         "fallback_count": 0,
         "workspace_path": str(tmp_path),
-        # bypass budget guard — we want to test quality-based triggering
+        # bypass budget guard - we want to test quality-based triggering
         "search_count": 100,
         "search_budget": 150,
         "depth": "deep",
@@ -131,7 +131,7 @@ def test_trigger_no_refetch_for_good_sq(tmp_path):
         "quality_scores": {"Q4": {"actionability": True, "freshness": True, "plurality": True, "completeness": True}},
         "fallback_count": 0,
         "workspace_path": str(tmp_path),
-        # bypass budget guard — we want to test quality-based triggering
+        # bypass budget guard - we want to test quality-based triggering
         "search_count": 100,
         "search_budget": 150,
         "depth": "deep",
@@ -142,7 +142,7 @@ def test_trigger_no_refetch_for_good_sq(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# trigger_fallback_node — BLOCKER when fallback_count >= 2
+# trigger_fallback_node - BLOCKER when fallback_count >= 2
 # ---------------------------------------------------------------------------
 
 def test_trigger_emits_blocker_at_max_retries(tmp_path):
@@ -196,7 +196,7 @@ def test_focus_section_in_prompt_when_focus():
     import deep_research.nodes.phase1a as p1a
     src = inspect.getsource(p1a._plan_queries)
     assert "focus_sqs" in src
-    assert "聚焦補搜模式" in src or "focus_section" in src
+    assert "focused refetch mode" in src or "focus_section" in src
 
 
 def test_phase1a_caps_budget_in_focus_mode():
@@ -209,12 +209,12 @@ def test_phase1a_caps_budget_in_focus_mode():
 
 
 # ---------------------------------------------------------------------------
-# graph — trigger_fallback node exists
+# graph - trigger_fallback node exists
 # ---------------------------------------------------------------------------
 
 def test_graph_has_trigger_fallback_node():
     from deep_research.graph import build_deep_research
-    # Just check the node is registered — don't compile with checkpointer
+    # Just check the node is registered - don't compile with checkpointer
     import deep_research.nodes.phase1b as p1b
     assert hasattr(p1b, "trigger_fallback_node")
 
@@ -244,4 +244,4 @@ def test_phase2_source_has_blocker_disclaimer():
     import deep_research.nodes.phase2 as p2
     src = inspect.getsource(p2.phase2_integrate)
     assert "BLOCKER" in src
-    assert "資料不足" in src or "disclaimer" in src.lower()
+    assert "insufficient data" in src or "disclaimer" in src.lower()

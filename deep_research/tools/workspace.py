@@ -6,6 +6,8 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+from deep_research.harness.secret_scanner import redact_secrets
+
 
 def create_workspace(topic: str, base_dir: str | None = None) -> str:
     """Create workspace directory structure. Returns the workspace path.
@@ -24,6 +26,12 @@ def create_workspace(topic: str, base_dir: str | None = None) -> str:
     ).strip("-")
     workspace = base / f"{date_str}_{safe_topic}"
     workspace.mkdir(parents=True, exist_ok=True)
+    # Owner-only access — workspace may contain redacted-but-still-sensitive
+    # research notes, grounding fingerprints, etc.
+    try:
+        os.chmod(workspace, 0o700)
+    except OSError:
+        pass  # e.g. Windows / restricted filesystem — best-effort
 
     # Sub-directories
     for sub in [
@@ -36,11 +44,25 @@ def create_workspace(topic: str, base_dir: str | None = None) -> str:
     return str(workspace)
 
 
+def _safe_content(content: str) -> str:
+    """Defense-in-depth redact before any workspace write.
+
+    Input-layer redaction (main.py) catches user-supplied secrets. This
+    second pass catches secrets echoed by LLMs, pulled from fetched URLs,
+    or introduced by a code path that bypassed the input layer.
+    """
+    redacted, _ = redact_secrets(content)
+    return redacted
+
+
 def write_workspace_file(workspace_path: str, filename: str, content: str) -> str:
-    """Write a file inside the workspace. Returns the full path."""
+    """Write a file inside the workspace. Returns the full path.
+
+    Secrets are redacted before the file hits disk.
+    """
     path = Path(workspace_path) / filename
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    path.write_text(_safe_content(content), encoding="utf-8")
     return str(path)
 
 
@@ -53,11 +75,14 @@ def read_workspace_file(workspace_path: str, filename: str) -> str | None:
 
 
 def append_workspace_file(workspace_path: str, filename: str, content: str) -> str:
-    """Append content to a workspace file."""
+    """Append content to a workspace file.
+
+    Secrets are redacted before the file hits disk.
+    """
     path = Path(workspace_path) / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
-        f.write(content)
+        f.write(_safe_content(content))
     return str(path)
 
 
@@ -87,12 +112,12 @@ def init_execution_log(workspace_path: str, topic: str, budget: int) -> str:
     """Initialise the execution-log.md file."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     content = (
-        f"# 執行日誌\n"
-        f"**研究主題：** {topic}\n"
-        f"**開始時間：** {ts}\n"
-        f"**搜尋預算：** 0 / {budget}\n\n"
-        f"## 已搜 Query 清單\n\n"
-        f"## 第 1 輪\n"
+        f"# Execution Log\n"
+        f"**Research Topic:** {topic}\n"
+        f"**Start time:** {ts}\n"
+        f"**Search budget:** 0 / {budget}\n\n"
+        f"## Queries already searched\n\n"
+        f"## Round 1\n"
     )
     return write_workspace_file(workspace_path, "execution-log.md", content)
 
@@ -101,11 +126,11 @@ def init_gap_log(workspace_path: str) -> str:
     """Initialise the gap-log.md file."""
     content = (
         "# Gap Log\n\n"
-        "## 缺失視角\n"
-        "（Phase 1 搜尋過程中發現但尚未覆蓋的立場）\n\n"
-        "## 薄弱證據\n"
-        "（只有單一來源的 claim）\n\n"
-        "## 未解矛盾\n"
-        "（正反方都有 approved claim 但結論相反）\n"
+        "## Missing perspectives\n"
+        "(positions discovered during Phase 1 search but not yet covered)\n\n"
+        "## Weak evidence\n"
+        "(claims backed by a single source only)\n\n"
+        "## Unresolved contradictions\n"
+        "(both advocate and critic sides have approved claims but opposite conclusions)\n"
     )
     return write_workspace_file(workspace_path, "gap-log.md", content)

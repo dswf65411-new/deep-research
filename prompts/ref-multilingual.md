@@ -1,35 +1,35 @@
-# 多語言搜尋設定
+# Multilingual Search Configuration
 
-## 擴展語言引擎（依主題啟用）
+## Extended-language engines (enable by topic)
 
-| 語言 | Serper 參數 | 典型平台 | 啟用條件 |
+| Language | Serper parameters | Typical platforms | Enablement condition |
 |------|-----------|---------|---------|
-| 🇨🇳 简中 (Google) | gl=cn, hl=zh-CN | 知乎、CSDN、掘金 | 涉及中國技術/市場 |
-| 🇨🇳 简中 (百度) | Baidu Search API | 微信公眾號、百度貼吧 | 與 Serper ZH-CN 同時啟用 |
-| 🇯🇵 日文 | gl=jp, hl=ja | Qiita、Zenn | 日本市場/製造/遊戲 |
-| 🇩🇪 德文 | gl=de, hl=de | Heise、Golem | GDPR/工業 4.0 |
-| 🇫🇷 法文 | gl=fr, hl=fr | Le Monde Informatique | 歐盟法規 |
-| 🇪🇸 西文 | gl=es, hl=es | — | 拉美市場 |
-| 🇧🇷 葡文 | gl=br, hl=pt | — | 巴西市場 |
-| 🇷🇺 俄文 | gl=ru, hl=ru | Habr | 俄羅斯/東歐技術 |
+| Simplified Chinese (Google) | gl=cn, hl=zh-CN | Zhihu, CSDN, Juejin | Topic touches Chinese tech/market |
+| Simplified Chinese (Baidu) | Baidu Search API | WeChat Official Accounts, Baidu Tieba | Enabled together with Serper ZH-CN |
+| Japanese | gl=jp, hl=ja | Qiita, Zenn | Japan market/manufacturing/gaming |
+| German | gl=de, hl=de | Heise, Golem | GDPR/Industry 4.0 |
+| French | gl=fr, hl=fr | Le Monde Informatique | EU regulation |
+| Spanish | gl=es, hl=es | — | Latin America market |
+| Portuguese | gl=br, hl=pt | — | Brazil market |
+| Russian | gl=ru, hl=ru | Habr | Russia/Eastern Europe tech |
 
-## 搜尋矩陣
+## Search Matrix
 
 ```
-EN query   → WebSearch + Brave                                    (2)
-ZH-TW      → WebSearch + Serper(gl=tw, hl=zh-TW)                 (2)
-學術        → Serper(site:semanticscholar.org + site:arxiv.org)    (1-2，學術主題時)
---- 擴展語言（啟用時）---
-ZH-CN      → Serper(gl=cn, hl=zh-CN) + Baidu                     (2)
-JA/DE/FR/ES/PT/RU → Serper(對應參數)                              (各1)
+EN query   -> WebSearch + Brave                                    (2)
+ZH-TW      -> WebSearch + Serper(gl=tw, hl=zh-TW)                  (2)
+Academic   -> Serper(site:semanticscholar.org + site:arxiv.org)    (1-2, for academic topics)
+--- Extended languages (when enabled) ---
+ZH-CN      -> Serper(gl=cn, hl=zh-CN) + Baidu                      (2)
+JA/DE/FR/ES/PT/RU -> Serper(matching parameters)                   (1 each)
 ```
 
-## 翻譯規則
+## Translation Rules
 
-- 不逐字直譯，用該語言社群的**慣用術語**
-- 無成熟本地術語 → 保留英文搜尋
-- 擴展語言 query 數量 = 核心語言的一半（省預算）
+- Do not translate word-for-word; use the **idiomatic terminology** of that language's community
+- No mature local term -> keep English for the search
+- Extended-language query count = half of the core language (to save budget)
 
-## 中國大陸限制
+## China Mainland Restrictions
 
-Google 被封鎖，微信公眾號、百度貼吧等封閉平台不被 Google 索引。搜中國資訊時 Serper ZH-CN + 百度同時搜。
+Google is blocked; closed platforms such as WeChat Official Accounts and Baidu Tieba are not indexed by Google. When searching for Chinese information, run Serper ZH-CN and Baidu in parallel.

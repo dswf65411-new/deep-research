@@ -19,6 +19,7 @@ from deep_research.harness.source_tier import tier_rank
 from deep_research.llm import get_llm, safe_ainvoke, safe_ainvoke_chain
 from deep_research.state import Claim, ResearchState, Source
 from deep_research.tools.workspace import (
+    append_workspace_file,
     read_workspace_file,
     write_workspace_file,
 )
@@ -28,14 +29,14 @@ from deep_research.context import iterative_refine
 
 logger = logging.getLogger(__name__)
 
-# 掃 section 文字找 claim_id 引用的 pattern（e.g. Q1-C1, Q12-C23）
+# Pattern for scanning claim_id quotes in section text (e.g. Q1-C1, Q12-C23)
 _CLAIM_ID_RE = re.compile(r"\bQ\d+-C\d+\b")
 
-_DOMAIN_BIAS_THRESHOLD = 0.30  # 同 phase1a._log_domain_bias
+_DOMAIN_BIAS_THRESHOLD = 0.30  # Same as phase1a._log_domain_bias
 
 
 def _extract_domain(url: str) -> str:
-    """從 URL 提取 hostname，去掉 www. 前綴。"""
+    """Extract hostname from URL, stripping the www. prefix."""
     from urllib.parse import urlparse
     try:
         host = urlparse(url).hostname or ""
@@ -45,7 +46,7 @@ def _extract_domain(url: str) -> str:
 
 
 def _detect_biased_domains(sources: list[Source]) -> set[str]:
-    """計算所有 sources 的 domain 分佈，回傳佔比超過 30% 的 domain 集合。"""
+    """Compute domain distribution across all sources and return the set of domains whose share exceeds 30%."""
     from collections import Counter
     domains = [
         _extract_domain(s.url)
@@ -86,17 +87,62 @@ def _dedup_approved_claims(claims: list[Claim]) -> list[Claim]:
     return result
 
 
-def _scan_phantom_claim_ids(section: str, approved_ids: set[str]) -> list[str]:
-    """Return claim_ids 出現在 section 文字但不在 approved_ids 中的清單。
+def _build_fallback_section(
+    subq: str,
+    claims: list[Claim],
+    biased_domains: set[str],
+    sid_to_domain: dict[str, str],
+    error: str,
+) -> str:
+    """Emergency section used when the LLM writer fails for a subquestion.
 
-    phase2 LLM 被要求只引用 approved claims。偶發 LLM 會幻覺 ID（拼錯 / 編造
-    不存在的 ID）。phase3 audit 會抓到鏈斷裂，但越早抓住越省事。
+    Preserves each claim verbatim with its ``[Qx-Cy]`` tag so Phase 3's
+    statement ledger can still build a traceability chain. Clearly marked so
+    readers know the narrative integration step was skipped — this is NOT a
+    synthesised report paragraph.
+
+    Why: without this, a transient LLM failure wipes the entire report body
+    (observed 2026-04-14: 113 approved claims but zero sections on disk).
+    A bullet dump is uglier than a polished paragraph but far better than
+    silent failure.
+    """
+    header = (
+        f"## {subq} — section integration failed, using fallback format\n\n"
+        f"> **Phase 2 writer failed**: {error[:200]}\n"
+        f"> Below are the approved claims for this subquestion, listed verbatim (**no LLM integration, no inference**).\n"
+        f"> Confidence level: LOW (for audit traceability only; not treated as complete analysis)\n\n"
+    )
+    lines: list[str] = []
+    for c in claims:
+        bias_tag = ""
+        if biased_domains:
+            hit = {
+                sid_to_domain[sid]
+                for sid in c.source_ids
+                if sid in sid_to_domain and sid_to_domain[sid] in biased_domains
+            }
+            if hit:
+                bias_tag = f"  [BIASED_SOURCE: {', '.join(sorted(hit))}]"
+        # Inline citation [Qx-Cy] after each claim so Phase 3 ledger can
+        # extract claim_ids via the same regex it uses for normal sections.
+        lines.append(f"- {c.claim_text} [{c.claim_id}]{bias_tag}")
+    return header + "\n".join(lines) + "\n"
+
+
+def _scan_phantom_claim_ids(section: str, approved_ids: set[str]) -> list[str]:
+    """Return the list of claim_ids that appear in the section text but are not in approved_ids.
+
+    The phase2 LLM is instructed to only quote approved claims. Occasionally the LLM
+    hallucinates IDs (typos / fabricated IDs that do not exist). The phase3 audit
+    catches chain breaks, but catching them earlier saves work.
 
     Note:
-        phase2 本身不做 span-based 驗證：它是「寫作者」而非「抽取者」，
-        原始文字引用已經在 phase1a 被 index 驗證過；section 文字會在 phase3
-        被 verify_indexed_items 切成 statement 並再度 index 驗證。這裡只做
-        輕量的 claim_id referential integrity 檢查，不碰文字內容本身。
+        phase2 itself does not perform span-based validation: it is a "writer"
+        rather than an "extractor". The original-text quotes were already
+        validated by the index check in phase1a; section text will be split
+        into statements and index-validated again by verify_indexed_items in
+        phase3. This function performs only a lightweight referential integrity
+        check on claim_ids and does not touch the text content itself.
     """
     found = set(_CLAIM_ID_RE.findall(section or ""))
     return sorted(found - approved_ids)
@@ -115,7 +161,7 @@ async def phase2_integrate(state: ResearchState) -> dict:
     for _f in _old_sections:
         try:
             Path(_f).unlink()
-            logger.info("phase2: 清除舊 section 檔案 %s", Path(_f).name)
+            logger.info("phase2: removed stale section file %s", Path(_f).name)
         except OSError:
             pass
 
@@ -130,8 +176,10 @@ async def phase2_integrate(state: ResearchState) -> dict:
     # Iron rule: only approved claims with quote_ids
     approved = validate_claims_for_phase2(claim_objects)
 
-    # Near-duplicate dedup：同一 subquestion 內相似度 >= 0.92 的 claim 只保留第一個
-    # 防止跨輪補搜把同語意 claim 重複送進 LLM（distractor + token 浪費）
+    # Near-duplicate dedup: within the same subquestion, claims with similarity >= 0.92
+    # keep only the first occurrence.
+    # Prevents cross-round follow-up searches from feeding semantically duplicate claims
+    # to the LLM (distractor + token waste).
     approved = _dedup_approved_claims(approved)
 
     # Iron rule: numeric claims must have number_tag
@@ -143,11 +191,12 @@ async def phase2_integrate(state: ResearchState) -> dict:
     # Read phase instructions
     instructions = get_prompt("phase2-integrate.md")
 
-    # Read gap log（source-registry 不再塞入 LLM context — 是 distractor，
-    # LLM 整合本子問題段落時不需要看其他子問題的 source 列表）
+    # Read gap log (source-registry is no longer injected into LLM context —
+    # it acts as a distractor; when the LLM integrates a subquestion section it
+    # does not need to see the source list for other subquestions)
     gap_log = read_workspace_file(workspace, "gap-log.md") or ""
 
-    # 取 full_research_topic
+    # Fetch full_research_topic
     full_research_topic = read_workspace_file(workspace, "research-brief.md") or ""
 
     # Group claims by subquestion
@@ -155,8 +204,8 @@ async def phase2_integrate(state: ResearchState) -> dict:
     for c in approved:
         by_subq.setdefault(c.subquestion, []).append(c)
 
-    # 收集每個 subquestion 的 source 文字（供 iterative_refine 分批處理）
-    # 傳入 sources 讓 _gather_source_texts 按 tier 排序（T1-T3 優先）
+    # Collect source text for each subquestion (for iterative_refine batched processing).
+    # Pass in sources so _gather_source_texts can sort by tier (T1-T3 first).
     all_sources: list[Source] = [
         s if isinstance(s, Source) else Source(**s)
         for s in state.get("sources", [])
@@ -164,16 +213,16 @@ async def phase2_integrate(state: ResearchState) -> dict:
     ]
     subq_sources = _gather_source_texts(workspace, approved, sources=all_sources)
 
-    # Domain 濃度偵測：找出佔比過高的 domain（同 phase1a 的 _log_domain_bias）
+    # Domain concentration detection: find domains with excessive share (same as phase1a's _log_domain_bias)
     biased_domains: set[str] = _detect_biased_domains(all_sources)
-    # 建立 source_id → domain 映射，供 claim 標記使用
+    # Build source_id -> domain mapping for claim tagging
     sid_to_domain: dict[str, str] = {
         s.source_id: _extract_domain(s.url)
         for s in all_sources
         if s.url
     }
 
-    # BLOCKER 清單（由 trigger_fallback_node 寫入）
+    # BLOCKER list (written by trigger_fallback_node)
     all_blockers: list[str] = state.get("blockers", [])
 
     async def _write_one_section(
@@ -197,88 +246,106 @@ async def phase2_integrate(state: ResearchState) -> dict:
                 }
                 if claim_domains:
                     tag = ", ".join(sorted(claim_domains))
-                    base += f"  [⚠️BIASED_SOURCE: {tag}]"
+                    base += f"  [BIASED_SOURCE: {tag}]"
             return base
 
         claims_text = "\n".join(_claim_line(c) for c in subq_claims)
 
+        def _persist_fallback(err: str) -> tuple[str, str, list[str]]:
+            section = _build_fallback_section(
+                subq, subq_claims, biased_domains, sid_to_domain, err
+            )
+            write_workspace_file(
+                workspace, f"report-sections/{subq.lower()}_section.md", section
+            )
+            return subq, section, [
+                f"phase2/{subq}: LLM writer failed; wrote fallback section: {err[:200]}"
+            ]
+
         integrate_system = f"""{instructions}
 
-你是研究報告整合器。根據已驗證的 approved claims 和來源原文，生成報告段落。
+You are the research report integrator. Based on the validated approved claims and source originals, generate a report section.
 
-## 鐵律
-1. 只使用以下 approved claims，禁止引用其他資訊
-2. **每句事實必須在句末附 claim_id 標記，格式：[Q1-C2]**
-   - 範例：「Whisper Large v3 的中文 WER 為 8.3%。[Q1-C5]」
-   - 範例：「macOS 14 以上版本才支援此功能。[Q2-C3]」
-   - 如果一句引用多個 claim：「...。[Q1-C5] [Q1-C7]」
-3. 跨 claim 推導必須標記 [INFERENCE] 並附相關 claim_id：
-   - 範例：「[INFERENCE] 因此本地化工具在隱私上占優勢。[Q1-C5] [Q2-C1]」
-4. 數字必須標記 ORIGINAL/NORMALIZED/DERIVED
-5. 信心等級必須分配（🟢HIGH / 🟡MEDIUM / 🟠CONFLICTING / 🔴LOW）
-6. **標題、引導句、轉折句、摘要結論句不需要 claim_id** — 這些屬於報告結構，不是事實斷言
-7. **[⚠️BIASED_SOURCE] 標記**：若 claim 帶有此標記，代表來源 domain 佔比 > 30%（可能自家宣傳）。
-   - 除非有 T1-T3 獨立來源的 claim 佐證同一事實，否則必須標記 🟠CONFLICTING
-   - 在報告中加括號說明：「（此資訊來自 {domain} 自家來源，僅供參考）」
+## Hard Rules
+1. Use only the approved claims below; quoting any other information is forbidden.
+2. **Every factual sentence must end with a claim_id marker in the format [Q1-C2].**
+   - Example: "Whisper Large v3 achieves 8.3% Chinese WER. [Q1-C5]"
+   - Example: "This feature is supported only on macOS 14 and later. [Q2-C3]"
+   - When one sentence quotes multiple claims: "...[Q1-C5] [Q1-C7]"
+3. Cross-claim inferences must be labelled [INFERENCE] and list the relevant claim_ids:
+   - Example: "[INFERENCE] Therefore local tools have a privacy advantage. [Q1-C5] [Q2-C1]"
+4. Numbers must be tagged ORIGINAL/NORMALIZED/DERIVED.
+5. A confidence level must be assigned (HIGH / MEDIUM / CONFLICTING / LOW).
+6. **Headings, lead-in sentences, transitional sentences, and concluding summary sentences do not need claim_ids** — these are report structure, not factual assertions.
+7. **[BIASED_SOURCE] marker**: when a claim carries this marker, the source domain share exceeds 30% (likely self-promotion).
+   - Unless an independent T1-T3 source corroborates the same fact, the claim must be flagged as CONFLICTING.
+   - Add a parenthetical note in the report: "(this information comes from {{domain}}'s own source; treat with caution)".
 
-## Iterative 模式說明
+## Iterative mode notes
 
-你可能會收到多輪來源文件。每輪你要：
-1. 審閱本輪來源原文，將有價值的資訊整合進草稿
-2. 保持草稿結構完整，新資訊插入到對應段落末尾
-3. 輸出完整的最新報告段落（不是 diff）
+You may receive source documents in multiple rounds. Each round you must:
+1. Review this round's source originals and integrate valuable information into the draft.
+2. Keep the draft structure intact; append new information to the end of the relevant section.
+3. Output the complete latest report section (not a diff).
 
-語言：繁體中文（技術術語保留原文）。
-請按照 Phase 2 Step 6 的格式生成 {subq} 的報告段落。"""
+Language: English (keep technical terms verbatim).
+Please follow the Phase 2 Step 6 format to generate the report section for {subq}."""
 
-        extra = f"""## 子問題：{subq}
+        extra = f"""## Subquestion: {subq}
 
 ## Approved Claims
 {claims_text}"""
 
         source_texts = subq_sources.get(subq, [])
 
-        if source_texts:
-            section = await iterative_refine(
-                sources=source_texts,
-                full_research_topic=full_research_topic,
-                system_prompt=integrate_system,
-                extra_context=extra,
-                role="writer",
-            )
-        else:
-            response = await safe_ainvoke_chain(
-                role="writer",
-                messages=[
-                    SystemMessage(content=integrate_system),
-                    HumanMessage(content=f"""{extra}\n\n（本子問題無搜尋結果原文，請僅根據 approved claims 生成報告段落）"""),
-                ],
-                max_tokens=16384,
-                temperature=0.2,
-            )
-            section = response.content
+        try:
+            if source_texts:
+                section = await iterative_refine(
+                    sources=source_texts,
+                    full_research_topic=full_research_topic,
+                    system_prompt=integrate_system,
+                    extra_context=extra,
+                    role="writer",
+                )
+            else:
+                response = await safe_ainvoke_chain(
+                    role="writer",
+                    messages=[
+                        SystemMessage(content=integrate_system),
+                        HumanMessage(content=f"""{extra}\n\n(This subquestion has no search result originals; generate the report section using only the approved claims.)"""),
+                    ],
+                    max_tokens=16384,
+                    temperature=0.2,
+                )
+                section = response.content
+        except Exception as e:
+            logger.exception("phase2/%s writer failed; falling back to raw claim dump", subq)
+            return _persist_fallback(str(e))
+
+        if not section or not section.strip():
+            return _persist_fallback("LLM returned empty section")
 
         # Referential integrity check
         approved_ids = {c.claim_id for c in approved}
         phantom_ids = _scan_phantom_claim_ids(section, approved_ids)
         if phantom_ids:
-            msg = f"phase2/{subq}: 引用未核准 claim_id: {', '.join(phantom_ids)}"
+            msg = f"phase2/{subq}: quoted unapproved claim_ids: {', '.join(phantom_ids)}"
             logger.warning(msg)
             local_blockers.append(msg)
 
-        # BLOCKER 免責聲明
+        # BLOCKER disclaimer
         if any(f"[BLOCKER: {subq}" in b for b in all_blockers):
             disclaimer = (
-                f"> ⚠️ **資料不足警告（{subq}）**\n"
-                f"> 本子問題的 grounding 分數未達標準，且已進行最大次數補搜（2 次）。\n"
-                f"> 以下分析僅依據現有有限資料，請謹慎參考，可能存在缺漏。\n\n"
+                f"> **Insufficient data warning ({subq})**\n"
+                f"> The grounding score for this subquestion fell short of the threshold and the maximum follow-up searches (2) have already been performed.\n"
+                f"> The analysis below is based only on the limited data available; treat with caution — gaps may exist.\n\n"
             )
             section = disclaimer + section
 
         write_workspace_file(workspace, f"report-sections/{subq.lower()}_section.md", section)
         return subq, section, local_blockers
 
-    # 所有子問題段落並行寫入（原序列 for 改為 asyncio.gather）
+    # Write all subquestion sections in parallel (the original sequential for-loop is replaced with asyncio.gather)
     ordered_subqs = sorted(by_subq.items())
     results = await asyncio.gather(
         *[_write_one_section(sq, sq_claims) for sq, sq_claims in ordered_subqs],
@@ -288,17 +355,41 @@ async def phase2_integrate(state: ResearchState) -> dict:
     report_sections = []
     for r in results:
         if isinstance(r, BaseException):
-            logger.error("phase2 section error: %s", r)
+            # Defensive: _write_one_section's own try/except should have
+            # caught writer failures and returned a fallback tuple. An
+            # exception reaching here means something outside the writer
+            # path failed (file I/O, fallback builder bug). Surface it.
+            msg = f"phase2 section task raised an unexpected exception: {r!r}"
+            logger.error(msg)
+            blockers.append(msg)
             continue
         _, section, local_blockers = r
         report_sections.append(section)
         blockers.extend(local_blockers)
 
+    # Critical assertion — never leave the pipeline with an empty
+    # report-sections/ directory when there were approved claims to write.
+    sections_on_disk = list((Path(workspace) / "report-sections").glob("*.md"))
+    if by_subq and not sections_on_disk:
+        critical_msg = (
+            f"[CRITICAL: phase2] {len(by_subq)} SQs have approved claims "
+            f"({len(approved)} claims total), but report-sections/ is empty."
+            f" Downstream phase3 will be unable to produce a detailed analysis section."
+        )
+        logger.critical(critical_msg)
+        blockers.append(critical_msg)
+        append_workspace_file(
+            workspace,
+            "gap-log.md",
+            f"\n\n## CRITICAL — Phase 2 empty output\n- {critical_msg}\n",
+        )
+
     return {
         "report_sections": report_sections,
         "blockers": blockers,
         "execution_log": [
-            f"Phase 2 完成：{len(report_sections)} 段落，{len(approved)} approved claims 整合"
+            f"Phase 2 complete: {len(report_sections)} sections, {len(approved)} approved claims integrated"
+            + (f" ({len(sections_on_disk)} files written)" if sections_on_disk else " (warning: report-sections is empty)")
         ],
     }
 
@@ -310,8 +401,8 @@ def _gather_source_texts(
 ) -> dict[str, list[str]]:
     """Read search result files relevant to approved claims, grouped by subquestion.
 
-    回傳 dict[subquestion, list[source_text]]，每篇 source 為一個獨立字串。
-    這個格式讓 iterative_refine 可以分批處理（BM25 排序 + 貪心塞入）。
+    Returns dict[subquestion, list[source_text]]; each source is a separate string.
+    This format lets iterative_refine batch them (BM25 ranking + greedy packing).
 
     T1-T3 sources are placed before T4-T5 so iterative_refine feeds higher-quality
     content to the integrator first (BM25 fallback still applies within each batch).

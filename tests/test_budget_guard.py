@@ -1,4 +1,4 @@
-"""Smoke tests for Budget Guard — issue #4 fix.
+"""Smoke tests for Budget Guard - issue #4 fix.
 
 Verifies:
 - DEPTH_CONFIG has min_budget_per_sq for all depths
@@ -41,9 +41,9 @@ def test_depth_config_has_min_budget_per_sq():
 # ---------------------------------------------------------------------------
 
 def test_extract_sq_ids_basic():
-    plan = "## Q1 是否好用？\n\n## Q2 競爭者？\n\n## Q3 ...\n\n## Q1 重複？"
+    plan = "## Q1 is it usable?\n\n## Q2 competitors?\n\n## Q3 ...\n\n## Q1 duplicate?"
     ids = _extract_sq_ids(plan)
-    assert ids == ["Q1", "Q2", "Q3"]  # 有序、去重
+    assert ids == ["Q1", "Q2", "Q3"]  # ordered, deduplicated
 
 
 def test_extract_sq_ids_empty():
@@ -63,10 +63,10 @@ def test_extract_sq_ids_preserves_order():
 
 EXEC_LOG_SAMPLE = """\
 - iOS 18 call recording VoIP support update 2025 [Q1/advocate/en]
-- iOS 18.4 通話錄音 LINE VoIP 支援 更新 [Q1/advocate/zh-TW]
+- iOS 18.4 call recording LINE VoIP support update [Q1/advocate/zh-TW]
 - iPhone LINE call recording impossible iOS sandbox limitation 2025 [Q1/critic/en]
 - best transcription app Chinese speaker diarization 2025 [Q2/advocate/en]
-- 中文 語音轉文字 說話者辨識 App 推薦 2025 [Q2/advocate/zh-TW]
+- Chinese speech-to-text speaker identification app recommendation 2025 [Q2/advocate/zh-TW]
 """
 
 
@@ -97,7 +97,7 @@ def test_log_budget_gaps_writes_when_underfunded():
         open(os.path.join(ws, "gap-log.md"), "w").close()
         _log_budget_gaps(ws, iteration=2, sq_ids=sq_ids, sq_counts=sq_counts, min_per_sq=3)
         content = open(os.path.join(ws, "gap-log.md"), encoding="utf-8").read()
-        assert "## 預算缺口（第 2 輪後）" in content
+        assert "## budget gap (after round 2)" in content
         assert "Q2" in content
         assert "Q3" in content
         assert "Q1" not in content  # Q1 is funded
@@ -111,7 +111,7 @@ def test_log_budget_gaps_no_write_when_all_funded():
         open(gap_path, "w").write("# Gap Log\n")
         _log_budget_gaps(ws, iteration=3, sq_ids=sq_ids, sq_counts=sq_counts, min_per_sq=3)
         content = open(gap_path, encoding="utf-8").read()
-        assert "預算缺口" not in content  # nothing appended
+        assert "budget gap" not in content  # nothing appended
 
 
 def test_log_budget_gaps_shows_shortage_count():
@@ -121,7 +121,7 @@ def test_log_budget_gaps_shows_shortage_count():
         open(os.path.join(ws, "gap-log.md"), "w").close()
         _log_budget_gaps(ws, iteration=1, sq_ids=sq_ids, sq_counts=sq_counts, min_per_sq=12)
         content = open(os.path.join(ws, "gap-log.md"), encoding="utf-8").read()
-        assert "仍缺 10 次" in content  # 12 - 2 = 10
+        assert "still short by 10" in content  # 12 - 2 = 10
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +129,8 @@ def test_log_budget_gaps_shows_shortage_count():
 # ---------------------------------------------------------------------------
 
 def test_underfunded_detection():
-    """從 exec_log 算出 underfunded 清單的完整流程。"""
-    plan = "Q1 子問題一\nQ2 子問題二\nQ3 子問題三\nQ4 子問題四"
+    """End-to-end flow for computing the underfunded list from exec_log."""
+    plan = "Q1 subquestion one\nQ2 subquestion two\nQ3 subquestion three\nQ4 subquestion four"
     exec_log = EXEC_LOG_SAMPLE  # Q1=3, Q2=2, Q3/Q4 missing
 
     sq_ids = _extract_sq_ids(plan)

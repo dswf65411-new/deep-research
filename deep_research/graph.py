@@ -45,7 +45,7 @@ async def human_approval(state: ResearchState) -> dict:
 
     response = interrupt({
         "type": "approve",
-        "question": "請確認研究計畫，或提出修改。",
+        "question": "Please confirm the research plan, or propose revisions.",
         "plan_summary": plan_summary,
         "workspace": state.get("workspace_path", ""),
     })
@@ -99,7 +99,7 @@ async def increment_iteration(state: ResearchState) -> dict:
     current = state.get("iteration_count", 0)
     return {
         "iteration_count": current + 1,
-        "execution_log": [f"迭代 {current + 1} → 回到 Phase 1a"],
+        "execution_log": [f"iteration {current + 1} → back to Phase 1a"],
     }
 
 

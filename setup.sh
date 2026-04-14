@@ -27,7 +27,7 @@ if ! command -v pyenv &>/dev/null; then
     export PATH="$HOME/.pyenv/bin:$PATH"
     eval "$(pyenv init -)"
 else
-    echo "[1/5] pyenv already installed ✓"
+    echo "[1/5] pyenv already installed [OK]"
     eval "$(pyenv init -)"
 fi
 
@@ -35,7 +35,7 @@ fi
 # 2. Install Python
 # ------------------------------------------------------------------
 if pyenv versions --bare | grep -q "^${PYTHON_VERSION}$"; then
-    echo "[2/5] Python ${PYTHON_VERSION} already installed ✓"
+    echo "[2/5] Python ${PYTHON_VERSION} already installed [OK]"
 else
     echo "[2/5] Installing Python ${PYTHON_VERSION}..."
     pyenv install "${PYTHON_VERSION}"
@@ -49,7 +49,7 @@ PYENV_PYTHON="$(pyenv prefix ${PYTHON_VERSION})/bin/python3"
 VENV_DIR="${PROJECT_DIR}/.venv"
 
 if [[ -d "${VENV_DIR}" ]]; then
-    echo "[3/5] venv already exists ✓"
+    echo "[3/5] venv already exists [OK]"
 else
     echo "[3/5] Creating venv..."
     "${PYENV_PYTHON}" -m venv "${VENV_DIR}"
@@ -58,7 +58,7 @@ fi
 echo "      Installing dependencies..."
 "${VENV_DIR}/bin/pip" install --quiet --upgrade pip
 "${VENV_DIR}/bin/pip" install --quiet -r "${PROJECT_DIR}/requirements.txt"
-echo "      Dependencies installed ✓"
+echo "      Dependencies installed [OK]"
 
 # ------------------------------------------------------------------
 # 4. Setup .env (API keys)
@@ -71,12 +71,13 @@ if [[ -f "${PROJECT_DIR}/.env" ]]; then
     echo "      (Delete .env and re-run to reconfigure)"
 else
     echo ""
-    echo "  ╔═══════════════════════════════════════════════════════╗"
-    echo "  ║  需要以下 API keys（Press Enter 跳過非必要項目）      ║"
-    echo "  ╚═══════════════════════════════════════════════════════╝"
+    echo "  +-------------------------------------------------------+"
+    echo "  |  The following API keys are needed (press Enter to    |"
+    echo "  |  skip optional items).                                |"
+    echo "  +-------------------------------------------------------+"
     echo ""
-    echo "  ── LLM（至少需要一個，優先順序：Claude > Gemini > OpenAI）──"
-    echo "     取得方式："
+    echo "  -- LLM (at least one required; priority: Claude > Gemini > OpenAI) --"
+    echo "     Where to get keys:"
     echo "     Claude:  https://console.anthropic.com/settings/keys"
     echo "     Gemini:  https://aistudio.google.com/apikey"
     echo "     OpenAI:  https://platform.openai.com/api-keys"
@@ -89,13 +90,13 @@ else
     # Validate: at least one LLM key
     if [[ -z "${ANTHROPIC_KEY}" && -z "${OPENAI_KEY}" && -z "${GEMINI_KEY}" ]]; then
         echo ""
-        echo "  ⛔ ERROR: 至少需要一個 LLM API key。"
+        echo "  [ERROR] At least one LLM API key is required."
         echo "     Re-run: make init"
         exit 1
     fi
 
     echo ""
-    echo "  ── 搜尋引擎（必填）──"
+    echo "  -- Search engines (required) --"
     echo "     Brave:   https://brave.com/search/api/"
     echo "     Serper:  https://serper.dev/"
     echo ""
@@ -105,16 +106,16 @@ else
 
     if [[ -z "${BRAVE_KEY}" ]]; then
         echo ""
-        echo "  ⛔ ERROR: BRAVE_API_KEY 為必填。"
-        echo "     申請：https://brave.com/search/api/"
+        echo "  [ERROR] BRAVE_API_KEY is required."
+        echo "     Sign up at: https://brave.com/search/api/"
         echo "     Re-run: make init"
         exit 1
     fi
 
     if [[ -z "${SERPER_KEY}" ]]; then
         echo ""
-        echo "  ⛔ ERROR: SERPER_API_KEY 為必填。"
-        echo "     申請：https://serper.dev/"
+        echo "  [ERROR] SERPER_API_KEY is required."
+        echo "     Sign up at: https://serper.dev/"
         echo "     Re-run: make init"
         exit 1
     fi
@@ -132,13 +133,13 @@ EOF
 
     # Show which LLM will be used
     if [[ -n "${ANTHROPIC_KEY}" ]]; then
-        echo "      ✓ LLM: Claude（優先使用）"
+        echo "      [OK] LLM: Claude (preferred)"
     elif [[ -n "${GEMINI_KEY}" ]]; then
-        echo "      ✓ LLM: Gemini（自動偵測）"
+        echo "      [OK] LLM: Gemini (auto-detected)"
     else
-        echo "      ✓ LLM: OpenAI（自動偵測）"
+        echo "      [OK] LLM: OpenAI (auto-detected)"
     fi
-    echo "      .env created ✓"
+    echo "      .env created [OK]"
 fi
 
 # ------------------------------------------------------------------
@@ -153,25 +154,25 @@ INSTALLED_SKILLS=""
 
 # --- Claude Code ---
 if [[ -d "$HOME/.claude" ]]; then
-    read -rp "  偵測到 Claude Code，是否安裝 /deep_research skill？(y/n) " INSTALL_CLAUDE
+    read -rp "  Claude Code detected. Install /deep_research skill? (y/n) " INSTALL_CLAUDE
     if [[ "${INSTALL_CLAUDE}" =~ ^[Yy]$ ]]; then
         SKILL_DIR="$HOME/.claude/commands"
         mkdir -p "${SKILL_DIR}"
         cat > "${SKILL_DIR}/deep_research.md" <<'SKILL_EOF'
 ---
-description: "LangGraph 深度研究。Trigger on: '/deep_research'."
-argument-hint: "<研究主題> [--quick | --standard | --deep] [--budget N] [--model claude|openai|gemini] [--noask]"
+description: "LangGraph deep research. Trigger on: '/deep_research'."
+argument-hint: "<research topic> [--quick | --standard | --deep] [--budget N] [--model claude|openai|gemini] [--noask]"
 ---
 
 # /deep_research
 
-使用 deep-research LangGraph pipeline 執行深度研究。
+Run deep research through the deep-research LangGraph pipeline.
 
-## 執行流程
+## Execution flow
 
-用 Bash tool 執行，加 `--json` flag 啟用 turn-based protocol。
+Run with the Bash tool, passing `--json` to enable the turn-based protocol.
 
-### Step 1: 啟動研究
+### Step 1: Start the research
 
 ```bash
 SKILL_EOF
@@ -180,90 +181,90 @@ SKILL_EOF
         cat >> "${SKILL_DIR}/deep_research.md" <<'SKILL_EOF'
 ```
 
-讀取 stdout 的 JSON 輸出。
+Read the JSON output from stdout.
 
-### Step 2: 互動 Loop
+### Step 2: Interactive loop
 
-根據 JSON 的 `status` 欄位處理：
+Handle each turn based on the JSON `status` field:
 
-**`NEEDS_INPUT` + `type: clarify`：**
-- 從 `questions` 陣列取出所有問題
-- 用對話問使用者每一個問題，收集回答
-- 組成 JSON：`{"0": "第一題回答", "1": "第二題回答"}`
-- 繼續執行：
+**`NEEDS_INPUT` + `type: clarify`:**
+- Take every item from the `questions` array.
+- Ask the user each question through chat, collect each answer.
+- Assemble a JSON answer: `{"0": "first answer", "1": "second answer"}`
+- Continue:
 ```bash
 SKILL_EOF
-        echo "cd ${PROJECT_DIR} && ${VENV_PYTHON} main.py --resume <thread_id> --answer '<JSON回答>' --json 2>/dev/null" >> "${SKILL_DIR}/deep_research.md"
+        echo "cd ${PROJECT_DIR} && ${VENV_PYTHON} main.py --resume <thread_id> --answer '<JSON answers>' --json 2>/dev/null" >> "${SKILL_DIR}/deep_research.md"
         cat >> "${SKILL_DIR}/deep_research.md" <<'SKILL_EOF'
 ```
 
-**`NEEDS_INPUT` + `type: approve`：**
-- 將 `plan_summary` 呈現給使用者
-- 問使用者是否確認
-- 確認：`--answer '{"approved": true}'`
-- 修改：`--answer '{"approved": false, "revised_plan": "修改內容"}'`
+**`NEEDS_INPUT` + `type: approve`:**
+- Present `plan_summary` to the user.
+- Ask the user to confirm.
+- Approve: `--answer '{"approved": true}'`
+- Revise: `--answer '{"approved": false, "revised_plan": "revised text"}'`
 
-**`DONE`：**
-- 讀取 `workspace` 路徑下的 `final-report.md`，呈現給使用者
+**`DONE`:**
+- Read `final-report.md` from the workspace path and present it to the user.
 
-**`ERROR`：**
-- 顯示錯誤訊息
+**`ERROR`:**
+- Show the error message.
 
-### Step 3: 重複 Step 2 直到 status = DONE 或 ERROR
+### Step 3: Repeat Step 2 until status = DONE or ERROR.
 
-## 注意事項
-- 一定要加 `--json` flag，否則會卡在 stdin 等待
-- `--noask` 模式不會有 NEEDS_INPUT，直接跑到 DONE
-- 繁體中文回應
+## Notes
+- Always pass `--json`, otherwise the process will block on stdin.
+- `--noask` mode never emits NEEDS_INPUT and runs straight through to DONE.
+- Reply in English.
 SKILL_EOF
-        echo "      ✓ Claude Code: /deep_research → ${SKILL_DIR}/deep_research.md"
+        echo "      [OK] Claude Code: /deep_research -> ${SKILL_DIR}/deep_research.md"
         INSTALLED_SKILLS="${INSTALLED_SKILLS}\n    /deep_research <topic>                (Claude Code)"
     fi
 else
-    echo "      Claude Code 未安裝，跳過。"
+    echo "      Claude Code not installed; skipping."
 fi
 
 # --- Gemini CLI ---
 if [[ -d "$HOME/.gemini" ]]; then
-    read -rp "  偵測到 Gemini CLI，是否安裝 /deep_research skill？(y/n) " INSTALL_GEMINI
+    read -rp "  Gemini CLI detected. Install /deep_research skill? (y/n) " INSTALL_GEMINI
     if [[ "${INSTALL_GEMINI}" =~ ^[Yy]$ ]]; then
         GEMINI_DIR="$HOME/.gemini/commands"
         mkdir -p "${GEMINI_DIR}"
         cat > "${GEMINI_DIR}/deep_research.toml" <<GEMINI_EOF
 [command]
-description = "LangGraph 深度研究 workflow（支援互動澄清）"
+description = "LangGraph deep-research workflow (supports interactive clarification)"
 
 [command.args.topic]
-description = "研究主題"
+description = "Research topic"
 required = true
 
 [command.args.flags]
-description = "選項：--quick/--standard/--deep --budget N --model claude/openai/gemini --noask"
+description = "Options: --quick/--standard/--deep --budget N --model claude/openai/gemini --noask"
 required = false
 
 [[steps]]
 prompt = """
-用終端機執行深度研究，使用 --json turn-based protocol。
+Run the deep-research pipeline in the terminal using the --json turn-based protocol.
 
-Step 1: 啟動
+Step 1: Start
   cd ${PROJECT_DIR} && ${VENV_PYTHON} main.py {{topic}} {{flags}} --json 2>/dev/null
 
-Step 2: 讀取 stdout JSON，根據 status 處理：
-  - NEEDS_INPUT + type:clarify → 從 questions 陣列取出問題，問使用者，收集回答成 JSON {"0":"回答1","1":"回答2"}，用 --resume <thread_id> --answer '<JSON>' --json 繼續
-  - NEEDS_INPUT + type:approve → 呈現 plan_summary，問使用者確認，用 --resume <thread_id> --answer '{"approved":true}' --json 繼續
-  - DONE → 讀取 workspace 路徑下的 final-report.md，以繁體中文呈現
-  - ERROR → 顯示錯誤
+Step 2: Read the JSON on stdout and act on status:
+  - NEEDS_INPUT + type:clarify -> take each item from the questions array, ask the user, collect answers as JSON {"0":"answer1","1":"answer2"}, continue with --resume <thread_id> --answer '<JSON>' --json
+  - NEEDS_INPUT + type:approve -> present plan_summary, ask the user to confirm, continue with --resume <thread_id> --answer '{"approved":true}' --json
+  - DONE -> read final-report.md from the workspace path and present it in English
+  - ERROR -> show the error
 
-Step 3: 重複 Step 2 直到 DONE 或 ERROR。
+Step 3: Repeat Step 2 until DONE or ERROR.
 
-注意：--noask 模式不會出現 NEEDS_INPUT。繁體中文回應。
+Notes: --noask mode never emits NEEDS_INPUT. Reply in English.
 """
 GEMINI_EOF
-        echo "      ✓ Gemini CLI: /deep_research → ${GEMINI_DIR}/deep_research.toml"
+        echo "      [OK] Gemini CLI: /deep_research -> ${GEMINI_DIR}/deep_research.toml"
         INSTALLED_SKILLS="${INSTALLED_SKILLS}\n    /deep_research <topic>                (Gemini CLI)"
     fi
 else
-    echo "      Gemini CLI 未安裝，跳過。"
+    echo "      Gemini CLI not installed; skipping."
 fi
 
 # ------------------------------------------------------------------

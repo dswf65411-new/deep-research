@@ -1,15 +1,16 @@
-"""Phase 1a: Planner-Executor-Extractor。
+"""Phase 1a: Planner-Executor-Extractor.
 
-取代舊的 ReAct agent 設計。原本 create_react_agent 把每輪 tool_result（網頁全文）
-都累積到下一次 LLM 請求，導致單次 request 輕易超過 Anthropic 30K ITPM。
+Replaces the old ReAct agent design. The original create_react_agent accumulated
+every round's tool_result (full page text) into the next LLM request, easily
+blowing past Anthropic's 30K ITPM on a single request.
 
-新架構分 4 階段，每次 LLM call 的 context 都固定且小：
-  1. Planner (LLM × 1)    讀 plan/coverage/gap，產出 query 清單
-  2. Executor (程式)      平行搜尋、urlhealth 驗證、並發 WebFetch/Serper 寫入 raw
-  3. Extractor (LLM × N)  每篇獨立 fresh context，抽 QUOTE / NUMBER / pending claim
-  4. Registry (程式)      更新 source-registry、execution-log、gap-log
+The new architecture splits into 4 stages so each LLM call has a fixed, small context:
+  1. Planner (LLM x 1)    reads plan/coverage/gap, produces a query list
+  2. Executor (code)      parallel search, urlhealth validation, concurrent WebFetch/Serper, writes raw
+  3. Extractor (LLM x N)  each page uses a fresh context; extracts QUOTE / NUMBER / pending claim
+  4. Registry (code)      updates source-registry, execution-log, gap-log
 
-Extractor 受 deep_research.llm 裡的 rate_limiter 節流，避免 429。
+The Extractor is throttled by the rate_limiter in deep_research.llm to avoid 429s.
 """
 
 from __future__ import annotations
@@ -56,15 +57,19 @@ from deep_research.tools.workspace import (
 _URLHEALTH_PY = "/Users/yao.chu/.pyenv/versions/3.13.12/bin/python3"
 _URLHEALTH_CLI = "/Users/yao.chu/.claude/mcp-servers/urlhealth.py"
 
-# 深讀配額：每子問題、每輪
-_QUOTA_PER_ROLE = {"advocate": 2, "critic": 2, "perspective": 1}
+# Deep-read quota: per subquestion, per round
+# seed: brief-named entities' arxiv/github queries — quota relaxed so the 2-cap
+#       doesn't block SOTA papers from entering source-registry.
+_QUOTA_PER_ROLE = {"advocate": 2, "critic": 2, "perspective": 1, "seed": 6}
 
-# 抓取全文截斷上限（避免單篇破萬 token；Extractor 看單篇 ≈ 6-8K token）
-# 從 45000 下修：原本一篇 45K chars ≈ 15K tokens，整篇塞 LLM 容易踩 Lost in the Middle，
-# 中段 quote/number 被忽略 → 鐵律 4「溯源鏈完整」斷裂。改為超過 _CHUNK_SIZE 走 chunked。
+# Full-text truncation cap (avoids exceeding ~10K tokens per page; the Extractor
+# sees ~6-8K tokens per page).
+# Reduced from 45000: a 45K-char page ~ 15K tokens — feeding the full thing to the
+# LLM makes middle quotes/numbers hit Lost-in-the-Middle and get ignored, breaking
+# hard rule 4 (citation chain integrity). Above _CHUNK_SIZE we switch to chunked mode.
 _RAW_CHAR_LIMIT = 25000
 
-# Taiwan 權威域名白名單：source_tier.py 使用，命中者自動升 T3
+# Taiwan authoritative domain whitelist: used by source_tier.py — a hit auto-promotes to T3
 _TAIWAN_DOMAIN_WHITELIST: frozenset[str] = frozenset({
     "ithome.com.tw",
     "ithelp.ithome.com.tw",
@@ -76,7 +81,8 @@ _TAIWAN_DOMAIN_WHITELIST: frozenset[str] = frozenset({
     "bnext.com.tw",
 })
 
-# Chunked extraction：sliding window 切片，每 chunk 獨立 LLM call 並發抽取後合併去重
+# Chunked extraction: sliding-window slices; each chunk is an independent concurrent
+# LLM call, then merged and deduplicated.
 _CHUNK_SIZE = 8000
 _CHUNK_OVERLAP = 1000
 
@@ -86,7 +92,7 @@ _CHUNK_OVERLAP = 1000
 # ---------------------------------------------------------------------------
 
 async def phase1a_search(state: ResearchState) -> dict:
-    """Phase 1a 入口：規劃 → 搜尋 → 深讀 → 抽取。"""
+    """Phase 1a entry: plan → search → deep-read → extract."""
     workspace = state["workspace_path"]
     plan = state.get("plan", "")
     depth = state.get("depth", "deep")
@@ -99,66 +105,87 @@ async def phase1a_search(state: ResearchState) -> dict:
     gap_log = read_workspace_file(workspace, "gap-log.md") or ""
     exec_log = read_workspace_file(workspace, "execution-log.md") or ""
 
-    # gap_log 會隨輪數累積（第 5 輪時已累積前 4 輪的所有 UNREACHABLE / MISSING / CONFLICT）。
-    # 對 Planner 而言只有「最近發生的 gap」是有效訊號，前段老資訊是 distractor。
-    # 保留最後 ~2000 chars（~650 tokens），避免 context 放大器效應。
+    # gap_log accumulates round over round (by round 5 it holds every UNREACHABLE /
+    # MISSING / CONFLICT from rounds 1-4). For the Planner, only recent gaps carry
+    # useful signal; older content is just a distractor. Keep the last ~2000 chars
+    # (~650 tokens) to avoid context amplifier effects.
     if len(gap_log) > 2000:
-        gap_log = "...[前段省略，只保留最近 gap]...\n\n" + gap_log[-2000:]
-    # plan 若超過 8000 chars（罕見但偶發），保留頭尾避免 Planner 看不完。
+        gap_log = "...[earlier content omitted, keeping only recent gaps]...\n\n" + gap_log[-2000:]
+    # If plan exceeds 8000 chars (rare but happens), keep head and tail so the
+    # Planner can still see both ends.
     if len(plan) > 8000:
-        plan = plan[:4000] + "\n\n...[中段省略]...\n\n" + plan[-4000:]
+        plan = plan[:4000] + "\n\n...[middle omitted]...\n\n" + plan[-4000:]
 
-    # 累積編號用：跨輪的現有 sources / claims
+    # For cross-round incremental numbering: existing sources / claims
     existing_sources = state.get("sources", [])
     existing_claims = state.get("claims", [])
 
-    # 確保 source-registry 存在
+    # Ensure source-registry exists
     if not read_workspace_file(workspace, "source-registry.md"):
         init_source_registry(workspace)
 
     remaining = budget - used
     if remaining <= 0:
         return {
-            "execution_log": [f"Phase 1a 第 {iteration + 1} 輪：預算用盡，跳過"],
+            "execution_log": [f"Phase 1a round {iteration + 1}: budget exhausted, skipping"],
         }
 
-    # Focus mode：trigger_fallback_node 指定需補搜的 SQ
+    # Focus mode: trigger_fallback_node specifies SQs needing refetch
     needs_refetch: list[str] = state.get("needs_refetch", [])
     focus_mode = bool(needs_refetch)
     if focus_mode:
-        # 預算守衛回跳（large needs_refetch）vs 品質失敗回跳（small needs_refetch）
-        # - 品質失敗（≤ 5 SQ）→ 聚焦補搜，預算上限 25
-        # - 預算守衛（> 5 SQ）→ 全面繼續搜尋，預算上限為 remaining 的一半（至少 40）
+        # Budget-guard refetch (large needs_refetch) vs quality-failure refetch (small needs_refetch)
+        # - Quality failure (<= 5 SQ) → focused refetch, budget cap 25
+        # - Budget guard (> 5 SQ)   → broad continued search, cap is half of remaining (at least 40)
         if len(needs_refetch) > 5:
             budget_cap = max(40, remaining // 2)
             remaining = min(remaining, budget_cap)
-            logger.info(f"Phase 1a 預算守衛補搜：SQ={len(needs_refetch)} 個, budget={remaining}")
+            logger.info(f"Phase 1a budget guard refetch: SQ={len(needs_refetch)}, budget={remaining}")
         else:
             remaining = min(remaining, 25)
-            logger.info(f"Phase 1a 聚焦補搜：SQ={needs_refetch}, budget={remaining}")
+            logger.info(f"Phase 1a focused refetch: SQ={needs_refetch}, budget={remaining}")
 
     # ── Stage 1: Planner ─────────────────────────────────────────────
     already_searched = _extract_searched_queries(exec_log)
 
-    # Budget 守衛：計算每 SQ 已用 query 數，找出未達 min 的 SQ
+    # Budget guard: tally queries used per SQ, find SQs below the minimum
     min_per_sq = DEPTH_CONFIG.get(depth, DEPTH_CONFIG["deep"])["min_budget_per_sq"]
     sq_ids = _extract_sq_ids(plan)
     sq_counts = _count_queries_per_sq(exec_log)
     underfunded_sqs = [sq for sq in sq_ids if sq_counts.get(sq, 0) < min_per_sq]
 
-    # 發現面 query：當前年份 + 已知工具 seed
+    # Discovery queries: current year + known-tools seed
     current_year = str(datetime.now().year)
     known_tools = _extract_known_tools(plan)
 
-    # 從上輪 gap-log 解析新發現實體（僅在 iteration > 0 且非 focus mode 時生效）
+    # Parse newly discovered entities from the prior round's gap-log
+    # (only when iteration > 0 and not in focus mode)
     prior_emerging = _extract_emerging_from_gap_log(gap_log, iteration) if iteration > 0 and not focus_mode else []
+
+    # ── Brief entity seeds (injected on round 1, when not in focus mode) ───
+    # Read research-brief.md + phase0-plan.md to extract brief-named entities →
+    # produce hard-rule arxiv/github queries per entity; guarantees SOTA tools
+    # named in the brief are actually searched and land in the seed URL set.
+    seed_queries: list[dict] = []
+    brief_entities: list[str] = []
+    if iteration == 0 and not focus_mode:
+        brief_text = read_workspace_file(workspace, "research-brief.md") or ""
+        combined_source = (brief_text + "\n\n" + plan) if brief_text else plan
+        brief_entities = _extract_brief_entities(combined_source)
+        # Merge with _extract_known_tools results so the LLM planner also sees brief entities
+        combined_known = list(dict.fromkeys(list(brief_entities) + list(known_tools)))[:20]
+        # 2 queries per entity (arxiv+github); ~13% of remaining budget, capped at 20
+        seed_budget_cap = min(20, max(0, remaining // 4))
+        seed_queries = _seed_paper_queries(brief_entities, sq_ids, seed_budget_cap)
+        known_tools = combined_known
+    remaining_for_llm = max(0, remaining - len(seed_queries))
 
     query_plan = await _plan_queries(
         plan=plan,
         coverage=coverage,
         gap_log=gap_log,
         iteration=iteration,
-        remaining_budget=remaining,
+        remaining_budget=remaining_for_llm,
         already_searched=already_searched,
         depth=depth,
         underfunded_sqs=underfunded_sqs,
@@ -170,10 +197,19 @@ async def phase1a_search(state: ResearchState) -> dict:
         emerging_entities=prior_emerging if prior_emerging else None,
     )
 
-    queries = query_plan.get("queries", [])
+    llm_queries = query_plan.get("queries", [])
+    # Merge seed + LLM queries, seeds first to ensure priority; dedupe by query string
+    seen_q: set[str] = set()
+    queries: list[dict] = []
+    for q in seed_queries + llm_queries:
+        key = (q.get("query") or "").strip().lower()
+        if not key or key in seen_q:
+            continue
+        seen_q.add(key)
+        queries.append(q)
     if not queries:
         return {
-            "execution_log": [f"Phase 1a 第 {iteration + 1} 輪：Planner 未產出 query，跳過"],
+            "execution_log": [f"Phase 1a round {iteration + 1}: planner produced no queries, skipping"],
         }
 
     # ── Stage 2: Executor ────────────────────────────────────────────
@@ -181,19 +217,20 @@ async def phase1a_search(state: ResearchState) -> dict:
     url_health = await _verify_urls(search_hits)
     selected = _select_urls_by_quota(search_hits, url_health, queries)
 
-    # 跨輪 URL 去重：跳過已在前幾輪抓過的 URL，避免浪費預算 + 產生重複 claim
+    # Cross-round URL dedup: skip URLs already fetched in prior rounds to avoid
+    # wasting budget and producing duplicate claims.
     prior_fetched: set[str] = set(state.get("fetched_urls", []))
     if prior_fetched:
         before = len(selected)
         selected = [s for s in selected if s["url"] not in prior_fetched]
         skipped = before - len(selected)
         if skipped:
-            logger.info("phase1a: 跨輪去重跳過 %d 個已抓 URL", skipped)
+            logger.info("phase1a: cross-round dedup skipped %d already-fetched URLs", skipped)
 
     source_id_start = _next_source_id_index(existing_sources)
     raw_sources = await _fetch_pages(selected, workspace, source_id_start)
 
-    # ── Stage 3: Extractor（每篇獨立 LLM，fresh context）──────────────
+    # ── Stage 3: Extractor (each page is an independent LLM call with fresh context) ──
     extractions = await _extract_all_sources(raw_sources, workspace)
 
     # ── Stage 4: Registry ────────────────────────────────────────────
@@ -202,15 +239,16 @@ async def phase1a_search(state: ResearchState) -> dict:
     _log_unreachable(workspace, url_health, raw_sources)
     _log_domain_bias(workspace, iteration, existing_sources, raw_sources)
 
-    # Budget 守衛：更新本輪 sq_counts，把仍不足的 SQ 寫入 gap-log
+    # Budget guard: update this round's sq_counts; write any still-underfunded SQs to gap-log
     updated_sq_counts = dict(sq_counts)
     for q in queries:
         sq = q["subquestion"]
         updated_sq_counts[sq] = updated_sq_counts.get(sq, 0) + 1
     _log_budget_gaps(workspace, iteration + 1, sq_ids, updated_sq_counts, min_per_sq)
 
-    # Iterative expansion：從本輪 search results 抽出新工具名，寫入 gap-log
-    # 供下輪 Planner 生成 B 類 follow-up query（不在 focus mode 時才執行，避免分散注意）
+    # Iterative expansion: extract new tool names from this round's search results
+    # into gap-log so the next round's Planner can generate category-B follow-up
+    # queries (skipped in focus mode to avoid splitting attention).
     emerging_entities: list[str] = []
     if not focus_mode:
         emerging_entities = await _extract_emerging_entities(raw_sources, plan, iteration)
@@ -219,13 +257,14 @@ async def phase1a_search(state: ResearchState) -> dict:
             append_workspace_file(
                 workspace,
                 "gap-log.md",
-                f"\n\n## 新發現實體（第 {iteration + 1} 輪）\n{entities_text}\n",
+                f"\n\n## newly discovered entities (round {iteration + 1})\n{entities_text}\n",
             )
 
     sources = _build_sources(raw_sources)
     claims = _collect_claims(extractions, existing_claims)
 
-    # 本輪新抓到的 URL（LIVE/THIN_CONTENT 都算，UNREACHABLE 不加入防止下輪仍被跳過）
+    # URLs newly fetched this round (LIVE/THIN_CONTENT both count; UNREACHABLE
+    # is excluded so the next round can retry rather than skip).
     new_fetched_urls = [
         s["url"] for s in raw_sources
         if s.get("status") not in ("UNREACHABLE",) and s.get("url")
@@ -237,80 +276,84 @@ async def phase1a_search(state: ResearchState) -> dict:
         "claims": claims,
         "fetched_urls": new_fetched_urls,
         "execution_log": [
-            f"Phase 1a 第 {iteration + 1} 輪："
-            f"搜尋 {searches_used} 次、深讀 {len(raw_sources)} 篇、"
-            f"抽出 {len(claims)} claims（累計 {used + searches_used}/{budget}）"
-            + (f"、新發現實體 {len(emerging_entities)} 個" if emerging_entities else "")
+            f"Phase 1a round {iteration + 1}: "
+            f"searched {searches_used}, deep-read {len(raw_sources)}, "
+            f"extracted {len(claims)} claims (cumulative {used + searches_used}/{budget})"
+            + (f", brief entity seed {len(seed_queries)} (entities={len(brief_entities)})" if seed_queries else "")
+            + (f", newly discovered entities: {len(emerging_entities)}" if emerging_entities else "")
         ],
     }
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: Planner — 產出 query 清單
+# Stage 1: Planner — produces the query list
 # ---------------------------------------------------------------------------
 
-_PLANNER_SYSTEM = """你是研究搜尋 Planner。根據研究計畫和當前 coverage，產出下一輪要執行的搜尋 query 清單。
+_PLANNER_SYSTEM = """You are the research-search Planner. Given the research plan and current coverage, produce the list of search queries to run next round.
 
-## 職責
-- 只規劃 query，不執行搜尋。
-- 漸進式：第一輪每個子問題只生成最小集（advocate 1 family + critic 1 family）。
-- 後續輪次依 coverage gap 增補。
+## Responsibilities
+- Only plan queries; do not execute searches.
+- Incremental: in round 1 each subquestion only produces the minimum set (advocate 1 family + critic 1 family).
+- In later rounds, add queries to fill coverage gaps.
 
-## Query 規則
-1. 每個 query 5-10 詞。
-2. advocate 和 critic 的 query 必須有明顯差異（不是同一 query 換措辭）。
-3. 同一 query family 通常搭配兩個語言版本：en + zh-TW。zh-TW query **必須只**使用 `engines: ["serper_tw"]`，不可加 brave 或 serper_en（避免繁中結果被英文索引稀釋）。
-4. 對照「已搜過的 query 清單」做語義去重，不要重複。
-5. 學術主題可加上 `site:arxiv.org` 或 `site:semanticscholar.org`。
+## Query rules
+1. Each query should be 5-10 words.
+2. Advocate and critic queries must be clearly different (not the same query reworded).
+3. A query family usually has two language versions: en + zh-TW. zh-TW queries **must only** use `engines: ["serper_tw"]` and must not mix with brave or serper_en (avoids Traditional-Chinese results being diluted by English indexes).
+4. Semantically dedupe against the "already searched queries" list; do not repeat.
+5. Academic topics may append `site:arxiv.org` or `site:semanticscholar.org`.
 
-## 搜尋引擎配置（每個 query 指定 engines 列表）
-- `brave`：英文獨立索引
-- `serper_en`：Google 英文
-- `serper_tw`：Google 繁體中文（zh-TW query 專用，不可與 brave/serper_en 混用）
-- `serper_cn`：Google 中國
-- `serper_scholar`：Google + site:arxiv.org/semanticscholar.org
+## Search-engine configuration (specify engines list per query)
+- `brave`: English independent index
+- `serper_en`: Google English
+- `serper_tw`: Google Traditional Chinese (zh-TW query only; do not mix with brave/serper_en)
+- `serper_cn`: Google China
+- `serper_scholar`: Google + site:arxiv.org/semanticscholar.org
 
-## 輸出（嚴格 JSON，不要其他文字）
+## Output (strict JSON, no other text)
 ```json
 {
   "queries": [
     {"subquestion": "Q1", "role": "advocate", "query": "AI transcription accuracy Mandarin", "lang": "en", "engines": ["brave", "serper_en"]},
-    {"subquestion": "Q1", "role": "advocate", "query": "中文語音轉文字 準確率", "lang": "zh-TW", "engines": ["serper_tw"]},
+    {"subquestion": "Q1", "role": "advocate", "query": "<zh-TW query about speech-to-text accuracy>", "lang": "zh-TW", "engines": ["serper_tw"]},
     {"subquestion": "Q1", "role": "critic", "query": "AI transcription errors limitations", "lang": "en", "engines": ["brave", "serper_en"]}
   ]
 }
 ```
+Important: produce the actual Traditional Chinese query text for any zh-TW entry (the placeholder above is illustrative only).
 
-## Discovery Query Family（第 1 輪必須包含）
-除 advocate / critic 外，每個子問題至少需要 **2 個發現面 query**：
+## Discovery Query Family (round 1 must include these)
+Beyond advocate / critic, each subquestion needs at least **2 discovery queries**:
 
-| 類型 | 模板 | engines |
-|------|------|---------|
-| A 最新工具 | `best {主題} {YEAR}` / `top {主題} tools {YEAR}` | brave, serper_en |
-| B 競品 | `alternative to {已知工具名} {YEAR}` / `{已知工具名} competitors {YEAR}` | brave, serper_en |
-| C 在地 | `{主題} 台灣 推薦` / `site:ithome.com.tw {主題}` | serper_tw（只用此 engine） |
-| D 社群 | `site:reddit.com {主題} {YEAR} recommendation` | serper_en |
+| Category | Template | engines |
+|----------|----------|---------|
+| A latest tools | `best {topic} {YEAR}` / `top {topic} tools {YEAR}` | brave, serper_en |
+| B competitors  | `alternative to {known tool} {YEAR}` / `{known tool} competitors {YEAR}` | brave, serper_en |
+| C local (Taiwan) | `{topic} <Traditional Chinese recommendation phrase>` / `site:ithome.com.tw {topic}` | serper_tw (this engine only) |
+| D community    | `site:reddit.com {topic} {YEAR} recommendation` | serper_en |
+| E academic / source | `{entity} arxiv` / `{entity} github` / `{entity} paper pdf` | serper_scholar, brave |
 
-規則：
-- 每個子問題至少涵蓋 A 類 + C 類；B 類和 D 類視 budget 加入。
-- C 類 query 必須**只**使用 `engines: ["serper_tw"]`，不可加 brave 或 serper_en。
-- 後續輪次如果 Gap Log 出現新工具名，也必須為其補一個 B 類 query。
-- user_msg 有「新發現實體」欄位時，**每個實體至少產出 1 個 B 類 follow-up query**（例如 `{實體名} review {YEAR}` 或 `alternative to {實體名}`）。
-- {YEAR} 請使用 user_msg 中「本輪年份」提供的數字。
+Rules:
+- Every subquestion must cover at least category A + category C; categories B and D as budget allows.
+- Category C queries must **only** use `engines: ["serper_tw"]` — never combine with brave or serper_en.
+- If the Gap Log introduces a new tool name in a later round, add a category-B query for it.
+- When the user_msg contains a "newly discovered entities" field, **produce at least 1 B-type follow-up query per entity** (e.g. `{entity name} review {YEAR}` or `alternative to {entity name}`).
+- **Hard rule for academic / paper topics**: when the research involves keywords like paper, model, agent, SOTA, framework, or benchmark, **every entity in the `known tools` field must have at least 1 category-E query** (arxiv or github, pick one); these queries do not need a zh-TW counterpart.
+- Use the {YEAR} value from the user_msg's "this round's year" field.
 
-## 台灣來源鎖定
-研究涉及 Taiwan/台灣相關主題時，優先使用以下 site: 前綴產出精準繁中 query：
-- `site:ithome.com.tw`、`site:ithelp.ithome.com.tw` — IT 媒體
-- `site:techbang.com`、`site:kocpc.com.tw` — 電腦/3C 評測
-- `site:mobile01.com` — 3C 討論區
-- `site:inside.com.tw`、`site:bnext.com.tw` — 數位創業媒體
-- `site:apps.apple.com` — App Store（含評分與評論）
+## Taiwan source locking
+When the research topic concerns Taiwan, prefer these site: prefixes to produce precise Traditional-Chinese queries:
+- `site:ithome.com.tw`, `site:ithelp.ithome.com.tw` — IT media
+- `site:techbang.com`, `site:kocpc.com.tw` — computer / 3C reviews
+- `site:mobile01.com` — 3C forum
+- `site:inside.com.tw`, `site:bnext.com.tw` — digital startup media
+- `site:apps.apple.com` — App Store (ratings and reviews)
 
-這類 query 一律搭配 `engines: ["serper_tw"]`，不要加其他 engine。
+Such queries always pair with `engines: ["serper_tw"]`; do not add any other engine.
 
-## 預算控制
-- 每個 query 消耗 1 次搜尋（多 engines 對同一 query 視為同一次）。
-- 不得超過剩餘預算。
+## Budget control
+- Each query costs 1 search (multiple engines for the same query still count as one).
+- Do not exceed the remaining budget.
 """
 
 
@@ -331,62 +374,70 @@ async def _plan_queries(
     focus_sqs: list[str] | None = None,
     emerging_entities: list[str] | None = None,
 ) -> dict:
-    """Stage 1: LLM 規劃下一輪要執行的 query 清單。"""
+    """Stage 1: LLM plans the query list for the next round."""
     searched_text = (
-        "\n".join(f"- {q}" for q in already_searched) if already_searched else "（尚無）"
+        "\n".join(f"- {q}" for q in already_searched) if already_searched else "(none yet)"
     )
 
-    # Budget 守衛：若有 SQ 未達 min，注入優先補指示
+    # Budget guard: if any SQ is below min, inject a priority instruction
     if underfunded_sqs:
         sq_counts = sq_counts or {}
         underfunded_text = "\n".join(
-            f"  - {sq}：已搜 {sq_counts.get(sq, 0)}/{min_per_sq} 次"
+            f"  - {sq}: searched {sq_counts.get(sq, 0)}/{min_per_sq} times"
             for sq in underfunded_sqs
         )
         sq_priority_section = f"""
-## ⚠️ 子問題預算不足（本輪必須優先補）
-以下子問題的搜尋 query 數尚未達到最低要求（{min_per_sq} 次），本輪**必須**優先為這些子問題產出 query：
+## ⚠️ Subquestions with insufficient budget (must be topped up this round)
+The following subquestions have not reached the minimum query count ({min_per_sq}). You **must** prioritise producing queries for them this round:
 {underfunded_text}
 
-規則：在這些子問題各自達到 {min_per_sq} 次之前，不得為已達標的子問題產出額外 query。
+Rule: until each of these subquestions reaches {min_per_sq} queries, do not produce extra queries for subquestions that already met the minimum.
 """
     else:
         sq_priority_section = ""
 
-    # 聚焦補搜模式（由 trigger_fallback_node 觸發）
+    # Focused refetch mode (triggered by trigger_fallback_node)
     if focus_sqs:
         focus_section = f"""
-## 🎯 聚焦補搜模式（Fallback）
-**本輪只為以下 SQ 補搜，其他子問題暫停：**
+## 🎯 Focused refetch mode (Fallback)
+**This round only refetches the following SQs; other subquestions are paused:**
 {', '.join(focus_sqs)}
 
-補搜要求：
-- 每個指定 SQ 至少：advocate 1 組 + critic 1 組 + Discovery C 類（serper_tw）1 組
-- 優先台灣本土資源（serper_tw）和學術/官方資源（T1/T2 tier）
-- 對照 Gap Log 中的失敗原因，針對性補充
-- 總 query 數不超過 {remaining_budget} 次
+Refetch requirements:
+- For each specified SQ at minimum: 1 advocate + 1 critic + 1 Discovery category-C (serper_tw) set
+- Prioritise Taiwan-local resources (serper_tw) and academic/official resources (T1/T2 tier)
+- Target the failure reasons in the Gap Log specifically
+- Total queries must not exceed {remaining_budget}
 """
     else:
         focus_section = ""
 
-    # 已知工具 seed（用於 Discovery Query B 類）
+    # Known tool seed (used by Discovery Query category B)
     if known_tools:
-        tools_text = "、".join(known_tools[:15])
-        known_tools_section = f"\n## 已知工具名（用於生成 Discovery Query B 類）\n{tools_text}\n"
+        tools_text = ", ".join(known_tools[:15])
+        known_tools_section = f"\n## Known tools (for Discovery Query category B)\n{tools_text}\n"
     else:
         known_tools_section = ""
 
-    # 當前年份（用於 Discovery Query 的 {YEAR} 佔位）
-    year_section = f"\n## 本輪年份\n- 當前年份：{current_year or '2026'}（query 中的 year 請使用此數字）\n" if current_year else ""
+    # Current year (used for the {YEAR} placeholder in Discovery Queries)
+    year_section = (
+        f"\n## This round's year\n- Current year: {current_year or '2026'} "
+        "(use this number for year values inside queries)\n"
+        if current_year else ""
+    )
 
-    # 新發現實體（由 _extract_emerging_entities 從上輪搜尋結果中抽出）
+    # newly discovered entities (extracted by _extract_emerging_entities from the prior round's results)
     if emerging_entities:
         entities_text = "\n".join(f"- {e}" for e in emerging_entities)
-        emerging_section = f"\n## 新發現實體（本輪從搜尋結果中發現，須補充 query）\n{entities_text}\n"
+        emerging_section = (
+            "\n## newly discovered entities (surfaced from last round's results; "
+            "must have additional queries)\n"
+            f"{entities_text}\n"
+        )
     else:
         emerging_section = ""
 
-    user_msg = f"""## 研究計畫
+    user_msg = f"""## Research plan
 {plan}
 
 ## Coverage Checklist
@@ -395,19 +446,19 @@ async def _plan_queries(
 ## Gap Log
 {gap_log}
 
-## 已搜過的 Query（避免重複）
+## Already-searched queries (avoid duplicates)
 {searched_text}
 {focus_section}{sq_priority_section}{year_section}{known_tools_section}{emerging_section}
-## 本輪限制
-- 這是第 {iteration + 1} 輪（第 1 輪請用最小集；後續輪次依 coverage gap 增補）
-- 剩餘搜尋預算：{remaining_budget}
-- 研究深度：{depth}
+## This round's constraints
+- This is round {iteration + 1} (round 1 uses the minimum set; later rounds add queries per coverage gap)
+- Remaining search budget: {remaining_budget}
+- Research depth: {depth}
 
-請產出本輪要執行的 query 清單。"""
+Produce the query list to run this round."""
 
-    # role="verifier" — query 規劃是 structured JSON generation（邏輯任務）
-    # 不需要 Opus 的創意寫作能力，改用 Gemini/GPT-fast 節省 5-10 分鐘
-    # max_tokens=8192：給 JSON output 足夠空間（thinking_budget=0 已在 llm.py 設定）
+    # role="verifier" — query planning is structured JSON generation (logic task).
+    # Doesn't need Opus's creative writing; using Gemini/GPT-fast saves 5-10 minutes.
+    # max_tokens=8192: give JSON output enough room (thinking_budget=0 set in llm.py).
     response = await safe_ainvoke_chain(
         role="verifier",
         messages=[SystemMessage(content=_PLANNER_SYSTEM), HumanMessage(content=user_msg)],
@@ -423,7 +474,7 @@ async def _plan_queries(
     except json.JSONDecodeError:
         return {"queries": []}
 
-    # 規範化：清掉缺欄位或重複的 query
+    # Normalize: drop queries with missing fields or duplicates
     seen: set[str] = set()
     clean: list[dict] = []
     for q in data.get("queries", []):
@@ -431,8 +482,8 @@ async def _plan_queries(
         if not query or query in seen:
             continue
         seen.add(query)
-        # Normalize subquestion to Q{n} format — LLM might return full title like
-        # "子問題 1: 主流工具盤點" or "1" instead of "Q1".
+        # Normalize subquestion to Q{n} format — LLM might return a full title like
+        # "Subquestion 1: mainstream tools survey" or "1" instead of "Q1".
         subq_raw = (q.get("subquestion") or "Q1").strip()
         sq_m = re.match(r"Q(\d+)", subq_raw, re.IGNORECASE)
         if sq_m:
@@ -451,19 +502,19 @@ async def _plan_queries(
 
 
 def _extract_searched_queries(exec_log: str) -> list[str]:
-    """從 execution-log.md 撈出所有已搜尋過的 query 文字。
+    """Fetch every already-searched query from execution-log.md.
 
-    匹配 `- {query} [Q.../role/lang]` 格式（_append_execution_log 寫入的格式）。
+    Matches the `- {query} [Q.../role/lang]` format that _append_execution_log writes.
     """
     if not exec_log:
         return []
-    # 抓出 `- {query} [Q.../role/lang]` — query 是 [...] 之前的部分
+    # Capture `- {query} [Q.../role/lang]` — the query is the text before [...]
     pattern = re.compile(r"^[-*]\s+(.+?)\s+\[[^\]]+\]\s*$", re.MULTILINE)
     return [m.group(1).strip() for m in pattern.finditer(exec_log)]
 
 
 def _extract_sq_ids(plan: str) -> list[str]:
-    """從 phase0-plan.md 抽出有序不重複的子問題 ID（Q1, Q2, ...）。"""
+    """Extract ordered, unique subquestion IDs (Q1, Q2, ...) from phase0-plan.md."""
     matches = re.findall(r'\b(Q\d+)\b', plan)
     seen: set[str] = set()
     result: list[str] = []
@@ -475,9 +526,9 @@ def _extract_sq_ids(plan: str) -> list[str]:
 
 
 def _count_queries_per_sq(exec_log: str) -> dict[str, int]:
-    """從 execution-log.md 統計每個 SQ 已用 query 次數。
+    """Count queries used per SQ from execution-log.md.
 
-    匹配 `- {query} [Q{n}/role/lang]` 格式，取方括號內 Q 號。
+    Matches the `- {query} [Q{n}/role/lang]` format and reads the Q number inside brackets.
     """
     if not exec_log:
         return {}
@@ -496,9 +547,10 @@ def _log_budget_gaps(
     sq_counts: dict[str, int],
     min_per_sq: int,
 ) -> None:
-    """把預算仍不足的 SQ 追加到 gap-log.md 的「預算缺口」段落。
+    """Append any SQs still below minimum budget to the "Budget gaps" section of gap-log.md.
 
-    在每輪結束後呼叫，讓下一輪 Planner 能透過 gap_log 得知需要優先補的 SQ。
+    Called at the end of each round so the next round's Planner can see which SQs
+    need priority top-up via gap_log.
     """
     gaps = [
         (sq, sq_counts.get(sq, 0))
@@ -507,34 +559,35 @@ def _log_budget_gaps(
     ]
     if not gaps:
         return
-    lines = [f"\n\n## 預算缺口（第 {iteration} 輪後）"]
+    lines = [f"\n\n## budget gap (after round {iteration})"]
     for sq, have in gaps:
         need = min_per_sq - have
-        lines.append(f"- {sq}：已搜 {have} 次，最低要求 {min_per_sq} 次，仍缺 {need} 次")
+        lines.append(f"- {sq}: searched {have}, minimum required {min_per_sq}, still short by {need}")
     append_workspace_file(workspace, "gap-log.md", "\n".join(lines) + "\n")
 
 
 def _extract_known_tools(plan: str) -> list[str]:
-    """從 research plan 文字抽出已知工具/服務名稱，供 planner 生成 Discovery Query 用。
+    """Extract known tool / service names from the research plan text for the
+    planner's Discovery Query category B.
 
-    從括號（中英文）裡找以頓號或逗號分隔的工具清單，過濾出含英文字母的詞。
-    不用空格分割，以保留「Clova Note」「Good Tape」這類多詞工具名。
+    Look inside parentheses (CJK or ASCII) for lists separated by enumeration or
+    comma, and keep items that contain latin letters. Do not split on whitespace,
+    to preserve multi-word tool names like "Clova Note" or "Good Tape".
     """
-    bracket_content = re.findall(r'[（(]([^)）\n]{3,120})[)）]', plan)
+    bracket_content = re.findall(r'\(([^)\n]{3,120})\)', plan)
     candidates: list[str] = []
     for content in bracket_content:
-        # 只用頓號/逗號分割，保留工具名中的空格
-        parts = re.split(r'[、，,]+', content)
+        # Split on commas / semicolons (tool names may contain spaces)
+        parts = re.split(r'[,;]+', content)
         for p in parts:
             p = p.strip()
-            # 去掉結尾的「等」和開頭的助詞（「如」「例如」「含」等）
-            if p.endswith('等'):
-                p = p[:-1].strip()
-            p = re.sub(r'^(如|例如|含|包含|及|或)\s+', '', p).strip()
-            # 保留 2-40 字、含英文字母的詞（工具名通常是英文或中英混合）
+            # Strip trailing "etc." / "et al." and leading list-leaders like "such as" / "e.g."
+            p = re.sub(r'\s+(etc\.?|et al\.?)$', '', p, flags=re.IGNORECASE).strip()
+            p = re.sub(r'^(such as|e\.g\.|eg\.?|including|like)\s+', '', p, flags=re.IGNORECASE).strip()
+            # Keep 2-40-char entries containing latin letters (tool names are usually English or mixed)
             if 1 < len(p) <= 40 and re.search(r'[A-Za-z]', p):
                 candidates.append(p)
-    # 去重保持出現順序，最多回傳 20 個
+    # Dedupe preserving order; return at most 20
     seen: set[str] = set()
     result: list[str] = []
     for t in candidates:
@@ -546,20 +599,197 @@ def _extract_known_tools(plan: str) -> list[str]:
     return result
 
 
+_ENTITY_LEADER_RE = re.compile(
+    r"^(such\s+as|including|like|e\.g\.|eg\.?|i\.e\.|ie\.?)\s+",
+    re.IGNORECASE,
+)
+_ENTITY_SUFFIX_RE = re.compile(
+    r"\s+(tools?|services?|products?|applications?|implementations?|"
+    r"frameworks?|models?|systems?|platforms?|packages?|libraries)$",
+    re.IGNORECASE,
+)
+_ENTITY_CAPS_RE = re.compile(r"^[A-Z][\w.\-]*(?:\s+[A-Z0-9][\w.\-]*){0,3}$")
+# Allow camelCase / hyphens / dots (GPT-4.1 / LangGraph / LangChain / OpenAI) and
+# compound words where lowercase butts up against uppercase (e.g. "OpenAI deep research"
+# yields "OpenAI" via this pattern; the tail "deep research" is picked up by the
+# bullet/label pattern below).
+
+
+def _clean_entity_candidate(raw: str) -> str:
+    """Normalize an entity candidate — strip leading descriptors, trailing
+    meta suffixes, and punctuation. Returns empty string when invalid."""
+    name = raw.strip()
+    if not name:
+        return ""
+    # Strip leading leader words
+    name = _ENTITY_LEADER_RE.sub("", name).strip()
+    # Strip trailing meta suffixes like "tools" / "services"
+    name = _ENTITY_SUFFIX_RE.sub("", name).strip()
+    name = re.sub(r"\s+(etc\.?|et al\.?)$", "", name, flags=re.IGNORECASE).strip()
+    # Strip trailing punctuation
+    name = name.rstrip(".,:;)]}")
+    # Strip leading bullet / numbering
+    name = re.sub(r"^[-*+•·●◆■□▪▫]+\s*", "", name).strip()
+    name = re.sub(r"^\d+[\.\)]\s+", "", name).strip()
+    return name
+
+
+def _is_valid_entity(name: str) -> bool:
+    if not (2 <= len(name) <= 60):
+        return False
+    if not re.search(r"[A-Za-z]", name):
+        return False
+    # Too many spaces → probably a sentence
+    if name.count(" ") > 4:
+        return False
+    # All-lowercase with multiple spaces → looks like prose
+    if re.search(r"\s", name) and name == name.lower():
+        return False
+    # Ends with "?" / "!" → probably a question
+    if re.search(r"[?!]$", name):
+        return False
+    return True
+
+
+def _extract_brief_entities(text: str) -> list[str]:
+    """Extract entity names from research-brief.md / phase0-plan.md.
+
+    Three patterns:
+      A Comma-separated inline list of 3+ capitalized words (rejecting full sentences)
+      B Markdown bullet leading an entity (e.g. `- AIDE` / `- MLE-Agent: ...`)
+      C Labelled list following tags like facets / known tools / evaluation target
+
+    Plus a fallback: 2+ capitalized words inside parentheses, comma-separated.
+    """
+    if not text:
+        return []
+
+    seen_lower: set[str] = set()
+    entities: list[str] = []
+
+    def _add(raw: str) -> None:
+        name = _clean_entity_candidate(raw)
+        if not _is_valid_entity(name):
+            return
+        key = name.lower()
+        if key in seen_lower:
+            return
+        seen_lower.add(key)
+        entities.append(name)
+
+    # Pattern A: comma-separated inline list (evaluate each line independently, need >=3 capitalized candidates)
+    # Rather than matching the whole line with _ENTITY_CAPS_RE — the first item often has prefix
+    # pollution, the last item often has suffix pollution. Use findall to extract the "longest
+    # name-token" from each split fragment instead.
+    entity_token_re = re.compile(r"[A-Z][\w.\-]*(?:\s+[A-Z0-9][\w.\-]*){0,3}")
+    for line in text.splitlines():
+        if not re.search(r",", line):
+            continue
+        raw_parts = [p for p in re.split(r",", line) if p.strip()]
+        caps_candidates: list[str] = []
+        for p in raw_parts:
+            cand = p.strip()
+            # Strip parenthetical addenda first
+            cand = re.sub(r"\s*\([^)]*\)\s*", "", cand).strip()
+            # First try full clean + whole-string match (handles clean cases like "AutoML-Agent")
+            cleaned = _clean_entity_candidate(cand)
+            if cleaned and _ENTITY_CAPS_RE.match(cleaned):
+                caps_candidates.append(cleaned)
+                continue
+            # Fallback: extract the longest name-token from the fragment
+            matches = entity_token_re.findall(cand)
+            if matches:
+                caps_candidates.append(max(matches, key=len))
+        if len(caps_candidates) >= 3:
+            for c in caps_candidates:
+                _add(c)
+
+    # Pattern B: markdown bullet leading line (at most one entity per bullet)
+    bullet_re = re.compile(r"^\s*[-*+]\s+([^\n]+)", re.MULTILINE)
+    for m in bullet_re.finditer(text):
+        body = m.group(1).strip()
+        head = re.split(r"[:(]|\s+[-—]\s+|\s*—\s*", body, maxsplit=1)[0].strip()
+        head = _clean_entity_candidate(head)
+        if head and _ENTITY_CAPS_RE.match(head):
+            _add(head)
+
+    # Pattern C: labelled list (facets, known tools, evaluation target, ...)
+    label_re = re.compile(
+        r"(?:facets?|entities|known\s*tools|known\s*entities|tool\s*list|"
+        r"evaluation\s*target|important\s*tools|core\s*tools|core\s*targets|"
+        r"tools?/entities|research\s*targets?)\s*:\s*([^\n]+)",
+        re.IGNORECASE,
+    )
+    for m in label_re.finditer(text):
+        content = m.group(1)
+        # Strip parenthetical addenda outright
+        content = re.sub(r"\([^)]*\)", " ", content)
+        for part in re.split(r"[,/\|]", content):
+            _add(part)
+
+    # Fallback: comma list inside parentheses (>=2 capitalized candidates)
+    for inner in re.findall(r"\(([^)\n]{3,160})\)", text):
+        parts = [p.strip() for p in re.split(r",+", inner) if p.strip()]
+        caps = [p for p in parts if _ENTITY_CAPS_RE.match(_clean_entity_candidate(p))]
+        if len(caps) >= 2:
+            for p in caps:
+                _add(p)
+
+    return entities[:20]
+
+
+def _seed_paper_queries(
+    entities: list[str],
+    sq_ids: list[str] | None,
+    budget_cap: int,
+) -> list[dict]:
+    """Generate 2 mandatory paper/repo queries per brief entity (arxiv + github).
+
+    Parallel to the A/B/C/D query families produced by the LLM planner — these are the
+    **must-search** E-class seed queries. Each entity gets up to 2 queries
+    (`{entity} arxiv`, `{entity} github`), round-robin assigned across sq_ids to avoid
+    quota imbalance. `role="seed"` maps to the relaxed `_QUOTA_PER_ROLE["seed"]=6` quota.
+    """
+    if not entities or budget_cap <= 0:
+        return []
+
+    sqs = sq_ids or ["Q1"]
+    queries: list[dict] = []
+    idx = 0
+    for kind in ("arxiv", "github"):
+        engines = (
+            ["serper_scholar", "brave"] if kind == "arxiv"
+            else ["brave", "serper_en"]
+        )
+        for entity in entities:
+            if len(queries) >= budget_cap:
+                return queries
+            queries.append({
+                "subquestion": sqs[idx % len(sqs)],
+                "role": "seed",
+                "query": f"{entity} {kind}",
+                "lang": "en",
+                "engines": engines,
+            })
+            idx += 1
+    return queries
+
+
 async def _extract_emerging_entities(
     raw_sources: list[dict],
     plan: str,
     iteration: int,
 ) -> list[str]:
-    """從本輪 search results 抽取 plan 中尚未出現的新工具/產品/服務名稱。
+    """Extract new tool/product/service names from this round's search results that are not yet in the plan.
 
-    以 LLM（role="verifier"）從各來源的 title + content 片段提取工具名，
-    排除 plan 已知的，回傳去重後最多 15 個。
+    Uses an LLM (role="verifier") to extract tool names from the title + content snippet
+    of each source, excludes those already known in the plan, and returns up to 15
+    deduplicated names.
     """
     if not raw_sources:
         return []
 
-    # 收集 title + 前 500 字 content（夠 LLM 識別工具名，避免 context 膨脹）
+    # Collect title + first 500 chars of content (enough for LLM to identify tool names, avoids context bloat)
     snippets: list[str] = []
     for s in raw_sources:
         title = s.get("title", "")
@@ -569,20 +799,20 @@ async def _extract_emerging_entities(
     if not snippets:
         return []
 
-    combined = "\n\n---\n\n".join(snippets[:30])  # 最多 30 篇
+    combined = "\n\n---\n\n".join(snippets[:30])  # up to 30 sources
 
-    # plan 裡已知的工具（排除清單）
+    # Tools already known in the plan (exclusion list)
     known_in_plan = _extract_known_tools(plan)
-    known_text = "、".join(known_in_plan) if known_in_plan else "（無）"
+    known_text = ", ".join(known_in_plan) if known_in_plan else "(none)"
 
-    prompt = f"""以下是最新一輪搜尋結果的標題和摘要。
+    prompt = f"""The following are titles and summaries from the latest round of search results.
 
-任務：找出文中提到的工具/軟體/App/服務/硬體產品名稱，**排除**以下研究計畫中已知的工具：
+Task: Identify tool / software / app / service / hardware product names mentioned in the text, **excluding** the following tools already known in the research plan:
 {known_text}
 
-輸出格式：每行一個名稱，最多 15 個。只輸出名稱，不要解釋。
+Output format: one name per line, up to 15 names. Only output names, no explanations.
 
-搜尋結果：
+Search results:
 {combined}"""
 
     try:
@@ -597,7 +827,7 @@ async def _extract_emerging_entities(
         logger.warning(f"_extract_emerging_entities LLM call failed: {e}")
         return []
 
-    # 解析輸出：每行一個，過濾無效行
+    # Parse output: one per line, filter invalid lines
     entities: list[str] = []
     seen_set: set[str] = set()
     known_lower = {k.lower() for k in known_in_plan}
@@ -614,22 +844,23 @@ async def _extract_emerging_entities(
         if len(entities) >= 15:
             break
 
-    logger.info(f"第 {iteration + 1} 輪新發現實體：{entities}")
+    logger.info(f"Round {iteration + 1} newly discovered entities: {entities}")
     return entities
 
 
 def _extract_emerging_from_gap_log(gap_log: str, iteration: int) -> list[str]:
-    """從 gap-log.md 中解析最近一輪寫入的「新發現實體」清單。
+    """Parse the most recently written "newly discovered entities" list from gap-log.md.
 
-    只取最後一個 ## 新發現實體（第 N 輪）段落，避免把舊輪實體重複送給 Planner。
+    Only picks the last `## newly discovered entities (round N)` section, to avoid
+    passing old rounds' entities to the Planner again.
     """
-    # 找所有「## 新發現實體（第 N 輪）」段落起始位置
-    pattern = re.compile(r"## 新發現實體（第 \d+ 輪）\n(.*?)(?=\n## |\Z)", re.DOTALL)
+    # Find all `## newly discovered entities (round N)` section starts
+    pattern = re.compile(r"## newly discovered entities \(round \d+\)\n(.*?)(?=\n## |\Z)", re.DOTALL)
     matches = list(pattern.finditer(gap_log))
     if not matches:
         return []
 
-    # 取最後一個段落
+    # Take the last section
     last_match = matches[-1]
     block = last_match.group(1)
 
@@ -644,17 +875,18 @@ def _extract_emerging_from_gap_log(gap_log: str, iteration: int) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: Executor — 搜尋 + urlhealth + fetch raw
+# Stage 2: Executor — search + urlhealth + fetch raw
 # ---------------------------------------------------------------------------
 
 async def _execute_searches(
     queries: list[dict],
     remaining_budget: int,
 ) -> tuple[list[dict], int]:
-    """平行執行所有搜尋 task。回傳 (hits, searches_used)。
+    """Run all search tasks in parallel. Returns (hits, searches_used).
 
     hits: [{"subquestion", "role", "query", "lang", "engine", "url", "title", "description"}, ...]
-    每個 (query, engine) 組合消耗 1 次搜尋，但 engines 數量受 remaining_budget 限制。
+    Each (query, engine) combination consumes 1 search, but the number of engines is
+    bounded by remaining_budget.
     """
     tasks: list[asyncio.Task] = []
     task_meta: list[dict] = []
@@ -693,7 +925,7 @@ async def _execute_searches(
 
 
 async def _run_single_search(query: str, engine: str) -> list[dict]:
-    """依引擎分派到對應的底層搜尋函數。"""
+    """Dispatch to the appropriate underlying search function for each engine."""
     try:
         if engine == "brave":
             return await brave_search(query, count=10)
@@ -704,7 +936,7 @@ async def _run_single_search(query: str, engine: str) -> list[dict]:
         if engine == "serper_cn":
             return await serper_search(query, gl="cn", hl="zh-CN", num=10)
         if engine == "serper_scholar":
-            # 把 query 前綴 site:arxiv.org OR site:semanticscholar.org
+            # Prefix the query with site:arxiv.org OR site:semanticscholar.org
             scholar_q = f"({query}) (site:arxiv.org OR site:semanticscholar.org)"
             return await serper_search(scholar_q, gl="us", hl="en", num=10)
     except Exception:
@@ -713,7 +945,7 @@ async def _run_single_search(query: str, engine: str) -> list[dict]:
 
 
 async def _verify_urls(hits: list[dict]) -> dict[str, str]:
-    """對所有命中 URL 批次呼叫 urlhealth CLI，回傳 {url: status}。"""
+    """Batch-invoke the urlhealth CLI for all hit URLs, returns {url: status}."""
     urls = list({h["url"] for h in hits if h.get("url")})
     if not urls:
         return {}
@@ -729,7 +961,8 @@ async def _verify_urls(hits: list[dict]) -> dict[str, str]:
         stdout, _ = await proc.communicate(payload.encode("utf-8"))
         data = json.loads(stdout.decode("utf-8"))
     except Exception:
-        # 無法驗證時降級為 UNKNOWN；後續 fetch 仍會嘗試，失敗會記 UNREACHABLE
+        # Fall back to UNKNOWN when verification fails; subsequent fetch will still try,
+        # and failures will be logged as UNREACHABLE
         return {u: "UNKNOWN" for u in urls}
 
     status_map: dict[str, str] = {}
@@ -743,14 +976,14 @@ def _select_urls_by_quota(
     url_health: dict[str, str],
     queries: list[dict],
 ) -> list[dict]:
-    """按 (subquestion, role) 配額挑選要深讀的 URL。
+    """Pick URLs for deep reading based on (subquestion, role) quota.
 
-    規則：
-      - 跳過 LIKELY_HALLUCINATED
-      - 同一 URL 如果命中多個 engine，跨引擎加分
-      - 每個 (subq, role) 至多挑 _QUOTA_PER_ROLE[role] 篇
+    Rules:
+      - Skip LIKELY_HALLUCINATED
+      - The same URL hit by multiple engines gets a cross-engine score bonus
+      - Each (subq, role) picks up to _QUOTA_PER_ROLE[role] URLs
     """
-    # Step 1: 聚合——同 URL 合併各 engine 命中
+    # Step 1: aggregate — merge same-URL hits across engines
     by_url: dict[str, dict] = {}
     for h in hits:
         url = h.get("url", "")
@@ -770,7 +1003,7 @@ def _select_urls_by_quota(
         bucket["subq_roles"].add((h["subquestion"], h["role"]))
         bucket["engines"].add(h["engine"])
 
-    # Step 2: 每個 (subq, role) 桶獨立排序 + 取配額
+    # Step 2: Sort each (subq, role) bucket independently + take the quota
     buckets: dict[tuple[str, str], list[dict]] = {}
     for info in by_url.values():
         score = len(info["engines"])  # cross-engine hit
@@ -800,11 +1033,12 @@ async def _fetch_pages(
     workspace: str,
     id_start: int = 1,
 ) -> list[dict]:
-    """三階梯抓取：WebFetch → Serper scrape → 標記 UNREACHABLE。
+    """Three-tier fetch: WebFetch -> Serper scrape -> mark UNREACHABLE.
 
-    每篇寫入 workspace/search-results/{subq}/{source_id}_raw.md
-    回傳每篇的 meta dict（含 source_id, url, raw_path, content, status...）
-    `id_start` 用於跨輪累積編號，避免第二輪重新從 S001 撞號。
+    Each source is written to workspace/search-results/{subq}/{source_id}_raw.md
+    Returns the meta dict for each source (includes source_id, url, raw_path, content, status...)
+    `id_start` is used for cross-round cumulative numbering so that round 2 does not
+    restart from S001 and collide with round 1.
     """
     tasks = [_fetch_one(item, i + 1) for i, item in enumerate(selected)]
     fetched = await asyncio.gather(*tasks)
@@ -825,7 +1059,7 @@ async def _fetch_pages(
             write_workspace_file(workspace, raw_path, header + content[:_RAW_CHAR_LIMIT])
         else:
             raw_path = ""
-        # THIN_CONTENT 覆寫 url_health status，讓下游可以識別並過濾
+        # THIN_CONTENT overrides the url_health status so downstream can detect and filter it
         effective_status = "THIN_CONTENT" if method == "thin_content" else item["status"]
         raw_sources.append({
             "source_id": sid,
@@ -844,19 +1078,20 @@ async def _fetch_pages(
 
 
 async def _fetch_one(item: dict, idx: int) -> tuple[str, str]:
-    """三階梯抓取單一 URL。回傳 (content, method)。
+    """Three-tier fetch for a single URL. Returns (content, method).
 
-    method 取值：
-      "web_fetch"      — WebFetch 成功且 >= 500 chars
-      "serper_scrape"  — Serper scrape 成功且 >= 500 chars
-      "thin_content"   — 至少有回傳但 < 500 chars（頁面截斷或無實質內容）
-      "unreachable"    — 完全無法取得（content 為空字串）
+    method values:
+      "web_fetch"      - WebFetch succeeded and >= 500 chars
+      "serper_scrape"  - Serper scrape succeeded and >= 500 chars
+      "thin_content"   - at least returned something but < 500 chars (truncated page or no substantive content)
+      "unreachable"    - completely unreachable (content is empty string)
 
-    標題結尾為 …/... 暗示 WebFetch 只抓到截斷版，一律嘗試 Serper scrape。
+    A title ending in ellipsis/... hints that WebFetch only got a truncated version;
+    always retry with Serper scrape in that case.
     """
     url = item["url"]
     title = item.get("title", "")
-    thin_candidate = ""  # 記下最長的 < 500 chars 內容作 fallback
+    thin_candidate = ""  # Record the longest < 500 chars content as a fallback
 
     # 1. WebFetch
     try:
@@ -865,12 +1100,12 @@ async def _fetch_one(item: dict, idx: int) -> tuple[str, str]:
             if len(text.strip()) >= 500:
                 return text, "web_fetch"
             elif text.strip():
-                thin_candidate = text   # 有回傳但太短
+                thin_candidate = text   # Returned something but too short
     except Exception:
         pass
 
     # 2. Serper scrape
-    # 條件：尚未成功取得足量內容，或標題截斷（暗示 WebFetch 只拿到 stub）
+    # Conditions: haven't fetched enough content yet, or title is truncated (hints WebFetch only got a stub)
     title_truncated = title.rstrip().endswith(("...", "…"))
     if SERPER_API_KEY and (not thin_candidate or title_truncated):
         try:
@@ -889,59 +1124,63 @@ async def _fetch_one(item: dict, idx: int) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: Extractor — 每篇獨立 LLM，fresh context
+# Stage 3: Extractor — independent LLM per source, fresh context
 # ---------------------------------------------------------------------------
 
-_EXTRACTOR_SYSTEM = """你是精準抄錄員。從一篇來源原文中抽出與子問題相關的證據。
+_EXTRACTOR_SYSTEM = """You are a precise transcriber. Extract evidence relevant to the subquestion from a single source document.
 
-## 任務
-對這一篇原文：
-1. 找出與子問題相關的段落（最多 3 處）
-2. 逐字複製關鍵句為 QUOTE（不得改寫、摘要、合併）
-3. 含數字的句子單獨記為 NUMBER（必須連同完整原句）
-4. 基於這些 QUOTE/NUMBER 形成 1-3 個 pending claim
+## Task
+For this one source document:
+1. Locate passages relevant to the subquestion (at most 3)
+2. Copy the key sentences verbatim as QUOTE (no rewriting, summarizing, or merging)
+3. Record sentences containing numbers separately as NUMBER (must include the full original sentence)
+4. Based on these QUOTE/NUMBER items, form 1-3 pending claims
 
-## 鐵律
-- QUOTE 必須是原文逐字，禁止改寫
-- **QUOTE 和 NUMBER 的 text/sentence 欄位必須保持來源的原始語言。若來源是英文，quote text 必須是英文；若來源是中文，quote text 必須是中文。嚴禁翻譯。**
-- claim_text 可以用中文撰寫，但 QUOTE/NUMBER 的 text/sentence 欄位必須保持原文語言，不可翻譯
-- NUMBER 必須附含數字的完整原句（保持原文語言）
-- 每個 claim 必須連結至少 1 個 quote_id 或 number_id
-- 無明確證據的推論禁止建成 claim
+## Hard rules
+- QUOTE must be verbatim from the source; rewriting is forbidden
+- **The text/sentence fields of QUOTE and NUMBER must preserve the source's original language. If the source is English, quote text must be English; if the source is Traditional Chinese (zh-TW) or Simplified Chinese (zh-CN), quote text must be in that language. Translation is strictly prohibited.**
+- claim_text should be written in English, but the text/sentence fields of QUOTE/NUMBER must remain in the source language and must not be translated
+- NUMBER must include the complete original sentence containing the number (in source language)
+- Every claim must link to at least 1 quote_id or number_id
+- Inferences without explicit evidence must not be turned into claims
 
-## 禁止抽取的內容（常見雜訊，一律跳過）
-以下內容與研究子問題無關，即使出現在原文中也絕對不得抽為 claim：
-- 公司/機構的實體地址、郵遞區號、門牌號碼
-- 聯絡電話、客服 email、客服連結
-- 公司員工人數、辦公室城市/國家等公司簡介資訊
-- 公司創辦年份、創辦人姓名（與產品功能、性能無關的背景資訊）
-- Cookie 聲明、隱私政策、使用者條款、廣告文字
-- 網站 header / footer / navigation 樣板文字
-- SEO 行銷語句（如 "Our team of experts"、"We are dedicated to..."、"Contact us today"）
+## Forbidden extraction content (common noise, always skip)
+The following content is unrelated to the research subquestion; even if it appears in the source, it must NOT be extracted as a claim:
+- Physical address, postal code, or street number of a company/organization
+- Contact phone numbers, support email, customer service links
+- Company employee headcount, office city/country, and other company-profile background info
+- Company founding year, founder names (background info unrelated to product features or performance)
+- Cookie notices, privacy policies, terms of use, advertisement copy
+- Website header / footer / navigation boilerplate
+- SEO marketing phrases (e.g., "Our team of experts", "We are dedicated to...", "Contact us today")
 
-## start_char / end_char 欄位（重要）
-對每個 QUOTE / NUMBER，額外輸出 start_char 與 end_char，
-代表該段文字在「上面的原文」中的字元起訖 index（0-based，Python 字串切片語意）。
-驗證方式：raw_content[start_char:end_char] 會等於 text（或 sentence）。
+## start_char / end_char fields (important)
+For each QUOTE / NUMBER, additionally output start_char and end_char,
+representing the character-level start/end index of that text within "the source above"
+(0-based, Python string slicing semantics).
+Verification: raw_content[start_char:end_char] must equal text (or sentence).
 
-估不準不會被懲罰 — 程式會用 text 去回找真位置做 fallback。
-但 text 欄位必須仍是原文的逐字摘錄，否則整筆會被 reject。
+Inaccurate estimates are not penalized — the program will fall back to locating the text
+by string search.
+But the text field itself must still be a verbatim excerpt from the source, otherwise
+the entire item will be rejected.
 
-若 text 在原文出現多次，任選一處的 index 即可（程式會認第一個能 find 到的位置）。
+If text appears multiple times in the source, the index of any one occurrence is fine
+(the program will take the first matching position it can find).
 
-## 輸出（嚴格 JSON）
+## Output (strict JSON)
 ```json
 {
   "quotes": [
-    {"quote_id": "Q1", "text": "原文逐字複製的句子", "start_char": 123, "end_char": 234}
+    {"quote_id": "Q1", "text": "verbatim sentence from source", "start_char": 123, "end_char": 234}
   ],
   "numbers": [
     {"number_id": "N1", "value": "92.5", "unit": "%",
-     "sentence": "含該數字的完整原句", "start_char": 456, "end_char": 567}
+     "sentence": "full original sentence containing the number", "start_char": 456, "end_char": 567}
   ],
   "claims": [
     {
-      "claim_text": "一句話陳述事實",
+      "claim_text": "one-sentence factual statement",
       "claim_type": "numeric|comparative|causal|forecast|qualitative",
       "evidence_quote_ids": ["Q1"],
       "evidence_number_ids": ["N1"]
@@ -950,11 +1189,11 @@ _EXTRACTOR_SYSTEM = """你是精準抄錄員。從一篇來源原文中抽出與
 }
 ```
 
-只輸出 JSON，不要其他文字。"""
+Only output JSON, no other text."""
 
 
-# Index-based 引用共用工具：resolve_quote_index / verify_indexed_items 現在住在
-# deep_research.harness.validators，這裡保留本模組內部別名方便閱讀。
+# Shared index-based quote utilities: resolve_quote_index / verify_indexed_items now live in
+# deep_research.harness.validators; we keep local module-level aliases for readability.
 _resolve_quote_index = resolve_quote_index
 
 
@@ -965,9 +1204,9 @@ def _verify_indexed_items(raw, items, text_field, chunk_offset=0):
 
 
 async def _extract_all_sources(raw_sources: list[dict], workspace: str) -> list[dict]:
-    """對每篇獨立 LLM call 抽取。rate_limiter 已在 llm.py 配置。
+    """Independent LLM call per source for extraction. rate_limiter is configured in llm.py.
 
-    THIN_CONTENT source 跳過（不進 claim extraction）。
+    THIN_CONTENT sources are skipped (do not enter claim extraction).
     """
     eligible = [s for s in raw_sources if s["content"] and s.get("status") != "THIN_CONTENT"]
     tasks = [_extract_one(src, workspace) for src in eligible]
@@ -1008,13 +1247,16 @@ def _strip_html_for_extraction(content: str) -> str:
 
 
 async def _extract_one(src: dict, workspace: str) -> dict | None:
-    """對單篇來源執行 Extractor，並寫入最終的 S{id}.md。
+    """Run the Extractor on a single source and write the final S{id}.md.
 
-    短文（≤ _CHUNK_SIZE）走單次 LLM；長文做 sliding window chunked extraction：
-    每 chunk 獨立 LLM call 並發抽取，合併去重後重新編號。
+    Short docs (<= _CHUNK_SIZE) use a single LLM call; long docs use sliding-window
+    chunked extraction: each chunk is extracted by an independent LLM call concurrently,
+    then merged, deduplicated, and renumbered.
 
-    為什麼要切：原本一篇 25K chars 整塊餵 LLM，中段 quote/number 容易因 Lost in the
-    Middle 被忽略，破壞鐵律 4「溯源鏈完整」。chunked + overlap 讓每段都有近端 context。
+    Why we chunk: feeding a 25K-char source as a single block to the LLM causes
+    mid-document quotes/numbers to be missed due to Lost in the Middle, violating
+    hard rule 4 "complete citation chain". Chunked + overlap ensures every section
+    has near-range context.
     """
     raw_original = (src.get("content") or "")[:_RAW_CHAR_LIMIT]
     # Strip HTML if the content is an HTML page (CSS/JS noise causes extraction failures).
@@ -1035,7 +1277,7 @@ async def _extract_one(src: dict, workspace: str) -> dict | None:
         data_raw = await _extract_one_pass(src, raw)
         if not data_raw:
             return None
-        # 短文：LLM 看到的就是完整 raw，index 為 global。單次驗證即可。
+        # Short doc: LLM sees the full raw, indices are global. One-pass verification suffices.
         data = {
             "quotes": _verify_indexed_items(raw, data_raw.get("quotes", []), "text"),
             "numbers": _verify_indexed_items(raw, data_raw.get("numbers", []), "sentence"),
@@ -1047,7 +1289,8 @@ async def _extract_one(src: dict, workspace: str) -> dict | None:
     if not data:
         return None
 
-    # 重編 id：保證單篇 source 內 Q1, Q2, ... 連續且唯一（chunked 模式合併後尤其重要）
+    # Renumber ids: ensures Q1, Q2, ... within a single source are consecutive and unique
+    # (especially important after merging in chunked mode)
     sid = src["source_id"]
     qid_map: dict[str, str] = {}
     quotes: list[dict] = []
@@ -1100,9 +1343,9 @@ async def _extract_one(src: dict, workspace: str) -> dict | None:
             "subquestion": src["subquestion"],
         })
 
-    # ─── Tier 1 硬規則驗證 ────────────────────────────────────────
-    # 鐵律 2 + 4：quote 必須真實存在於原文 + claim 引用 quote_id 必須真實存在
-    # 違規即 drop（不傳給下游被誤用），記入 logger.warning 方便 debug。
+    # --- Tier 1 hard-rule validation ------------------------------------
+    # Hard rules 2 + 4: quote must truly exist in source + quote_id referenced by claim must truly exist
+    # On violation, drop (don't pass downstream to be misused); log via logger.warning for debugging.
     quotes, numbers, claims = _apply_tier1_validation(
         sid=sid,
         raw_content=raw,
@@ -1111,7 +1354,7 @@ async def _extract_one(src: dict, workspace: str) -> dict | None:
         claims=claims,
     )
 
-    # 寫入最終 S{id}.md（phase1b grounding 要讀這個）
+    # Write the final S{id}.md (phase1b grounding reads this)
     _write_source_file(workspace, src, quotes, numbers)
 
     return {"quotes": quotes, "numbers": numbers, "claims": claims}
@@ -1124,23 +1367,26 @@ def _apply_tier1_validation(
     numbers: list[dict],
     claims: list[dict],
 ) -> tuple[list[dict], list[dict], list[dict]]:
-    """Tier 1 硬規則：drop 在原文找不到的 quote、ledger 不存在的 quote_id。
+    """Tier 1 hard rules: drop quotes not found in source and quote_ids absent from the ledger.
 
-    流程：
-      1. validate_quotes_indexed：drop quote 的 start/end 無效或 source[s:e]!=text 的
-         （鐵律 2 硬版）。_verify_indexed_items 早前已 drop 過無法定位者，這裡是
-         雙重保險 — 確保 phase1a 下游看到的每筆 quote 都能純 index 還原。
-      2. number 同樣驗證（使用 sentence/start/end）
-         舊 quote 格式（無 start/end）會在步驟 1/2 被標成 violation；
-         若需向後相容（e.g. 不走 phase1a 的外部 quote），可再走 validate_quotes_exist。
-      3. validate_quote_ids_in_ledger：claim 引用不存在的 quote_id 視為破壞鐵律 4
-         — 把該無效 quote_id 從 claim 中移除；若 claim 失去所有 quote_ids → drop claim
+    Flow:
+      1. validate_quotes_indexed: drop quotes whose start/end is invalid or
+         source[s:e] != text (strict version of hard rule 2). _verify_indexed_items has
+         already dropped unlocatable ones earlier; this is a double safety net — ensuring
+         every quote seen downstream in phase1a can be reconstructed purely by index.
+      2. Same validation for numbers (using sentence/start/end).
+         Legacy quote format (no start/end) will be flagged as a violation in steps 1/2;
+         if backward compatibility is needed (e.g. external quotes not going through phase1a),
+         validate_quotes_exist can be invoked additionally.
+      3. validate_quote_ids_in_ledger: a claim referencing a non-existent quote_id is
+         treated as violating hard rule 4 — remove the invalid quote_id from the claim;
+         if the claim loses all quote_ids -> drop the claim entirely.
     """
     if not raw_content:
-        # 無原文（e.g. 抓取失敗的 source）— Tier 1 直接放行，後續 phase 自會處理
+        # No source content (e.g. fetch-failed source) — Tier 1 passes through; later phases will handle it
         return quotes, numbers, claims
 
-    # 1. quotes — 純 index 驗證（最硬）
+    # 1. quotes — pure index validation (strictest)
     quote_violations = validate_quotes_indexed(quotes, raw_content)
     bad_quote_ids: set[str] = set()
     if quote_violations:
@@ -1150,7 +1396,7 @@ def _apply_tier1_validation(
             bad_quote_ids.add(bad_id)
         quotes = [q for q in quotes if q.get("quote_id") not in bad_quote_ids]
 
-    # 2. numbers — 同樣走 index 驗證（sentence 當 text_field）
+    # 2. numbers — same index validation (sentence as text_field)
     num_violations = validate_quotes_indexed(numbers, raw_content)
     bad_number_ids: set[str] = set()
     if num_violations:
@@ -1160,7 +1406,7 @@ def _apply_tier1_validation(
             bad_number_ids.add(bad_id)
         numbers = [n for n in numbers if n.get("number_id") not in bad_number_ids]
 
-    # 3. claims：清掉引用無效 quote_id 的部分；空 quote_ids 的 claim 整條 drop
+    # 3. claims: strip invalid quote_id references; drop the entire claim if its quote_ids become empty
     bad_ids = bad_quote_ids | bad_number_ids
     valid_ids = (
         {q.get("quote_id") for q in quotes if q.get("quote_id")}
@@ -1187,29 +1433,29 @@ async def _extract_one_pass(
     chunk_idx: int | None = None,
     chunk_total: int | None = None,
 ) -> dict | None:
-    """單次 LLM call：抽取一段 content（可能是整篇或一個 chunk）的 quote/number/claim。"""
+    """Single LLM call: extract quote/number/claim from a content segment (could be full doc or one chunk)."""
     chunk_note = ""
     if chunk_idx is not None and chunk_total is not None:
         chunk_note = (
-            f"\n\n（這是長文的第 {chunk_idx + 1}/{chunk_total} 段，"
-            f"請只就這段內容抽取，不要假設前後文。）"
+            f"\n\n(This is chunk {chunk_idx + 1}/{chunk_total} of a long document; "
+            f"extract only from this chunk and do not assume surrounding context.)"
         )
 
-    user_msg = f"""## 子問題
-{src['subquestion']}（角色：{src['role']}）
+    user_msg = f"""## Subquestion
+{src['subquestion']} (role: {src['role']})
 
-## 來源 metadata
+## Source metadata
 - source_id: {src['source_id']}
 - url: {src['url']}
 - title: {src['title']}{chunk_note}
 
-## 原文
+## Source text
 {content}
 
-請根據以上原文抽取 QUOTE / NUMBER / claim。"""
+Based on the source text above, extract QUOTE / NUMBER / claim."""
 
     try:
-        # role="verifier" — 抽取/核對類，Gemini 主導（grounded summarization 幻覺率最低）
+        # role="verifier" — extraction/verification task; Gemini-led (lowest hallucination rate for grounded summarization)
         response = await safe_ainvoke_chain(
             role="verifier",
             messages=[SystemMessage(content=_EXTRACTOR_SYSTEM), HumanMessage(content=user_msg)],
@@ -1229,19 +1475,20 @@ async def _extract_one_pass(
 
 
 async def _extract_chunked(src: dict, content: str) -> dict:
-    """長文 sliding window 抽取：切 chunks → 並發 LLM call → 合併去重。
+    """Sliding-window extraction for long docs: split into chunks -> concurrent LLM calls -> merge + dedupe.
 
-    每 chunk 內的 quote_id / number_id 加上 c{chunk_idx}- 前綴避免衝突，
-    外層 _extract_one 會再做最終 ID 重編。
+    Within each chunk, quote_id / number_id are prefixed with c{chunk_idx}- to avoid
+    collisions; the outer _extract_one will then renumber IDs finally.
 
-    Index 處理：
-      - LLM 看到的是單一 chunk，輸出的 start_char/end_char 為 chunk-local
+    Index handling:
+      - The LLM sees only a single chunk, so its output start_char/end_char are chunk-local.
       - _verify_indexed_items(chunk_content, items, ..., chunk_offset=chunk_global_pos)
-        會把 chunk-local 驗證後的 index 轉為整篇 raw 的 global 座標
-      - 去重以 (start, end) tuple 為 key — 比 text 內容去重更精確
-        （同一段在 chunk overlap 區被兩次抽到會有相同 global span）
+        converts the chunk-local verified index into the global coordinate of the full raw.
+      - Deduplication keys on (start, end) tuple — more precise than deduplicating by
+        text content (the same passage extracted twice in the chunk-overlap region will
+        share the same global span).
 
-    Claim 去重仍用 claim_text（claim 不一定有 span）。
+    Claim deduplication still uses claim_text (claims don't always have spans).
     """
     step = max(_CHUNK_SIZE - _CHUNK_OVERLAP, 1)
     chunks: list[str] = []
@@ -1267,10 +1514,11 @@ async def _extract_chunked(src: dict, content: str) -> dict:
     merged_claims: list[dict] = []
     seen_quote_spans: set[tuple[int, int]] = set()
     seen_number_spans: set[tuple[int, int]] = set()
-    # 升級 claim 去重：用 normalize_for_dedup key 代替純字串
-    # key = normalized text → 抓得到 punctuation/whitespace 差異的近重複
+    # Upgraded claim dedup: use normalize_for_dedup key instead of raw string
+    # key = normalized text -> catches near-duplicates differing only in punctuation/whitespace
     seen_claim_norm: set[str] = set()
-    # 同時保留原始文字供 is_near_duplicate 比對（處理 normalized 後仍不同的近重複）
+    # Also keep raw text for is_near_duplicate comparison (handles near-duplicates that
+    # remain distinct after normalization)
     seen_claim_raw: list[str] = []
 
     for chunk_idx, res in enumerate(results):
@@ -1322,10 +1570,10 @@ async def _extract_chunked(src: dict, content: str) -> dict:
             if not text:
                 continue
             norm = normalize_for_dedup(text)
-            # 1) 快速 normalized 完全相符
+            # 1) Fast exact match after normalization
             if norm in seen_claim_norm:
                 continue
-            # 2) SequenceMatcher 近似重複（chunk overlap 區常見輕微改寫）
+            # 2) SequenceMatcher near-duplicate (common in chunk-overlap region with minor rephrasing)
             if any(is_near_duplicate(text, prev) for prev in seen_claim_raw):
                 continue
             seen_claim_norm.add(norm)
@@ -1371,8 +1619,8 @@ def _write_source_file(
         "",
         "## Verbatim Quotes",
         "",
-        "<!-- 每筆 @[start:end] 為 TextSpan（對應截斷後的 raw_content，"
-        "0-based、end-exclusive）。下游可用 raw[start:end] 切片驗證 / render。 -->",
+        "<!-- Each @[start:end] is a TextSpan (relative to the truncated raw_content, "
+        "0-based, end-exclusive). Downstream can verify/render via raw[start:end] slicing. -->",
     ]
     for q in quotes:
         span = _format_span(q.get("start"), q.get("end"))
@@ -1387,7 +1635,7 @@ def _write_source_file(
 
 
 def _format_span(start, end) -> str:
-    """將 start/end index 格式化為 @[s:e]；任一不是 int → 空字串（向後相容）。"""
+    """Format start/end index as @[s:e]; empty string if either is not an int (backward-compatible)."""
     if isinstance(start, int) and isinstance(end, int):
         return f" @[{start}:{end}]"
     return ""
@@ -1398,14 +1646,14 @@ def _format_span(start, end) -> str:
 # ---------------------------------------------------------------------------
 
 def _update_source_registry(workspace: str, raw_sources: list[dict]) -> None:
-    """追加新來源到 source-registry.md。"""
+    """Append new sources to source-registry.md."""
     today = datetime.now().strftime("%Y-%m-%d")
     lines = []
     for s in raw_sources:
         if not s["content"] and s.get("status") != "THIN_CONTENT":
-            continue  # UNREACHABLE 不登記到主 registry；THIN_CONTENT 留著透明記錄
+            continue  # UNREACHABLE is not registered in the main registry; THIN_CONTENT stays for transparency
         engines = ",".join(s["engines"])
-        # THIN_CONTENT 強制 T6；其他依 domain 分級
+        # THIN_CONTENT forces T6; others classified by domain
         if s.get("status") == "THIN_CONTENT":
             tier = "T6"
         else:
@@ -1424,13 +1672,13 @@ def _append_execution_log(
     queries: list[dict],
     searches_used: int,
 ) -> None:
-    """追加本輪到 execution-log.md，更新已搜 query 清單和搜尋計數。"""
+    """Append this round to execution-log.md, updating the searched-query list and search count."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     block = [
         "",
-        f"### 第 {iteration + 1} 輪 [{ts}]（消耗 {searches_used} 次）",
+        f"### Round {iteration + 1} [{ts}] (used {searches_used} searches)",
     ]
-    # 追加到已搜 Query 清單
+    # Append to the Searched Queries list
     query_lines = [f"- {q['query']} [{q['subquestion']}/{q['role']}/{q['lang']}]" for q in queries]
     block.append("")
     append_workspace_file(workspace, "execution-log.md", "\n".join(block) + "\n" + "\n".join(query_lines) + "\n")
@@ -1441,7 +1689,7 @@ def _log_unreachable(
     url_health: dict[str, str],
     raw_sources: list[dict],
 ) -> None:
-    """把 UNREACHABLE / THIN_CONTENT / LIKELY_HALLUCINATED URL 記入 gap-log.md。"""
+    """Record UNREACHABLE / THIN_CONTENT / LIKELY_HALLUCINATED URLs to gap-log.md."""
     bad = [s for s in raw_sources if not s["content"]]
     thin = [s for s in raw_sources if s.get("status") == "THIN_CONTENT"]
     hallucinated = [u for u, st in url_health.items() if st == "LIKELY_HALLUCINATED"]
@@ -1449,23 +1697,23 @@ def _log_unreachable(
         return
     lines = [""]
     if bad:
-        lines.append("### UNREACHABLE URLs（三階梯抓取全失敗）")
+        lines.append("### UNREACHABLE URLs (all three fetch tiers failed)")
         for s in bad:
             lines.append(f"- {s['url']} [{s['subquestion']}/{s['role']}]")
     if thin:
-        lines.append("### THIN_CONTENT URLs（內容不足 500 chars，不進 claim extraction）")
+        lines.append("### THIN_CONTENT URLs (< 500 chars, skipped claim extraction)")
         for s in thin:
             chars = len((s.get("content") or "").strip())
             lines.append(f"- {s['url']} [{s['subquestion']}/{s['role']}] ({chars} chars)")
     if hallucinated:
-        lines.append("### LIKELY_HALLUCINATED URLs（urlhealth 判定）")
+        lines.append("### LIKELY_HALLUCINATED URLs (urlhealth verdict)")
         for u in hallucinated:
             lines.append(f"- {u}")
     append_workspace_file(workspace, "gap-log.md", "\n".join(lines) + "\n")
 
 
 def _extract_domain(url: str) -> str:
-    """從 URL 提取 hostname，去掉 www. 前綴。"""
+    """Extract hostname from URL; strip the www. prefix."""
     from urllib.parse import urlparse
     try:
         host = urlparse(url).hostname or ""
@@ -1481,25 +1729,26 @@ def _log_domain_bias(
     new_raw_sources: list[dict],
     threshold: float = 0.30,
 ) -> None:
-    """掃描所有累積 sources 的 domain 分佈。
+    """Scan the domain distribution across all accumulated sources.
 
-    若某 domain 佔比超過 threshold（預設 30%），在 gap-log.md 追加
-    [BIAS WARNING]，供 Phase 2 整合時降低該 domain claims 的信心等級。
+    If a domain's share exceeds threshold (default 30%), append a [BIAS WARNING]
+    to gap-log.md so that Phase 2 can lower the confidence of claims from that
+    domain during integration.
     """
     domain_counts: dict[str, int] = {}
 
-    # 已存在的 Source 物件（前幾輪）
+    # Existing Source objects (from prior rounds)
     for s in existing_sources:
         url = s.url if hasattr(s, "url") else (s.get("url", "") if isinstance(s, dict) else "")
         d = _extract_domain(url)
         if d:
             domain_counts[d] = domain_counts.get(d, 0) + 1
 
-    # 本輪新抓到的（raw dicts）
+    # Newly fetched this round (raw dicts)
     for s in new_raw_sources:
         url = s.get("url", "")
         if s.get("status") == "UNREACHABLE":
-            continue  # 未抓到的不算
+            continue  # Unfetched sources don't count
         d = _extract_domain(url)
         if d:
             domain_counts[d] = domain_counts.get(d, 0) + 1
@@ -1519,20 +1768,20 @@ def _log_domain_bias(
 
     biased.sort(key=lambda x: -x[2])
     lines = [
-        f"\n\n## [BIAS WARNING] 來源 domain 濃度過高（第 {iteration + 1} 輪累計）",
-        f"以下 domain 佔所有已抓來源 > {threshold:.0%}，可能存在自家宣傳或觀點偏頗：",
+        f"\n\n## [BIAS WARNING] Source domain concentration too high (cumulative at round {iteration + 1})",
+        f"The following domains account for > {threshold:.0%} of all fetched sources; possible self-promotion or viewpoint bias:",
     ]
     for domain, count, pct in biased:
-        lines.append(f"- **{domain}**：{count}/{total} 篇（{pct:.0%}）")
+        lines.append(f"- **{domain}**: {count}/{total} sources ({pct:.0%})")
     lines.append(
-        "Phase 2 整合時，來自這些 domain 的 claims 應標記 🟠CONFLICTING，"
-        "除非有 T1-T3 獨立來源佐證。"
+        "During Phase 2 integration, claims from these domains should be marked CONFLICTING "
+        "unless corroborated by an independent T1-T3 source."
     )
     append_workspace_file(workspace, "gap-log.md", "\n".join(lines) + "\n")
 
 
 # ---------------------------------------------------------------------------
-# 建立回傳的 sources / claims
+# Build returned sources / claims
 # ---------------------------------------------------------------------------
 
 def _build_sources(raw_sources: list[dict]) -> list[Source]:
@@ -1557,7 +1806,7 @@ def _build_sources(raw_sources: list[dict]) -> list[Source]:
 
 
 def _next_source_id_index(existing: list) -> int:
-    """從現有 sources 算下一個 S{n} 編號起點。"""
+    """Compute the next S{n} numbering starting point from existing sources."""
     max_n = 0
     for s in existing:
         sid = s.source_id if hasattr(s, "source_id") else s.get("source_id", "")
@@ -1568,24 +1817,25 @@ def _next_source_id_index(existing: list) -> int:
 
 
 def _collect_claims(extractions: list[dict], existing_claims: list | None = None) -> list[Claim]:
-    """展開所有 Extractor 產出的 pending claim 成 Claim object。
+    """Expand all pending claims produced by Extractor into Claim objects.
 
-    `existing_claims` 用於跨輪累積編號，避免第二輪重新從 Q1-C1 撞號。
-    同時以 is_near_duplicate 過濾與 existing_claims 近似重複的 claim（跨輪去重）。
+    `existing_claims` is used for cross-round cumulative numbering, so round 2 does
+    not restart from Q1-C1 and collide. Also filters out claims near-duplicate with
+    existing_claims via is_near_duplicate (cross-round dedup).
     """
     out: list[Claim] = []
     counter: dict[str, int] = {}
 
-    # 建立跨輪去重的快速查詢結構：每個 subquestion → 已有 claim 文字 list
-    # 同時記 normalized key set 做 O(1) 快速篩
-    existing_raw: dict[str, list[str]] = {}   # subq → [raw_texts]
-    existing_norm: dict[str, set[str]] = {}   # subq → {norm_texts}
+    # Build a fast-lookup structure for cross-round dedup: each subquestion -> list of existing claim texts
+    # Also keep a normalized-key set for O(1) quick filtering
+    existing_raw: dict[str, list[str]] = {}   # subq -> [raw_texts]
+    existing_norm: dict[str, set[str]] = {}   # subq -> {norm_texts}
 
     if existing_claims:
         for c in existing_claims:
             cid = c.claim_id if hasattr(c, "claim_id") else c.get("claim_id", "")
             sq = c.subquestion if hasattr(c, "subquestion") else c.get("subquestion", "")
-            # Match any claim_id format ending in -C{n}: "Q1-C3", "子問題1-C3", etc.
+            # Match any claim_id format ending in -C{n}: "Q1-C3", "SQ1-C3", etc.
             m = re.match(r"(.+)-C(\d+)$", cid)
             if m:
                 subq_c = sq or m.group(1)  # prefer subquestion field over ID prefix
@@ -1604,7 +1854,7 @@ def _collect_claims(extractions: list[dict], existing_claims: list | None = None
             if not claim_text:
                 continue
 
-            # 跨輪去重：先用 normalized set O(1) 比，再用 SequenceMatcher
+            # Cross-round dedup: first O(1) check via normalized set, then SequenceMatcher
             norm = normalize_for_dedup(claim_text)
             if norm in existing_norm.get(subq, set()):
                 continue
@@ -1626,7 +1876,7 @@ def _collect_claims(extractions: list[dict], existing_claims: list | None = None
                 status="pending",
             ))
 
-            # 把新 claim 也加入去重池，防止同批次不同 source 的重複
+            # Add the new claim to the dedup pool to prevent duplicates from different sources in the same batch
             existing_raw.setdefault(subq, []).append(claim_text)
             existing_norm.setdefault(subq, set()).add(norm)
 

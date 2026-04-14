@@ -22,8 +22,11 @@ import unicodedata
 from difflib import SequenceMatcher
 
 # Punctuation characters to strip during normalization
+# (Latin + CJK punctuation; CJK chars included inline so the regex stays readable)
 _PUNCT_RE = re.compile(
-    r'[。，、！？；：\u201c\u201d\u2018\u2019「」【】《》〈〉\u2026—\-,.!?;:"\'()\[\]{}·•◆▶▷※★☆♦]'
+    r'[\u3002\uff0c\u3001\uff01\uff1f\uff1b\uff1a\u201c\u201d\u2018\u2019'
+    r'\u300c\u300d\u3010\u3011\u300a\u300b\u3008\u3009\u2026\u2014'
+    r'\-,.!?;:"\'()\[\]{}\u00b7\u2022\u25c6\u25b6\u25b7\u203b\u2605\u2606\u2666]'
 )
 _WHITESPACE_RE = re.compile(r"[\s\u3000\u00a0\u200b]+")
 
@@ -34,14 +37,14 @@ def normalize_for_dedup(text: str) -> str:
     Steps:
     1. NFKC unicode normalization (full-width → half-width, ligatures, etc.)
     2. Lowercase
-    3. Strip all whitespace (including 全角空格 U+3000)
+    3. Strip all whitespace (including full-width space U+3000)
     4. Strip common punctuation (Chinese and Latin)
 
     Returns a compact string suitable as a set/dict key.
     """
     if not text:
         return ""
-    # NFKC: 全形「Ａ」→「A」, 「①」→「1」, 「㎞」→「km」
+    # NFKC: full-width "A" (U+FF21) → "A", "1" circled (U+2460) → "1", "km" square (U+339E) → "km"
     text = unicodedata.normalize("NFKC", text)
     text = text.lower()
     text = _WHITESPACE_RE.sub("", text)

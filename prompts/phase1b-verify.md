@@ -1,18 +1,18 @@
-# Phase 1b: 驗證 + 條件式辯證 + 迭代
+# Phase 1b: Validation + Conditional Debate + Iteration
 
-**輸入：** `workspace/search-results/` + `workspace/source-registry.md` + `workspace/coverage.chk`
-**輸出：** `workspace/claim-ledger.md` + `workspace/grounding-results/` + 更新 `workspace/coverage.chk` + `workspace/gap-log.md`
-**完成條件：** 通過結構化停止條件
+**Input:** `workspace/search-results/` + `workspace/source-registry.md` + `workspace/coverage.chk`
+**Output:** `workspace/claim-ledger.md` + `workspace/grounding-results/` + updated `workspace/coverage.chk` + `workspace/gap-log.md`
+**Completion condition:** passes the structured stopping conditions
 
-**本 Phase 分兩子階段：**
-- **1b-A：** Grounding + 品質評估 → 全過就直接進 Phase 2
-- **1b-B（僅 1b-A 未過時觸發）：** Subagent 核對 + 辯證 + 補搜 → 迭代
+**This Phase has two sub-stages:**
+- **1b-A:** Grounding + quality evaluation -> if all pass, proceed directly to Phase 2
+- **1b-B (triggered only when 1b-A fails):** subagent cross-check + debate + additional search -> iterate
 
 ---
 
-## 驗證工具（CLI 模式）
+## Validation Tools (CLI mode)
 
-**完整 CLI 用法參見 `prompts/ref-cli-tools.md`**
+**Full CLI usage: see `prompts/ref-cli-tools.md`**
 
 ```
 PY=.venv/bin/python3
@@ -20,262 +20,262 @@ GS=grounding_scripts
 MINICHECK_PY=.minicheck-venv/bin/python3
 ```
 
-| 工具 | CLI 指令 | 角色 | 何時用 |
+| Tool | CLI command | Role | When to use |
 |------|---------|------|--------|
-| Bedrock Grounding | `echo '{...}' \| $PY $GS/bedrock-guardrails.py --cli` | **主要驗證** | 每個 claim 必跑 |
-| MiniCheck | `echo '{...}' \| $MINICHECK_PY $GS/minicheck.py --cli` | **備用** | 僅當 Bedrock 錯誤時 |
-| NeMo Grounding | `echo '{...}' \| $PY $GS/nemo-guardrails.py --cli` | **第三備用** | 僅當 Bedrock + MiniCheck 都錯誤時 |
+| Bedrock Grounding | `echo '{...}' \| $PY $GS/bedrock-guardrails.py --cli` | **Primary validator** | Every claim must be run |
+| MiniCheck | `echo '{...}' \| $MINICHECK_PY $GS/minicheck.py --cli` | **Fallback** | Only when Bedrock errors |
+| NeMo Grounding | `echo '{...}' \| $PY $GS/nemo-guardrails.py --cli` | **Third fallback** | Only when both Bedrock and MiniCheck error |
 
-**Bedrock 判定規則（按 claim 類型分門檻）：**
+**Bedrock decision rules (threshold per claim type):**
 
-| Claim 類型 | Bedrock 門檻 | 額外要求 |
+| Claim type | Bedrock threshold | Extra requirements |
 |-----------|-------------|---------|
-| 數字型 / 精確引用 | >= 0.8 | Citation API = precise + URL = LIVE/STALE |
-| 比較型 / 排名型 | >= 0.75 | 至少 2 個獨立來源 |
-| 因果型 / 預測型 | >= 0.75 | 至少 1 個 primary + 1 個 secondary source |
-| 背景定性型 | >= 0.7 | — |
+| Numeric / exact quote | >= 0.8 | Citation API = precise + URL = LIVE/STALE |
+| Comparative / ranking | >= 0.75 | at least 2 independent sources |
+| Causal / forecast | >= 0.75 | at least 1 primary + 1 secondary source |
+| Background qualitative | >= 0.7 | — |
 
-**Bedrock API Throttling：** 遇到 429 → 等待 3 秒重試，最多 3 次。持續失敗 → 改用 MiniCheck。
-**批次策略：** 同子問題的 claims 盡量用一次 Bash 呼叫打包送 Bedrock（JSON 中放多個 claims）。
+**Bedrock API throttling:** on 429 -> wait 3 seconds and retry, up to 3 times. Continued failure -> switch to MiniCheck.
+**Batch strategy:** whenever possible, batch claims for the same subquestion into a single Bash call to Bedrock (multiple claims in one JSON).
 
-**⛔ Grounding 工具可用性檢查（鐵律，不可跳過）：**
+**Grounding tool availability check (hard rule, not skippable):**
 
-在 Phase 1b 開始時，必須先用 Bash 執行簡單測試驗證 grounding CLI 是否可用：
+At the start of Phase 1b, run a simple Bash test first to verify the grounding CLI is working:
 
 ```bash
 TEST_JSON='{"claims":["The sky is blue."],"sources":["The sky is blue during a clear day."]}'
 
-# 1. 測試 Bedrock
+# 1. Test Bedrock
 echo "$TEST_JSON" | $PY $GS/bedrock-guardrails.py --cli 2>/dev/null
 
-# 2. 若失敗，測試 MiniCheck
+# 2. If it fails, test MiniCheck
 echo "$TEST_JSON" | $MINICHECK_PY $GS/minicheck.py --cli 2>/dev/null
 
-# 3. 若也失敗，測試 Nemo
+# 3. If that also fails, test Nemo
 echo "$TEST_JSON" | $PY $GS/nemo-guardrails.py --cli 2>/dev/null
 ```
 
-**判定規則：**
-- 三者中至少一個必須成功返回有效 JSON（含 grounding_score 或 confidence）
-- 若三者全部失敗 → **立即停止研究流程**，向使用者報告：
+**Decision rules:**
+- At least one of the three must return valid JSON (containing grounding_score or confidence)
+- If all three fail -> **stop the research pipeline immediately** and report to the user:
   ```
-  ⛔ [GROUNDING-UNAVAILABLE] 所有 grounding 驗證工具均不可用：
-  - Bedrock: {錯誤訊息}
-  - MiniCheck: {錯誤訊息}
-  - Nemo: {錯誤訊息}
-  請修復後重新執行 /research。
+  [GROUNDING-UNAVAILABLE] All grounding validation tools are unavailable:
+  - Bedrock: {error message}
+  - MiniCheck: {error message}
+  - Nemo: {error message}
+  Please fix and re-run /research.
   ```
-- **禁止在沒有任何 grounding 工具可用的情況下繼續 Phase 1b**
-- **禁止用「手動判斷」或「Claude 自行評估」替代 grounding 工具**
+- **Continuing Phase 1b with no grounding tool available is forbidden**
+- **Replacing grounding tools with "manual judgment" or "Claude's own evaluation" is forbidden**
 
-**Bedrock 只判定「claim 是否被提供的文本支持」，不判定「哪一方在現實中是真的」。禁止用 Bedrock 分數差直接裁決正反方真偽。**
+**Bedrock judges only "whether the claim is supported by the provided text", not "which side is actually true in reality". Using Bedrock score deltas to directly adjudicate advocate-vs-critic truth is forbidden.**
 
 ---
 
-# 1b-A：Grounding + 品質評估
+# 1b-A: Grounding + Quality Evaluation
 
-## Step 1: Grounding 驗證
+## Step 1: Grounding Validation
 
-讀取 `workspace/search-results/` 目錄下的所有來源檔案。
+Read all source files under `workspace/search-results/`.
 
-對每個來源中的每個 QUOTE 和 NUMBER：
-1. **Bedrock**：claim text + source text（超過 2000 tokens 時截取 quote 周邊 ±250 tokens）→ score
-2. **含數字或直接引用** → 追加 Citation API
+For every QUOTE and NUMBER in each source:
+1. **Bedrock**: claim text + source text (when over 2000 tokens, extract a ±250-token window around the quote) -> score
+2. **If it contains a number or direct quote** -> also call Citation API
 
-將結果寫入 `workspace/grounding-results/q{n}_grounding.md`。
+Write results to `workspace/grounding-results/q{n}_grounding.md`.
 
 ---
 
-## Step 2: 建立 Claim Ledger
+## Step 2: Build the Claim Ledger
 
-寫入 `workspace/claim-ledger.md`：
+Write `workspace/claim-ledger.md`:
 
 ```markdown
 # Claim Ledger
 
 | claim_id | subquestion | type | claim_text | source_ids | quote_ids | bedrock | citation | status |
 |----------|-------------|------|------------|------------|-----------|---------|----------|--------|
-| Q1-C1 | Q1 | numeric | "{完整 claim 文字}" | S003 | S003-N1 | 0.85 | precise | pending |
-| Q1-C2 | Q1 | comparative | "{完整 claim 文字}" | S003,S005 | S003-Q1,S005-Q2 | 0.78 | N/A | pending |
+| Q1-C1 | Q1 | numeric | "{full claim text}" | S003 | S003-N1 | 0.85 | precise | pending |
+| Q1-C2 | Q1 | comparative | "{full claim text}" | S003,S005 | S003-Q1,S005-Q2 | 0.78 | N/A | pending |
 ```
 
-**欄位說明：**
-- `claim_id`：唯一識別碼，格式 Q{n}-C{m}
-- `type`：numeric / comparative / causal / forecast / qualitative
-- `claim_text`：**canonical text**，後續所有引用和核對都以此為準
-- `quote_ids`：對應的逐字引用 ID（來自 search-results 檔案）
-- `status`：pending / approved / rejected / needs_revision
+**Field descriptions:**
+- `claim_id`: unique identifier, format Q{n}-C{m}
+- `type`: numeric / comparative / causal / forecast / qualitative
+- `claim_text`: **canonical text**; all downstream citations and cross-checks use this as the reference
+- `quote_ids`: the corresponding verbatim quote IDs (from the search-results files)
+- `status`: pending / approved / rejected / needs_revision
 
-**規則：claim_text 一旦寫入，後續 Phase 不得改寫。如需修正，建立新 claim_id。**
+**Rule: once `claim_text` is written, downstream phases must not rewrite it. To correct it, create a new claim_id.**
 
 ---
 
-## Step 3: 4 維品質評估
+## Step 3: 4-Dimension Quality Evaluation
 
-對每個子問題評估：
+Evaluate each subquestion:
 
-| 維度 | Pass 標準 |
+| Dimension | Pass criterion |
 |------|----------|
-| **Actionability** | 陳述具體、範圍清楚、限定詞正確。若來源本身不確定，保留不確定語氣不算 fail。 |
-| **Freshness** | 核心數據符合 Phase 0 設定的 freshness SLA |
-| **Plurality** | >= 2 個獨立來源（非同源轉述） |
-| **Completeness** | 正反方 + 主要視角都有覆蓋 |
+| **Actionability** | Statement is specific, scope is clear, qualifiers are correct. If the source itself is uncertain, preserving the uncertain tone does not count as fail. |
+| **Freshness** | Core data meets the freshness SLA set in Phase 0 |
+| **Plurality** | >= 2 independent sources (not relaying the same origin) |
+| **Completeness** | Both advocate and critic + the main perspectives are covered |
 
-**評估結果：**
-- 4/4 Pass → 該子問題的所有 pending claims 標記為 **approved** → 更新 coverage.chk
-- 任一維度 Fail → 記錄失敗維度 → 進入 **1b-B**
-
----
-
-## Step 4: 1b-A 快速通關判定
-
-**如果所有子問題都 4/4 Pass：**
-→ 跳過 1b-B，直接進入 Phase 2
-
-**如果任一子問題有 Fail 維度：**
-→ 僅對 Fail 的子問題進入 1b-B（已通過的子問題不需重做）
+**Evaluation result:**
+- 4/4 Pass -> all pending claims for the subquestion become **approved** -> update coverage.chk
+- Any Fail dimension -> record the failed dimension -> enter **1b-B**
 
 ---
 
-# 1b-B：Subagent 核對 + 辯證 + 補搜（條件觸發）
+## Step 4: 1b-A Fast-Track Decision
 
-**只有 1b-A 未全過時才執行此段。**
+**If every subquestion is 4/4 Pass:**
+-> skip 1b-B, proceed directly to Phase 2
 
-## Step 5: Subagent 攻擊式核對
+**If any subquestion has a Fail dimension:**
+-> only subquestions that Fail enter 1b-B (passing subquestions do not need to be redone)
 
-對每個 Fail 的子問題，spawn 一個 **Sonnet** subagent。多個子問題可平行。
+---
 
-**Subagent Prompt（填入後傳給 Agent tool，model: sonnet）：**
+# 1b-B: Subagent Cross-Check + Debate + Additional Search (conditionally triggered)
+
+**This section is only executed when 1b-A has not fully passed.**
+
+## Step 5: Subagent Attacker-Style Cross-Check
+
+For each Fail subquestion, spawn a **Sonnet** subagent. Multiple subquestions may run in parallel.
+
+**Subagent prompt (fill in and pass to the Agent tool, model: sonnet):**
 
 ```
-你是攻擊型事實核查員。你的任務是嘗試證明以下 claims 是錯的。
+You are an attacker-style fact-checker. Your task is to try to prove the following claims wrong.
 
-## 待核對 Claims
-{從 claim-ledger.md 中提取該子問題所有 pending/needs_revision 的 claims，每個附 claim_id 和 claim_text}
+## Claims to check
+{extract all pending/needs_revision claims for the subquestion from claim-ledger.md, each with claim_id and claim_text}
 
-## 搜尋結果檔案（用 Read 和 Glob 工具讀取）
-目錄：{workspace 絕對路徑}/search-results/Q{n}/
-讀取該目錄下所有 .md 檔案。
-如果某檔案不存在，跳過，不得因缺檔中止。
+## Search-result files (read with Read and Glob)
+Directory: {absolute workspace path}/search-results/Q{n}/
+Read every .md file in that directory.
+If a file does not exist, skip it; do not abort because of missing files.
 
-## 核對規則（嚴格遵守）
-對每個 claim：
-1. 在搜尋結果中找到 QUOTE 或 NUMBER 原文，嘗試推翻 claim
-2. 數字：執行逐字核對。15% ≠ 約15% ≠ 近15%。任何不一致 = NOT_SUPPORTED
-3. 程度詞：原文「成長」但 claim 說「大幅成長」= PARTIAL
-4. 語氣：原文「可能」但 claim 說「確定」= NOT_SUPPORTED
-5. 跨來源拼接：如果 claim 需要兩個不同來源才能支持 = PARTIAL 並標記 COMPOSITE
+## Cross-check rules (strict)
+For each claim:
+1. Find the QUOTE or NUMBER original text in the search results and try to refute the claim
+2. Numbers: verbatim check. 15% != about 15% != nearly 15%. Any mismatch = NOT_SUPPORTED
+3. Degree words: original says "grew" but claim says "grew substantially" = PARTIAL
+4. Tone: original says "may" but claim says "will" = NOT_SUPPORTED
+5. Cross-source splicing: if the claim requires two different sources to be supported = PARTIAL and mark COMPOSITE
 
-若找不到逐字對應或明確支持的原文，必須判為 NOT_SUPPORTED。
-禁止用「意思接近」代替支持。
-禁止自己腦補可能的支持證據。
+If no verbatim correspondence or explicitly supporting original text can be found, you must rule NOT_SUPPORTED.
+Replacing support with "similar meaning" is forbidden.
+Inventing plausible supporting evidence is forbidden.
 
-## 輸出格式（每個 claim 一段，嚴格遵守此格式）
+## Output format (one block per claim, strictly follow this format)
 CLAIM_ID: {claim_id}
 VERDICT: SUPPORTED / PARTIAL / NOT_SUPPORTED
-QUOTE_ID: {支持的 quote_id} 或 NONE
-ISSUE: {如果非 SUPPORTED，具體說明問題類型和細節}
+QUOTE_ID: {supporting quote_id} or NONE
+ISSUE: {if not SUPPORTED, describe the issue type and details}
 ---
 ```
 
 ---
 
-## Step 6: 處理 Subagent 結果
+## Step 6: Process Subagent Results
 
-更新 claim-ledger.md 的 `status` 欄位：
+Update the `status` field of claim-ledger.md:
 
-| Subagent Verdict | 動作 | claim status |
+| Subagent verdict | Action | claim status |
 |-----------------|------|-------------|
-| SUPPORTED | 保留 | **approved** |
-| PARTIAL | 修正 claim_text 使其與原文一致（建新 claim_id），或弱化語氣 | **needs_revision** → 修正後 approved |
-| NOT_SUPPORTED | 觸發補搜 1 次。補搜後仍無支持 → 刪除 | **rejected** |
+| SUPPORTED | keep | **approved** |
+| PARTIAL | revise claim_text to match the original text (create new claim_id) or weaken the tone | **needs_revision** -> approved after revision |
+| NOT_SUPPORTED | trigger one additional search. If still unsupported after searching -> delete | **rejected** |
 
-**Fail-Fast：** 同一 claim 補搜最多 2 次。第 3 次仍 NOT_SUPPORTED → 直接 rejected，不再迴圈。
-
----
-
-## Step 7: 正反方辯證
-
-1. 列出正方 approved claims + Bedrock 分數
-2. 列出反方 approved claims + Bedrock 分數
-3. 讀取 `prompts/ref-challenge-checklist.md`，從 22 項中**選出適用的項目**執行（不需全部通過，標記 N/A 的跳過）
-4. 質疑成立 → 記入 `workspace/gap-log.md` 的「未解矛盾」區段，觸發補搜
-5. **Perspective 來源中如有一手事實或實質反證** → 提升為 advocate/critic claim
+**Fail-Fast:** each claim gets at most 2 additional searches. A third NOT_SUPPORTED -> rejected immediately, no more loops.
 
 ---
 
-## Step 8: 更新 Coverage Checklist
+## Step 7: Pro-Con Debate
 
-讀取 `workspace/coverage.chk`，用 Edit tool 更新每個項目：
+1. List advocate approved claims + Bedrock scores
+2. List critic approved claims + Bedrock scores
+3. Read `prompts/ref-challenge-checklist.md` and **pick applicable items** from the 22 (not all need to pass; skip those marked N/A)
+4. A challenge holds -> record in the "Unresolved contradictions" section of `workspace/gap-log.md`, trigger additional search
+5. **If perspective sources contain primary facts or substantive counter-evidence** -> promote to advocate/critic claim
 
-| 更新規則 | 動作 |
+---
+
+## Step 8: Update Coverage Checklist
+
+Read `workspace/coverage.chk` and update each item using the Edit tool:
+
+| Update rule | Action |
 |---------|------|
-| 該 facet+role 有 ≥1 個 approved claim | `[ ]` → `[x]` + `evidence_found (S{ids})` |
-| 搜過但無 approved claim（至少 2 次嘗試）| `[ ]` → `[x]` + `searched_2x_no_evidence` |
-| 搜過但正在補搜 | 保持 `[ ]` + `in_progress` |
+| Facet+role has >=1 approved claim | `[ ]` -> `[x]` + `evidence_found (S{ids})` |
+| Searched but no approved claim (at least 2 attempts) | `[ ]` -> `[x]` + `searched_2x_no_evidence` |
+| Searched but additional search still in progress | keep `[ ]` + `in_progress` |
 
-同時更新 `workspace/gap-log.md`（薄弱證據、缺失視角）。
-
----
-
-## Step 9: 迭代決策
-
-**觸發新迭代的條件：** 資料不足 / 矛盾未解 / coverage 有 required `[ ]` / Subagent NOT_SUPPORTED 未處理
-
-**每輪結束時 Plan Reflection：**
-1. 新發現了什麼？
-2. 從搜尋結果中提取新術語 → 重寫下輪 query
-3. 更新 gap-log.md
-4. 重跑 4 維品質，delta = 0 → 飽和信號
-
-**Beast Mode（搜尋預算 80% 時）：**
-- 停止開新子問題和新 facet
-- **但不能停止補足 required coverage 項目**
-- 剩餘 20% 留給 Phase 2-3
-
-**回到 Phase 1a 繼續搜尋 → 搜完回到 Phase 1b-A 驗證 → 循環直到停止條件**
+Also update `workspace/gap-log.md` (weak evidence, missing perspectives).
 
 ---
 
-## ⚠️ 結構化停止條件（全部成立才可停止）
+## Step 9: Iteration Decision
+
+**Conditions to trigger a new iteration:** insufficient data / unresolved contradictions / coverage still has required `[ ]` / Subagent NOT_SUPPORTED items not yet handled
+
+**Plan Reflection at the end of each round:**
+1. What was newly discovered?
+2. Extract new terms from search results -> rewrite next-round queries
+3. Update gap-log.md
+4. Re-run 4-dim quality; delta = 0 -> saturation signal
+
+**Beast Mode (when search budget hits 80%):**
+- Stop opening new subquestions or new facets
+- **But do not stop backfilling required coverage items**
+- Reserve the remaining 20% for Phase 2-3
+
+**Return to Phase 1a to keep searching -> after searching, return to Phase 1b-A to validate -> loop until stop condition is met**
+
+---
+
+## Structured Stopping Conditions (all must hold to stop)
 
 ```
-□ 1. coverage.chk 中所有 required 項目皆已標為 [x]？
-     → 有未標記的 required 項 = 禁止停止
+[ ] 1. All required items in coverage.chk are marked [x]?
+       -> any unmarked required item = stopping is forbidden
 
-□ 2. 每個 searched_2x_no_evidence 項目確實至少 2 次不同 query？
-     → < 2 次 = 回到 Phase 1a 補搜
+[ ] 2. Each searched_2x_no_evidence item really came from at least 2 different queries?
+       -> < 2 -> return to Phase 1a for additional search
 
-□ 3. 每個子問題 advocate 和 critic 各至少 1 個 approved claim？
-     → 任一方 = 0 且非 searched_2x_no_evidence → 補搜
+[ ] 3. Each subquestion has at least 1 approved claim from advocate and 1 from critic?
+       -> either side = 0 and not searched_2x_no_evidence -> additional search
 
-□ 4. 所有 high-risk claim（numeric/comparative/causal/forecast）
-     都已完成 Grounding + URL check？
-     → 列出 high-risk claims 和驗證狀態
+[ ] 4. Every high-risk claim (numeric/comparative/causal/forecast)
+       has completed Grounding + URL check?
+       -> list the high-risk claims and their validation status
 
-□ 5. gap-log.md 的「未解矛盾」已全部處理或標記 [BLOCKER]？
-     → 未處理的矛盾 > 0 = 處理完或標記 BLOCKER 才能停
+[ ] 5. All "Unresolved contradictions" in gap-log.md are resolved or marked [BLOCKER]?
+       -> unresolved contradictions > 0 -> must be resolved or marked BLOCKER before stopping
 
-□ 6. 所有 rejected claims 已處理（確認 rejected 或補搜後 approved）？
+[ ] 6. All rejected claims handled (confirmed rejected or approved after additional search)?
 
-→ 全部 ✅ = 進入 Phase 2
-→ 任一 ❌ = 回到 Phase 1a/Step 繼續
+-> all OK = proceed to Phase 2
+-> any fail = return to Phase 1a/Step, continue
 ```
 
 ---
 
-## 更新 execution-log.md
+## Update execution-log.md
 
-每輪結束時追加：
+At the end of each round, append:
 
 ```
-### 第 {R} 輪完成
-🔍 搜尋：{N} 次（累計 {total}/{budget} = {pct}%）
-📖 深讀：{N} 篇
-🛡️ Grounding：{passed}✅ / {weak}⚠️ / {filtered}❌
-📊 Claim Ledger：{approved} approved / {rejected} rejected / {pending} pending
-📊 4 維品質：{pass}/4（Fail: {失敗維度}）
-📊 1b-B 觸發？ {是/否}
-📊 Coverage：{checked}/{total_required} required 項已完成
-🔄 新 URL 新增率：{pct}% | approved claim 成長率：{pct}%
+### Round {R} complete
+Search: {N} calls (cumulative {total}/{budget} = {pct}%)
+Deep-read: {N} sources
+Grounding: {passed} pass / {weak} weak / {filtered} filtered
+Claim Ledger: {approved} approved / {rejected} rejected / {pending} pending
+4-dim quality: {pass}/4 (Fail: {failed dimensions})
+1b-B triggered? {yes/no}
+Coverage: {checked}/{total_required} required items done
+New URL growth rate: {pct}% | approved claim growth rate: {pct}%
 ```

@@ -47,7 +47,7 @@ async def phase3_report(state: ResearchState) -> dict:
     claim_objects = _ensure_claim_objects(claims)
     source_objects = _ensure_source_objects(sources)
 
-    # Step 1: Merge report sections（同時保留 per-section 內容供 ledger 切片）
+    # Step 1: Merge report sections (also keep per-section contents for ledger splitting)
     section_files = list_workspace_files(workspace, "report-sections", "*.md")
     section_contents: list[tuple[str, str]] = []  # (section_name, content)
     merged_body = ""
@@ -57,7 +57,7 @@ async def phase3_report(state: ResearchState) -> dict:
             section_contents.append((Path(sf).stem, content))
             merged_body += content + "\n\n---\n\n"
 
-    # Step 2: Build statement ledger — 按 section 分批切，避免 Lost in the Middle
+    # Step 2: Build statement ledger — split per section to avoid Lost in the Middle
     statements = await _build_statement_ledger(section_contents, claim_objects)
     statement_ledger_md = _format_statement_ledger(statements)
     write_workspace_file(workspace, "statement-ledger.md", statement_ledger_md)
@@ -71,9 +71,10 @@ async def phase3_report(state: ResearchState) -> dict:
     # Step 5: Traceability chain validation (iron rule)
     chain_breaks = validate_traceability_chain(statements, claim_objects, source_objects)
 
-    # Step 5b: Tier 1 — 數字 claim 三類標記校驗（鐵律 3）
-    # phase1a 已驗過 quote 真實存在於原文；此處複驗 number_tag 格式，
-    # 確保 ORIGINAL/NORMALIZED/DERIVED 標記在最後報告階段沒被遺漏。
+    # Step 5b: Tier 1 — three-category marker validation for numeric claims (hard rule 3)
+    # phase1a has already verified that quotes exist verbatim in the original text;
+    # here we re-check number_tag formatting to ensure ORIGINAL/NORMALIZED/DERIVED
+    # markers were not dropped in the final reporting phase.
     number_tag_violations = validate_number_tags(claim_objects)
     if number_tag_violations:
         chain_breaks = list(chain_breaks) + [f"[Tier1 number_tag] {v}" for v in number_tag_violations]
@@ -92,19 +93,30 @@ async def phase3_report(state: ResearchState) -> dict:
     # Step 7: Assemble final report
     gap_log = read_workspace_file(workspace, "gap-log.md") or ""
 
-    # Coverage sanity check（兩層）
-    # 層 1：SQ 覆蓋率（計畫子問題 vs 實際 approved claims）
+    # Coverage sanity check (two layers)
+    # Layer 1: SQ coverage (planned subquestions vs actual approved claims)
     sq_coverage_note = _compute_coverage_note(plan, approved_claims)
 
-    # 層 2：Keyword 覆蓋率（任務書明確提及工具 vs 實際 approved claims）
+    # Layer 2: Keyword coverage (tools explicitly mentioned in the brief vs actual approved claims)
     uncovered_keywords = _find_uncovered_keywords(brief_keywords, approved_claims)
     keyword_coverage_note = _format_keyword_coverage(brief_keywords, uncovered_keywords)
+
+    # Final sanity check: detect truncated phase2/3 output and display a CRITICAL banner at the top of the report
+    critical_banner = _build_critical_banner(
+        workspace=workspace,
+        fixed_body=fixed_body,
+        section_files=section_files,
+        statements=statements,
+        approved_claims=approved_claims,
+        brief_keywords=brief_keywords,
+        uncovered_keywords=uncovered_keywords,
+    )
 
     # Read clarifications if any
     clarify_section = ""
     clarify_md = read_workspace_file(workspace, "clarifications.md")
     if clarify_md:
-        clarify_section = f"""## 研究需求澄清記錄
+        clarify_section = f"""## Research Requirement Clarification Log
 
 {clarify_md}
 
@@ -112,58 +124,58 @@ async def phase3_report(state: ResearchState) -> dict:
 
 """
 
-    final_report = f"""# 研究報告：{state.get('topic', '未命名研究')}
+    final_report = f"""# Research Report: {state.get('topic', 'Unnamed Research')}
 
-**研究日期：** {_today()}
-**研究深度：** {state.get('depth', 'deep')}
-**搜尋統計：** {state.get('iteration_count', 0)} 輪，搜尋 {state.get('search_count', 0)}/{state.get('search_budget', 150)} 次
-**Claim 統計：** {len(approved_claims)} approved / {len(rejected_claims)} rejected / {len(claim_objects)} total
-**溯源鏈完整率：** {len(statements)} 個 statements，{len(chain_breaks)} 個鏈斷裂
+**Research Date:** {_today()}
+**Research Depth:** {state.get('depth', 'deep')}
+**Search Statistics:** {state.get('iteration_count', 0)} rounds, search {state.get('search_count', 0)}/{state.get('search_budget', 150)} times
+**Claim Statistics:** {len(approved_claims)} approved / {len(rejected_claims)} rejected / {len(claim_objects)} total
+**Citation Chain Completeness:** {len(statements)} statements, {len(chain_breaks)} chain breaks
 
----
+{critical_banner}---
 
-{clarify_section}## 摘要
+{clarify_section}## Summary
 
 {summary}
 
 ---
 
-## 詳細分析
+## Detailed Analysis
 
 {fixed_body}
 
 ---
 
-## 引用來源總表
+## Source Reference Table
 
 {_format_source_table(source_objects)}
 
-## 覆蓋率完整性報告
+## Coverage Integrity Report
 
-### 子問題覆蓋率
+### Subquestion Coverage
 
 {sq_coverage_note}
 
-### 任務書明確提及工具／主題的覆蓋率
+### Coverage of Tools / Topics Explicitly Mentioned in the Research Brief
 
 {keyword_coverage_note}
 
-## 未解答問題與知識缺口
+## Unanswered Questions and Knowledge Gaps
 
 {gap_log}
 
-## 研究方法論
+## Research Methodology
 
-本研究採用 LangGraph workflow + agent 交織架構：
-- Phase 0：研究規劃 + 多輪澄清（workflow node + LLM Judge 評估）
-- Phase 1a：多引擎平行搜尋（agent node with direct API tools）
-- Phase 1b：Grounding 驗證 + 攻擊式核查（subgraph: workflow + sub-agent）
-- Phase 2：矛盾裁決 + 整合（workflow node）
-- Phase 3：Statement-level 審計 + 報告生成（workflow node + sub-agent）
+This research uses a LangGraph workflow + agent interleaved architecture:
+- Phase 0: Research planning + multi-round clarification (workflow node + LLM Judge evaluation)
+- Phase 1a: Multi-engine parallel search (agent node with direct API tools)
+- Phase 1b: Grounding validation + adversarial verification (subgraph: workflow + sub-agent)
+- Phase 2: Conflict arbitration + integration (workflow node)
+- Phase 3: Statement-level audit + report generation (workflow node + sub-agent)
 
-所有事實 claim 均經過 Bedrock Grounding Check 驗證。
-所有數字均標記為 ORIGINAL / NORMALIZED / DERIVED。
-溯源鏈：報告句 → claim_id → quote_id → source_id。
+All factual claims are verified by the Bedrock Grounding Check.
+All numbers are tagged ORIGINAL / NORMALIZED / DERIVED.
+Citation chain: report sentence -> claim_id -> quote_id -> source_id.
 """
 
     write_workspace_file(workspace, "final-report.md", final_report)
@@ -171,9 +183,9 @@ async def phase3_report(state: ResearchState) -> dict:
     return {
         "final_report": final_report,
         "execution_log": [
-            f"Phase 3 完成：{len(statements)} statements 審計，"
-            f"{len(chain_breaks)} 鏈斷裂，"
-            f"final-report.md 已寫入"
+            f"Phase 3 complete: {len(statements)} statements audited, "
+            f"{len(chain_breaks)} chain breaks, "
+            f"final-report.md written"
         ],
     }
 
@@ -188,29 +200,30 @@ def _today() -> str:
 
 
 async def _extract_brief_keywords(brief_text: str) -> list[str]:
-    """LLM 從 research-brief.md 中抽取明確提及的工具/產品/技術名稱。
+    """LLM extracts explicitly mentioned tool / product / technology names from research-brief.md.
 
-    只抽取用戶有明確提及的專有名詞（工具名、產品名、服務名），
-    不抽取一般性描述詞（「語音識別」「高準確度」等）。
+    Extracts only proper nouns explicitly mentioned by the user (tool names, product names,
+    service names); does not extract generic descriptors such as "speech recognition" or
+    "high accuracy".
 
-    失敗時 conservative fallback：回傳空 list（不影響報告生成）。
+    Conservative fallback on failure: return an empty list (does not affect report generation).
     """
     if not brief_text or len(brief_text.strip()) < 50:
         return []
 
-    # 截斷避免 context 過大（brief 一般 < 3K chars，只取前 4000）
+    # Truncate to avoid oversized context (a brief is usually < 3K chars; keep the first 4000)
     snippet = brief_text[:4000]
 
-    prompt = f"""從以下研究任務書中，找出所有用戶明確提及的工具名稱、產品名稱、服務名稱或技術名稱。
+    prompt = f"""From the research brief below, find every tool name, product name, service name, or technology name explicitly mentioned by the user.
 
-只抽取：工具名稱（如 Otter.ai）、產品名稱（如 MacWhisper）、服務名稱（如 Google 文件）、
-        特定 OS/版本（如 iOS 26）、硬體裝置名（如 Plaud Note）。
-不要抽取：一般描述詞（「語音識別」「準確度」「說話者分離」）、非工具的概念詞。
+Extract only: tool names (e.g. Otter.ai), product names (e.g. MacWhisper), service names (e.g. Google Docs),
+        specific OS/versions (e.g. iOS 26), hardware device names (e.g. Plaud Note).
+Do not extract: generic descriptors ("speech recognition", "accuracy", "speaker diarization") or non-tool conceptual terms.
 
-任務書：
+Research brief:
 {snippet}
 
-只輸出 JSON，格式：{{"keywords": ["工具A", "工具B", ...]}}"""
+Output JSON only, in the format: {{"keywords": ["ToolA", "ToolB", ...]}}"""
 
     try:
         response = await safe_ainvoke_chain(
@@ -264,28 +277,108 @@ def _format_keyword_coverage(
 ) -> str:
     """Format keyword coverage as a Markdown section."""
     if not brief_keywords:
-        return "（任務書中未偵測到明確的工具/產品名稱提及，無需交叉核對）"
+        return "(No explicit tool/product names detected in the research brief; no cross-check needed.)"
 
     covered = [k for k in brief_keywords if k not in uncovered]
-    lines = ["| 工具／主題 | 狀態 |", "|-----------|------|"]
+    lines = ["| Tool / Topic | Status |", "|-----------|------|"]
     for kw in brief_keywords:
         if kw in uncovered:
-            lines.append(f"| {kw} | ❌ **未找到 approved claim** |")
+            lines.append(f"| {kw} | **No approved claim found** |")
         else:
-            lines.append(f"| {kw} | ✅ 已涵蓋 |")
+            lines.append(f"| {kw} | Covered |")
 
     table = "\n".join(lines)
 
     if uncovered:
-        missing = "、".join(uncovered)
+        missing = ", ".join(uncovered)
         warning = (
-            f"\n\n> ⚠️ **注意：以下主題未找到有效來源：{missing}**\n"
-            f"> 這些工具或主題在研究任務書中明確提及，但沒有任何 approved claim 涉及它們。\n"
-            f"> 可能原因：搜尋未命中、相關頁面 UNREACHABLE、或 grounding 分數不足被過濾。"
+            f"\n\n> **Notice: no valid sources found for the following topics: {missing}**\n"
+            f"> These tools or topics are explicitly mentioned in the research brief, but no approved claim covers them.\n"
+            f"> Possible causes: the search did not hit, relevant pages were UNREACHABLE, or the grounding score was too low and they were filtered out."
         )
         return table + warning
     else:
-        return table + "\n\n所有任務書明確提及的工具／主題均有 approved claim 涵蓋。"
+        return table + "\n\nEvery tool / topic explicitly mentioned in the research brief is covered by at least one approved claim."
+
+
+_DETAILED_ANALYSIS_MIN_CHARS = 500
+
+
+def _build_critical_banner(
+    *,
+    workspace: str,
+    fixed_body: str,
+    section_files: list[str],
+    statements: list[dict],
+    approved_claims: list[Claim],
+    brief_keywords: list[str],
+    uncovered_keywords: list[str],
+) -> str:
+    """Detect truncated phase2/3 output and return a CRITICAL banner Markdown block.
+
+    Returns empty string when the report looks healthy. When any critical
+    condition fires, returns a top-of-report warning that makes the skeleton
+    report unusable-at-a-glance (the caller would otherwise ship a report
+    whose "Detailed Analysis" section is silently empty — see failed workspace
+    2026-04-14 where phase2 produced 0 sections but phase3 still wrote a
+    final-report.md claiming coverage).
+    """
+    issues: list[str] = []
+
+    # 1. Detailed-analysis body empty / tiny
+    body_chars = len((fixed_body or "").strip())
+    if approved_claims and body_chars < _DETAILED_ANALYSIS_MIN_CHARS:
+        issues.append(
+            f'"Detailed Analysis" section only has {body_chars} chars (< {_DETAILED_ANALYSIS_MIN_CHARS}), '
+            f"but there are {len(approved_claims)} approved claims; integration clearly failed."
+        )
+
+    # 2. report-sections/ empty but there are approved claims (a direct signal that phase2 truncated)
+    if approved_claims and not section_files:
+        issues.append(
+            f"report-sections/ is empty, but there are {len(approved_claims)} approved claims. "
+            f"Phase 2 did not write any section to disk."
+        )
+
+    # 3. Statement ledger empty (phase3 statistics/audit chain broken)
+    if approved_claims and not statements:
+        issues.append(
+            "statement-ledger is empty. phase3 was unable to extract any statement from report-sections."
+        )
+
+    # 4. None of the tools/products explicitly named in the brief entered any claim
+    if brief_keywords and uncovered_keywords and len(uncovered_keywords) == len(brief_keywords):
+        issues.append(
+            f"None of the {len(brief_keywords)} tools / topics explicitly mentioned in the research brief "
+            f"({', '.join(brief_keywords[:5])}"
+            f"{'...' if len(brief_keywords) > 5 else ''}) "
+            f"are covered by an approved claim. This research provides essentially zero help toward the original question."
+        )
+
+    if not issues:
+        return ""
+
+    # Persist to gap-log so downstream audit / post-mortem tools can pick it up
+    try:
+        import datetime as _dt
+        ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        note = (
+            f"\n\n## CRITICAL — Phase 3 sanity check failed ({ts})\n"
+            + "\n".join(f"- {i}" for i in issues)
+            + "\n"
+        )
+        from deep_research.tools.workspace import append_workspace_file as _append
+        _append(workspace, "gap-log.md", note)
+    except Exception:
+        logger.exception("failed to append CRITICAL banner to gap-log.md")
+
+    bullet = "\n".join(f"- {i}" for i in issues)
+    return (
+        "\n> **CRITICAL — report integrity check failed**\n"
+        "> Before the final assembly, this report was found to have the following structural defects; **do not quote it directly**:\n"
+        + "\n".join(f"> {line}" for line in bullet.splitlines())
+        + "\n> See gap-log.md and execution-log.md to trace the root cause.\n\n"
+    )
 
 
 def _compute_coverage_note(plan: str, approved_claims: list[Claim]) -> str:
@@ -307,9 +400,9 @@ def _compute_coverage_note(plan: str, approved_claims: list[Claim]) -> str:
             planned_ids.append(qid)
 
     if not planned_ids:
-        return "（無計畫子問題資訊可供對照）"
+        return "(No planned subquestion information available for cross-check.)"
 
-    # Determine which SQs have ≥1 approved claim
+    # Determine which SQs have >=1 approved claim
     covered: set[str] = set()
     sq_claim_counts: dict[str, int] = {}
     for c in approved_claims:
@@ -319,27 +412,27 @@ def _compute_coverage_note(plan: str, approved_claims: list[Claim]) -> str:
             sq_claim_counts[sq] = sq_claim_counts.get(sq, 0) + 1
 
     uncovered = [sq for sq in planned_ids if sq not in covered]
-    lines = ["| 子問題 | 狀態 | Approved Claims 數 |",
+    lines = ["| Subquestion | Status | Approved Claims |",
              "|--------|------|-------------------|"]
     for sq in planned_ids:
         count = sq_claim_counts.get(sq, 0)
         if sq in covered:
-            status = "✅ 已涵蓋"
+            status = "Covered"
         else:
-            status = "❌ **無 approved claims**"
+            status = "**No approved claims**"
         lines.append(f"| {sq} | {status} | {count} |")
 
     table = "\n".join(lines)
 
     if uncovered:
         warning = (
-            f"\n\n> ⚠️ **覆蓋率警告**：以下子問題沒有 approved claims，"
-            f"對應段落可能缺乏實質證據：**{', '.join(uncovered)}**\n"
-            f"> 請參閱「未解答問題與知識缺口」了解原因。"
+            f"\n\n> **Coverage warning**: the following subquestions have no approved claims, "
+            f"so their sections may lack substantive evidence: **{', '.join(uncovered)}**\n"
+            f"> See 'Unanswered Questions and Knowledge Gaps' for reasons."
         )
         return table + warning
     else:
-        return table + "\n\n所有計畫子問題均有 approved claims 涵蓋。"
+        return table + "\n\nEvery planned subquestion is covered by at least one approved claim."
 
 
 def _ensure_claim_objects(claims) -> list[Claim]:
@@ -362,58 +455,58 @@ def _ensure_source_objects(sources) -> list[Source]:
     return result
 
 
-_LEDGER_SYSTEM = """將報告內容切分為 statement 級別。每句事實、數字、推論各佔一行。
+_LEDGER_SYSTEM = """Split the report content into statement-level entries. Every factual, numeric, or inference sentence occupies its own line.
 
-## 鐵律
-- 完整審閱整個 section，不可跳句、不可合併
-- 每個事實句、每個數字句、每個推論句都要獨立列出
-- statement_id 從本批分配的 ID 範圍中取（避免衝突）
+## Hard Rules
+- Review the entire section in full; no sentence may be skipped or merged
+- Every factual sentence, every numeric sentence, every inference sentence must be listed independently
+- statement_id must be drawn from the ID range allocated for this batch (to avoid collisions)
 
-## 四種 type 分類（必須正確分類，直接影響溯源鏈驗證）
+## Four type categories (correct classification is required; this directly affects citation chain validation)
 
-### 必須歸類為 "opinion"（claim_ids 可為空 []）
-以下句子不需要 claim_id，必須標記 type="opinion"：
-- **段落標題 / 子標題**（如「## 主流工具比較」、「**結論**」）
-- **引導句 / 轉折句**（如「本段落分析了...」、「綜合以上分析...」、「值得注意的是」）
-- **摘要/總結句**（跨多個 claim 的綜述，無法對應單一來源）
-- **信心等級標記行**（如「🟢 HIGH 信心」、「**信心等級：MEDIUM**」）
-- **免責聲明/警告行**（如「⚠️ 資料不足警告...」）
-- **研究方法說明**（不是事實斷言，而是解釋報告如何生成的）
-- **任何報告中不含 claim_id 標記（如 Q1-C2）的評估性語句**
+### Must be classified as "opinion" (claim_ids may be empty [])
+The following sentences do not need a claim_id and must be marked type="opinion":
+- **Section headings / subheadings** (e.g. "## Mainstream Tool Comparison", "**Conclusion**")
+- **Lead-in / transitional sentences** (e.g. "This section analyzes...", "Summarizing the above...", "It is worth noting")
+- **Summary / concluding sentences** (overviews that span multiple claims and cannot map to a single source)
+- **Confidence-level marker lines** (e.g. "HIGH confidence", "**Confidence level: MEDIUM**")
+- **Disclaimer / warning lines** (e.g. "Insufficient data warning...")
+- **Methodology explanations** (not factual assertions but explanations of how the report was produced)
+- **Any evaluative statement in the report that has no claim_id marker (e.g. Q1-C2)**
 
-### "fact"（必須有 claim_ids）
-具體、可驗證的事實陳述，報告中通常有 [Q1-C2] 或 (Q1-C2) 格式的 claim 標記。
+### "fact" (claim_ids required)
+Concrete, verifiable factual statements; the report usually contains claim markers in the form [Q1-C2] or (Q1-C2).
 
-### "numeric"（必須有 claim_ids）
-包含具體數字的陳述（價格、百分比、版本號、評分等）。
+### "numeric" (claim_ids required)
+Statements containing specific numbers (price, percentage, version number, rating, etc.).
 
-### "inference"（必須有 claim_ids）
-從多個 fact 推導出的結論，報告中通常標有 [INFERENCE]。
+### "inference" (claim_ids required)
+Conclusions derived from multiple facts; the report usually marks them with [INFERENCE].
 
-## 判斷順序
-1. 句子有 [Q1-C1] 或 (Q1-C1) 這樣的 claim_id 標記 → fact 或 numeric（claim_ids 填入標記中的 ID）
-2. 句子有 [INFERENCE] 標記 → inference（claim_ids 填入句中所有 [Qn-Cm] ID）
-3. 句子是標題、引導、過渡、摘要、評估 → opinion（claim_ids=[]）
-4. 不確定 → 優先歸 opinion，避免製造假斷鏈
+## Decision order
+1. If the sentence contains a claim_id marker like [Q1-C1] or (Q1-C1) -> fact or numeric (fill claim_ids with the marked IDs)
+2. If the sentence contains [INFERENCE] -> inference (fill claim_ids with every [Qn-Cm] ID in the sentence)
+3. If the sentence is a heading, lead-in, transition, summary, or evaluation -> opinion (claim_ids=[])
+4. When uncertain -> prefer opinion to avoid creating false broken chains
 
-## start_char / end_char 欄位（重要）
-對每個 statement，額外輸出 start_char 與 end_char，
-代表該句在上面「報告內容」中的字元起訖 index（0-based，Python 字串切片語意）。
-驗證方式：content[start_char:end_char] 會等於 text。
+## start_char / end_char fields (important)
+For each statement, additionally output start_char and end_char,
+representing the character start/end indices of the sentence in the "report content" above (0-based, Python slicing semantics).
+Validation rule: content[start_char:end_char] must equal text.
 
-估不準不會被懲罰 — 程式會用 text 去回找真位置做 fallback。
-但 text 欄位必須仍是報告原文的逐字摘錄，否則整筆會被 reject。
+Inaccurate estimates are not penalized — the program will fall back by searching for text to find the real position.
+But the text field must still be a verbatim excerpt from the original report; otherwise the whole entry will be rejected.
 
-## 輸出（嚴格 JSON array）
+## Output (strict JSON array)
 ```json
-[{"statement_id": "ST-1", "section": "Q1-正方", "text": "報告原句",
+[{"statement_id": "ST-1", "section": "Q1-positive", "text": "original sentence from the report",
   "start_char": 123, "end_char": 145,
   "claim_ids": ["Q1-C1"], "type": "fact|numeric|inference|opinion"}]
 ```
 
-opinion 類型的 claim_ids 必須為空陣列 []，不要捏造 claim_id。
+For opinion entries, claim_ids must be an empty array []; do not fabricate claim_ids.
 
-只輸出 JSON，不要其他文字。"""
+Output JSON only, no other text."""
 
 
 async def _build_statement_ledger(
@@ -422,31 +515,35 @@ async def _build_statement_ledger(
 ) -> list[dict]:
     """Split report into statement-level entries — per-section to avoid LiM.
 
-    舊版把整份 body（20-50K tokens）一次塞給 LLM，中段 statement 因 Lost in the
-    Middle 容易被漏切，威脅鐵律 4「溯源鏈完整」。新版每個 section 獨立 LLM call，
-    每次只看一段，輸出統一 ID 範圍後合併。
+    The previous version fed the entire body (20-50K tokens) to the LLM at once;
+    mid-body statements were frequently dropped because of Lost in the Middle,
+    threatening hard rule 4 "citation chain completeness". The new version makes
+    an independent LLM call per section, so each call sees only one section,
+    and results are merged after being output within a unified ID range.
 
-    claim_id 雜訊優化：每個 section 只傳「本子問題相關的 claim_id」而非全部 approved
-    claims — 當 approved claims > 30 時，全列清單會淹沒 LLM attention，LLM 更容易把
-    不相關的 claim_id 硬湊進 statement，破壞溯源鏈準確度。
+    claim_id noise optimization: each section is given only "the claim_ids
+    related to this subquestion" rather than the entire approved claim list.
+    When approved claims > 30, the full list overwhelms LLM attention, making
+    it more likely to force unrelated claim_ids into a statement and break
+    citation chain accuracy.
     """
     if not sections:
         return []
 
-    # 按 subquestion 分組 approved claim_ids。
-    # 支援兩種 subquestion 格式：
-    #   - 新格式（v11+）: "Q1", "Q2" → key = "q1", "q2"
-    #   - 舊格式（v10-）: "子問題 1: 主流工具盤點" → key = "q1"（提取數字）AND 全文 key
-    # 雙 key 存儲確保 section_name → claim_ids 映射不斷鏈。
+    # Group approved claim_ids by subquestion.
+    # Supports two subquestion formats:
+    #   - New format (v11+): "Q1", "Q2" -> key = "q1", "q2"
+    #   - Old format (v10-): "Subquestion 1: Mainstream tool inventory" -> key = "q1" (extracted number) AND full-text key
+    # Dual-key storage ensures the section_name -> claim_ids mapping does not break.
     import re as _re
     claims_by_subq: dict[str, list[str]] = {}
     for c in claims:
         if c.status != "approved":
             continue
         subq = c.subquestion or ""
-        # Key 1: 全文 lowercase
+        # Key 1: full-text lowercase
         claims_by_subq.setdefault(subq.lower(), []).append(c.claim_id)
-        # Key 2: 提取 Q{n} prefix（如 "Q1" 或從 "子問題 1" 提取 "q1"）
+        # Key 2: extract Q{n} prefix (e.g. "Q1" or extract "q1" from "Subquestion 1")
         sq_m = _re.match(r"Q(\d+)", subq, _re.IGNORECASE)
         if sq_m:
             short_key = f"q{sq_m.group(1)}"
@@ -458,15 +555,15 @@ async def _build_statement_ledger(
                 [c.claim_id] if c.claim_id not in claims_by_subq.get(short_key, []) else []
             )
 
-    # 每個 section 並發呼叫，分配獨立的 ID 起點避免衝突
+    # Call each section concurrently; assign independent ID starting points to avoid collisions
     import asyncio as _asyncio
     tasks = []
     id_offset = 1
     for section_name, content in sections:
-        # 從 section_name 抽子問題代號：
-        # - "q1_section" → "q1"
-        # - "子問題 1: 主流工具盤點_section" → "q1"（提取數字）
-        # - 先試 Q{n} 格式，再試數字提取
+        # Extract the subquestion identifier from section_name:
+        # - "q1_section" -> "q1"
+        # - "subquestion 1: mainstream tool inventory_section" -> "q1" (extracted number)
+        # - Try the Q{n} format first, then number extraction
         subq_match = _re.match(r"([qQ]\d+)", section_name)
         if subq_match:
             subq_key = subq_match.group(1).lower()
@@ -477,10 +574,10 @@ async def _build_statement_ledger(
         claim_id_str = (
             ", ".join(relevant_ids)
             if relevant_ids
-            else "（本 section 無相關 approved claim）"
+            else "(No relevant approved claim for this section)"
         )
         section_id_start = id_offset
-        id_offset += 200  # 每 section 保留 200 ID 空間
+        id_offset += 200  # Reserve 200 IDs per section
         tasks.append(_split_one_section(section_name, content, claim_id_str, section_id_start))
     results = await _asyncio.gather(*tasks, return_exceptions=True)
 
@@ -498,19 +595,19 @@ async def _split_one_section(
     claim_id_str: str,
     id_start: int,
 ) -> list[dict]:
-    """單一 section 切 statement，使用獨立 ID 範圍。"""
-    # role="verifier" — statement 切分是結構化抽取，Gemini 主導
+    """Split statements for a single section using an independent ID range."""
+    # role="verifier" — statement splitting is structured extraction, Gemini-led
     response = await safe_ainvoke_chain(
         role="verifier",
         messages=[
             SystemMessage(content=_LEDGER_SYSTEM),
             HumanMessage(content=f"""## Section: {section_name}
-（statement_id 從 ST-{id_start} 開始編號）
+(statement_id numbering starts at ST-{id_start})
 
-## 報告內容
+## Report Content
 {content}
 
-## 可用 claim_ids
+## Available claim_ids
 {claim_id_str}"""),
         ],
         max_tokens=8192,
@@ -526,27 +623,27 @@ async def _split_one_section(
     except json.JSONDecodeError:
         return []
 
-    # Index 驗證：statement.text 必須真實存在於 section content。
-    # 通過後：text 覆寫為 content[start:end]（杜絕 LLM 抄字幻覺），附上 start/end span。
+    # Index validation: statement.text must actually exist within the section content.
+    # After passing: text is overwritten with content[start:end] (to eliminate LLM transcription hallucinations), with start/end span attached.
     verified = verify_indexed_items(
         content, data, "text", log_prefix=f"phase3/ledger/{section_name}"
     )
 
-    # 強制覆寫 section 欄位，並校正 ID 不出範圍
-    # Python fallback：從 statement.text 內的 inline 標記補填 claim_ids
-    # 支援 [Q1-C1] 和 (Q1-C1) 兩種格式
+    # Force-overwrite the section field and correct IDs that are out of range.
+    # Python fallback: fill in claim_ids from inline markers inside statement.text
+    # Supports both [Q1-C1] and (Q1-C1) formats.
     _claim_id_re = re.compile(r'Q\d+-C\d+')
     out = []
     for i, st in enumerate(verified):
         st["section"] = section_name
         if not st.get("statement_id", "").startswith("ST-"):
             st["statement_id"] = f"ST-{id_start + i}"
-        # 清掉 LLM 原始 hint（保留 start/end 最終真值即可）
+        # Remove the LLM's original hints (only the final true start/end values need to be kept)
         st.pop("start_char", None)
         st.pop("end_char", None)
 
-        # 若 LLM 沒有填 claim_ids（空陣列），嘗試從 text 內 inline 標記中提取
-        # 支援兩種格式：(Q1-C1) 或 [Q1-C1]（Phase 2 舊格式用方括號）
+        # If the LLM did not fill claim_ids (empty array), try to extract them from inline markers in text.
+        # Supports both formats: (Q1-C1) or [Q1-C1] (Phase 2 legacy format uses square brackets)
         if not st.get("claim_ids") and st.get("type") != "opinion":
             text = st.get("text", "")
             extracted = _claim_id_re.findall(text)
@@ -558,15 +655,16 @@ async def _split_one_section(
 
 
 def _format_statement_ledger(statements: list[dict]) -> str:
-    """渲染 statement-ledger.md。
+    """Render statement-ledger.md.
 
-    span 欄位格式：`@[start:end]`。若缺 span（不該發生，因為 verify_indexed_items
-    會過濾掉無法定位者），顯示為空字串以保持表格結構。
+    span field format: `@[start:end]`. If the span is missing (should not happen
+    because verify_indexed_items filters out anything that cannot be located),
+    render it as an empty string to preserve the table structure.
     """
     header = (
         "# Statement Ledger\n\n"
-        "<!-- span 欄位 @[s:e] 對應 report-sections/{section}.md 的字元 index，"
-        "可用 section_content[s:e] 切片還原原句。 -->\n\n"
+        "<!-- The span field @[s:e] refers to the character index in report-sections/{section}.md; "
+        "use section_content[s:e] to restore the original sentence. -->\n\n"
         "| statement_id | section | span | text | claim_ids | type | verified |\n"
         "|-------------|---------|------|------|-----------|------|----------|\n"
     )
@@ -584,25 +682,25 @@ def _format_statement_ledger(statements: list[dict]) -> str:
     return header + "\n".join(rows) + "\n"
 
 
-AUDIT_SYSTEM = """你是最終品質攻擊員。核對每個 statement 的溯源鏈完整性。
+AUDIT_SYSTEM = """You are the final-quality adversary. Verify the citation chain completeness of each statement.
 
-## 核對規則
+## Verification Rules
 
-1. 溯源鏈：statement → claim_id → quote_id → source
-2. 數字逐字核對
-3. 語氣一致性
-4. 組合型幻覺檢測
-5. 過度推論檢測
+1. Citation chain: statement -> claim_id -> quote_id -> source
+2. Verbatim numeric verification
+3. Tone consistency
+4. Composite hallucination detection
+5. Over-inference detection
 
-## Iterative 模式說明
+## Iterative mode notes
 
-你可能會收到多輪來源文件。每輪你要：
-1. 審閱本輪來源原文，核對每個 statement 的溯源鏈
-2. 累積發現的 issues（不要因為本輪沒找到問題就刪除之前發現的）
-3. 如果本輪找到支持證據，可以將之前的 issue 標記為 NONE
-4. 輸出完整的最新審計結果（包含所有 statements 的最新狀態）
+You may receive source documents in multiple rounds. Each round you must:
+1. Review this round's source originals and verify the citation chain of each statement
+2. Accumulate issues found (do not drop previously found issues just because this round did not find any)
+3. If this round finds supporting evidence, you may mark a previous issue as NONE
+4. Output the complete latest audit result (covering the latest status of every statement)
 
-## 輸出格式（嚴格 JSON array，包含所有 statements 的最新狀態）
+## Output format (strict JSON array, covering the latest status of every statement)
 
 ```json
 [{"statement_id": "ST-1", "issue": "NONE|BROKEN_CHAIN|NUMBER_MISMATCH|TONE_MISMATCH|COMPOSITE_HALLUCINATION|OVER_INFERENCE|NO_SOURCE", "detail": "...", "fix": "..."}]
@@ -614,23 +712,27 @@ async def _run_final_audit(
     statements: list[dict],
     claims: list[Claim],
 ) -> list[StatementCheck]:
-    """Run final sub-agent audit on statements vs claims — per-section 並發。
+    """Run final sub-agent audit on statements vs claims — concurrent per section.
 
-    場景：最終品質審計 — statement 級別的溯源鏈完整性核對。
+    Scenario: final-quality audit — verifying the completeness of statement-level citation chains.
 
-    舊版一次把所有 statements（50-100+ 條）+ 所有 claims 當 extra_context 送審，屬
-    典型「一次做太多」anti-pattern：LLM 要同時核對多個 section 的 statement，中段
-    容易失焦、iterative_refine 每輪都重傳臃腫的 extra_context，實際消耗 =
-    extra × 輪數。新版按 section 分組，每 section 獨立 `iterative_refine` 並發，
-    每次只看自己 section 的 statements + 本子問題相關 claims，最後程式合併審計結果。
+    The previous version submitted all statements (50-100+) plus all claims as a single
+    extra_context, a classic "doing too much at once" anti-pattern: the LLM had to verify
+    statements across multiple sections simultaneously, easily losing focus in the middle,
+    and iterative_refine re-sent the bloated extra_context every round, so actual
+    consumption = extra * rounds. The new version groups by section and runs
+    `iterative_refine` concurrently per section, so each call sees only its own
+    statements + the claims relevant to that subquestion, and the program merges
+    audit results at the end.
 
-    注意：sources 仍是所有 sections 共用（同一 statement 可能引用跨 section source），
-    這部分無法再縮，只能靠 iterative_refine 分批處理。
+    Note: sources are still shared across all sections (the same statement may quote a
+    cross-section source); that part cannot be shrunk further and must be handled by
+    iterative_refine batching.
     """
     import asyncio as _asyncio
     import re as _re
 
-    # ── Step 1: 按 section 分組 statements（跳過 opinion）
+    # Step 1: group statements by section (skip opinion)
     by_section: dict[str, list[dict]] = {}
     for st in statements:
         if st.get("type") == "opinion":
@@ -641,12 +743,12 @@ async def _run_final_audit(
     if not by_section:
         return []
 
-    # ── Step 2: 按 subquestion 分組 claims（key 用 lower case Q1/Q2/...）
+    # Step 2: group claims by subquestion (key is lower-case Q1/Q2/...)
     claims_by_subq: dict[str, list[Claim]] = {}
     for c in claims:
         claims_by_subq.setdefault(c.subquestion.lower(), []).append(c)
 
-    # ── Step 3: 收集所有 source 文件（所有 section 共用）
+    # Step 3: collect all source documents (shared across all sections)
     source_texts: list[str] = []
     source_files = list_workspace_files(workspace, "search-results")
     for sf in source_files:
@@ -656,7 +758,7 @@ async def _run_final_audit(
 
     full_research_topic = read_workspace_file(workspace, "research-brief.md") or ""
 
-    # ── Step 4: 每 section 獨立審計 task
+    # Step 4: an independent audit task per section
     async def _audit_one_section(
         section_name: str,
         section_statements: list[dict],
@@ -668,7 +770,7 @@ async def _run_final_audit(
         claim_text = "\n".join(
             f"- {c.claim_id} ({c.status}): {c.claim_text[:100]}"
             for c in section_claims
-        ) or "（本 section 無相關 claim）"
+        ) or "(No relevant claim for this section)"
         statement_text = "\n".join(
             f"- {st.get('statement_id')}: [{st.get('type')}] {st.get('text', '')[:100]}"
             for st in section_statements
@@ -676,10 +778,10 @@ async def _run_final_audit(
 
         extra_context = f"""## Section: {section_name}
 
-## 本 section 的 Statements（請逐條審計）
+## Statements in this section (audit every one)
 {statement_text}
 
-## 相關 Claim Ledger（子問題 {subq_key.upper() or '?'}）
+## Related Claim Ledger (subquestion {subq_key.upper() or '?'})
 {claim_text}"""
 
         result_text = await iterative_refine(
@@ -687,7 +789,7 @@ async def _run_final_audit(
             full_research_topic=full_research_topic,
             system_prompt=AUDIT_SYSTEM,
             extra_context=extra_context,
-            role="verifier",  # 報告審計 = verifier 任務（Gemini 主導，Vectara HHEM 幻覺率最低）
+            role="verifier",  # Report audit = verifier task (Gemini-led; Vectara HHEM reports the lowest hallucination rate)
         )
 
         json_match = _re.search(r"\[[\s\S]*\]", result_text)
@@ -727,19 +829,19 @@ async def _generate_summary(claims: list[Claim], plan: str) -> str:
     """Generate summary from approved claims only (iron rule)."""
     approved = [c for c in claims if c.status == "approved"]
     if not approved:
-        return "（無 approved claims，無法生成摘要）"
+        return "(No approved claims; cannot generate a summary.)"
 
     claims_text = "\n".join(
         f"- {c.claim_id}: {c.claim_text}" for c in approved
     )
 
-    # role="writer" — 摘要寫作，Claude Opus 主導
+    # role="writer" — summary writing, Claude Opus-led
     response = await safe_ainvoke_chain(
         role="writer",
         messages=[
-            SystemMessage(content="""根據以下 approved claims 生成 1-3 段摘要。
-鐵律：每句摘要必須對應 claim_id。禁止引用 claims 以外的資訊。
-語言：繁體中文。"""),
+            SystemMessage(content="""Generate a 1-3 paragraph summary from the approved claims below.
+Hard rule: every sentence in the summary must map to a claim_id. Quoting information outside the claims is forbidden.
+Language: English."""),
             HumanMessage(content=f"## Approved Claims\n{claims_text}"),
         ],
         max_tokens=2048,
@@ -751,10 +853,10 @@ async def _generate_summary(claims: list[Claim], plan: str) -> str:
 
 def _format_source_table(sources: list[Source]) -> str:
     header = (
-        "| # | 來源 | 層級 | URL 狀態 |\n"
+        "| # | Source | Tier | URL Status |\n"
         "|---|------|------|----------|\n"
     )
     rows = []
     for s in sources:
         rows.append(f"| {s.source_id} | [{s.title}]({s.url}) | {s.tier} | {s.url_status} |")
-    return header + "\n".join(rows) + "\n" if rows else "(無來源)\n"
+    return header + "\n".join(rows) + "\n" if rows else "(No sources)\n"

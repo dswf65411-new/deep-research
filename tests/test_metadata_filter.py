@@ -13,7 +13,7 @@ from deep_research.state import Claim
 
 
 # ---------------------------------------------------------------------------
-# _is_metadata_claim — should detect off-topic metadata
+# _is_metadata_claim - should detect off-topic metadata
 # ---------------------------------------------------------------------------
 
 class TestIsMetadataClaim:
@@ -29,7 +29,7 @@ class TestIsMetadataClaim:
         assert _is_metadata_claim("Our office is at 99 Broadmoor Road, Boston")
 
     def test_us_zip_code(self):
-        assert _is_metadata_claim("San Francisco, CA 94105 — visit us anytime")
+        assert _is_metadata_claim("San Francisco, CA 94105 - visit us anytime")
 
     # --- Address context keywords ---
 
@@ -62,46 +62,46 @@ class TestIsMetadataClaim:
         assert _is_metadata_claim("See our Privacy Policy for details on data handling")
 
     def test_copyright(self):
-        assert _is_metadata_claim("© 2025 Acme Corp. All rights reserved.")
+        assert _is_metadata_claim("(c) 2025 Acme Corp. All rights reserved.")
 
     def test_terms_of_service(self):
         assert _is_metadata_claim("By using this site you agree to our Terms of Service")
 
     # ---------------------------------------------------------------------------
-    # Legitimate claims — must NOT be filtered
+    # Legitimate claims - must NOT be filtered
     # ---------------------------------------------------------------------------
 
     def test_wer_performance_claim(self):
-        assert not _is_metadata_claim("Whisper Large v3 在中文語料上的 WER 為 8.3%")
+        assert not _is_metadata_claim("Whisper Large v3 WER on Chinese corpus is 8.3%")
 
     def test_model_comparison_claim(self):
-        assert not _is_metadata_claim("Breeze ASR 25 在台語辨識上優於 OpenAI Whisper")
+        assert not _is_metadata_claim("Breeze ASR 25 outperforms OpenAI Whisper on Taiwanese Hokkien recognition")
 
     def test_diarization_claim(self):
-        assert not _is_metadata_claim("pyannote-audio 3.1 支援最多 20 位說話者分離")
+        assert not _is_metadata_claim("pyannote-audio 3.1 supports diarization for up to 20 speakers")
 
     def test_platform_support_claim(self):
-        assert not _is_metadata_claim("macOS 14 以上版本才支援 Apple Intelligence 語音轉錄")
+        assert not _is_metadata_claim("macOS 14 or above is required to support Apple Intelligence speech transcription")
 
     def test_price_claim(self):
-        assert not _is_metadata_claim("MacWhisper Pro 的年訂閱價格為 USD 49.99")
+        assert not _is_metadata_claim("MacWhisper Pro annual subscription is USD 49.99")
 
     def test_founded_year_product_context(self):
-        # "founded" in a product-launch context is borderline — should NOT be filtered
+        # "founded" in a product-launch context is borderline - should NOT be filtered
         # (the filter targets *company meta* not product release dates)
         # This claim has no address pattern so it passes
-        assert not _is_metadata_claim("Whisper 於 2022 年由 OpenAI 開源發布")
+        assert not _is_metadata_claim("Whisper was open-sourced by OpenAI in 2022")
 
     def test_taiwan_tool_claim(self):
-        assert not _is_metadata_claim("雅婷轉錄器針對台灣繁體中文語境優化，支援粵語和閩南語辨識")
+        assert not _is_metadata_claim("Yating transcriber is optimized for Taiwanese Traditional Chinese context and supports Cantonese and Hokkien recognition")
 
     def test_privacy_feature_claim(self):
         # Privacy as a feature (not legal boilerplate)
-        assert not _is_metadata_claim("本機端處理模式可確保語音資料不上傳至雲端，隱私更安全")
+        assert not _is_metadata_claim("On-device processing mode keeps voice data off the cloud, providing stronger privacy")
 
 
 # ---------------------------------------------------------------------------
-# validate_claims_for_phase2 — metadata filter integrated into gate
+# validate_claims_for_phase2 - metadata filter integrated into gate
 # ---------------------------------------------------------------------------
 
 def _make_claim(claim_id: str, text: str, bedrock: float = 0.7) -> Claim:
@@ -121,17 +121,17 @@ def test_address_claim_rejected_by_phase2_gate():
 
 def test_legitimate_claim_passes_phase2_gate():
     """A topical claim must not be filtered by the metadata heuristic."""
-    good = _make_claim("Q1-C2", "Whisper Large v3 在中文語料上的 WER 為 8.3%")
+    good = _make_claim("Q1-C2", "Whisper Large v3 WER on Chinese corpus is 8.3%")
     result = validate_claims_for_phase2([good])
     assert len(result) == 1
 
 
 def test_mix_of_claims_filtered_correctly():
     """Only metadata claims are removed; topical claims pass through."""
-    topical = _make_claim("Q1-C1", "MacWhisper Pro 支援本機端 Whisper 模型，無需網路")
+    topical = _make_claim("Q1-C1", "MacWhisper Pro supports local Whisper models and requires no network")
     addr = _make_claim("Q1-C2", "MacWhisper Ltd., 55 Baker Street, London")
     boilerplate = _make_claim("Q1-C3", "Contact us today to start your free trial")
-    another_good = _make_claim("Q1-C4", "pyannote 3.1 speaker diarization 平均 DER 為 12%")
+    another_good = _make_claim("Q1-C4", "pyannote 3.1 speaker diarization average DER is 12%")
 
     result = validate_claims_for_phase2([topical, addr, boilerplate, another_good])
     ids = {c.claim_id for c in result}

@@ -1,160 +1,160 @@
-# Phase 2: 整合 + 矛盾裁決
+# Phase 2: Integration + Contradiction Adjudication
 
-**輸入：** 讀取 workspace 中的：
-- `workspace/claim-ledger.md`（**核心輸入：只用 status=approved 的 claims**）
+**Input:** read from the workspace:
+- `workspace/claim-ledger.md` (**core input: only use claims with status=approved**)
 - `workspace/source-registry.md`
-- `workspace/search-results/`（原文引用用）
-- `workspace/coverage.chk`（完整性檢查用）
-- `workspace/gap-log.md`（未解矛盾用）
+- `workspace/search-results/` (for original-text quotes)
+- `workspace/coverage.chk` (for completeness check)
+- `workspace/gap-log.md` (for unresolved contradictions)
 
-**輸出：** `workspace/report-sections/q{n}_section.md`
+**Output:** `workspace/report-sections/q{n}_section.md`
 
-**本 Phase 必讀：** `prompts/source-criteria.md`、`prompts/ref-citation-embedding.md`
-
----
-
-## 鐵律：只從 Approved Claims 生成
-
-**讀取 claim-ledger.md，只使用 `status=approved` 的 claims。rejected 和 pending 的 claims 禁止出現在報告中。**
-
-在開始整合前，先建立 **Approved Claims 清單**，整合時禁止引用此清單以外的任何事實或數字。
+**Required reading for this Phase:** `prompts/source-criteria.md`, `prompts/ref-citation-embedding.md`
 
 ---
 
-## Step 1: 匯入成果
+## Hard Rule: Generate Only from Approved Claims
 
-讀取 workspace 檔案。為每個子問題整理 approved claims：
-- 正方 claims + Bedrock 分數 + quote_ids
-- 反方 claims + Bedrock 分數 + quote_ids
-- 殘餘矛盾（正反方都有 approved claim 但結論相反）
+**Read claim-ledger.md; use only claims with `status=approved`. Claims that are rejected or pending are forbidden from appearing in the report.**
+
+Before starting integration, build an **Approved Claims list**; during integration, citing any fact or number outside this list is forbidden.
 
 ---
 
-## Step 2: 處理已定案的論點
+## Step 1: Import Results
 
-| 狀態 | 動作 |
+Read the workspace files. For each subquestion, organize the approved claims:
+- Advocate claims + Bedrock scores + quote_ids
+- Critic claims + Bedrock scores + quote_ids
+- Residual contradictions (both advocate and critic have approved claims with opposite conclusions)
+
+---
+
+## Step 2: Handle Settled Claims
+
+| Status | Action |
 |------|------|
-| 正反方達共識 + Bedrock >= 0.7 | 採納 |
-| 正方有 approved claim，反方 coverage = searched_2x_no_evidence | 採納，但必須寫為「在本次已覆蓋的反方搜尋範圍內，未找到足以推翻此論點的高品質證據」（禁止全域式表述「反方未找到反駁」） |
-| 反方有 approved claim，正方無有效回應 | 採納為風險/限制 |
-| 兩方都有 approved claim 但結論相反 | → Step 3 矛盾裁決 |
+| Advocate and critic reach consensus + Bedrock >= 0.7 | Adopt |
+| Advocate has approved claim, critic coverage = searched_2x_no_evidence | Adopt, but must be worded as "within the critic search scope covered in this run, no high-quality evidence was found that would overturn this claim" (blanket wording like "critic found no rebuttal" is forbidden) |
+| Critic has approved claim, advocate has no valid response | Adopt as risk/limitation |
+| Both sides have approved claims with opposite conclusions | -> Step 3 contradiction adjudication |
 
 ---
 
-## Step 3: 矛盾裁決（三段式，禁止 Bedrock 分差選邊）
+## Step 3: Contradiction Adjudication (three-stage, taking sides based on Bedrock score delta is forbidden)
 
-**Bedrock 只判定「文本是否支持 claim」，不判定「哪一方在現實中是真的」。**
+**Bedrock judges only "whether the text supports the claim", not "which side is actually true in reality".**
 
-對矛盾論點：
+For contradicting claims:
 
-**3a. 多維度比較（不只看 Bedrock）：**
+**3a. Multi-dimensional comparison (not just Bedrock):**
 
-| 比較維度 | 正方 | 反方 |
+| Comparison dimension | Advocate | Critic |
 |---------|------|------|
 | Source Tier | T{n} | T{n} |
-| Independence（非同源） | {Y/N} | {Y/N} |
+| Independence (not same source) | {Y/N} | {Y/N} |
 | Methodology Transparency | {Y/N} | {Y/N} |
 | Freshness | {date} | {date} |
-| Bedrock（參考，非決定性） | {score} | {score} |
+| Bedrock (reference only, not decisive) | {score} | {score} |
 
-**3b. 補搜裁決（如果上述比較無法分高下）：**
-搜第三方 meta-analysis、原始數據 → 新來源也跑 Bedrock → 更新 claim-ledger
+**3b. Additional search for adjudication (if the comparison above cannot resolve it):**
+Search third-party meta-analyses, primary data -> run Bedrock on new sources -> update claim-ledger
 
-**3c. 無法裁決：**
-2 輪補搜後仍無法分高下 → 保留 [CONFLICTING]，報告中呈現雙方觀點，記入 `gap-log.md` 的「未解矛盾」。（Fail-Fast：最多 2 輪，不做第 3 輪）
+**3c. Cannot adjudicate:**
+After 2 rounds of additional search still no resolution -> keep as [CONFLICTING], present both sides in the report, record in "Unresolved contradictions" of `gap-log.md`. (Fail-Fast: at most 2 rounds, no round 3)
 
 ---
 
-## Step 4: 信心等級 + 不確定性評分
+## Step 4: Confidence Level + Uncertainty Score
 
-**每個結論必須分配，無例外。**
+**Every conclusion must be assigned one; no exceptions.**
 
-| 等級 | 不確定性 | 條件 | 語氣規則 |
+| Level | Uncertainty | Conditions | Tone rule |
 |------|---------|------|---------|
-| 🟢 **HIGH** | < 0.1 | 2+ 獨立來源，≥1 個 T1-T2，Bedrock >= 0.7 | 可斷言 |
-| 🟡 **MEDIUM** | 0.1-0.4 | 1-2 來源，T1-T4，Bedrock 0.5-0.7 | 審慎：「根據現有來源」 |
-| 🟠 **CONFLICTING** | 0.4-0.7 | 正反方都有支持 | 呈現雙方 |
-| 🔴 **LOW** | > 0.7 | 僅 T5-T6，或 Bedrock < 0.5 | 弱化：「有來源聲稱...但無法驗證」 |
+| HIGH | < 0.1 | 2+ independent sources, >=1 T1-T2, Bedrock >= 0.7 | may assert |
+| MEDIUM | 0.1-0.4 | 1-2 sources, T1-T4, Bedrock 0.5-0.7 | cautious: "according to available sources" |
+| CONFLICTING | 0.4-0.7 | advocate and critic both supported | present both sides |
+| LOW | > 0.7 | only T5-T6, or Bedrock < 0.5 | weaken: "some sources claim... but it could not be verified" |
 
-**硬性規則：**
-- 🔴 禁止斷言語氣
-- 帶數字的結論必須 🟢 或 🟡，否則刪除數字或標記 [UNVERIFIED]
-- **僅有 T4-T6 來源的子問題** → 最高只能評為 🟠，禁止輸出推薦句，禁止數字斷言
+**Hard rules:**
+- LOW: assertive tone is forbidden
+- Conclusions that contain numbers must be HIGH or MEDIUM, otherwise remove the number or mark [UNVERIFIED]
+- **Subquestions supported only by T4-T6 sources** -> can at most be rated CONFLICTING; producing recommendation sentences is forbidden; numeric assertions are forbidden
 
 ---
 
-## Step 5: 來源深度評估
+## Step 5: Source Depth Evaluation
 
-| 檢查項 | 動作 |
+| Check item | Action |
 |--------|------|
-| 原始性：Primary / Secondary / Tertiary | 標記 |
-| 利益衝突 | 標記 [COI]，在結論中明示 |
-| 同源：多來源轉述同一研究 | 只計 1 個獨立來源，**root-source 去重** |
-| 時效：超過 freshness SLA | 降為「背景資訊」 |
+| Originality: Primary / Secondary / Tertiary | Mark |
+| Conflict of interest | Mark [COI], disclose in the conclusion |
+| Same origin: multiple sources relaying the same study | Count as 1 independent source, **dedupe at root-source level** |
+| Freshness: exceeds freshness SLA | Downgrade to "background information" |
 
 ---
 
-## Step 6: 寫入報告段落
+## Step 6: Write Report Sections
 
-讀取 `prompts/ref-citation-embedding.md`，按其規則建立 verified-sources 約束。
+Read `prompts/ref-citation-embedding.md` and build the verified-sources constraint per its rules.
 
-為每個子問題寫入 `workspace/report-sections/q{n}_section.md`。**每完成一個就立即寫入。**
+For each subquestion, write `workspace/report-sections/q{n}_section.md`. **Write each one immediately after finishing it.**
 
 ```markdown
-# Q{n}: {子問題}
+# Q{n}: {subquestion}
 Status: FINAL
 Based-On-Claims: Q{n}-C1, Q{n}-C2, ...
 
-## 原文證據（正方）
-> QUOTE[S{id}-Q{n}]: "{逐字引用}" — [{來源名稱}]({URL})
-> NUMBER[S{id}-N{n}]: {數字} — Original: "{原句}" — [{來源名稱}]({URL})
+## Original Evidence (advocate)
+> QUOTE[S{id}-Q{n}]: "{verbatim quote}" — [{source name}]({URL})
+> NUMBER[S{id}-N{n}]: {number} — Original: "{original sentence}" — [{source name}]({URL})
 
-## 原文證據（反方）
-> QUOTE[S{id}-Q{n}]: "{逐字引用}" — [{來源名稱}]({URL})
+## Original Evidence (critic)
+> QUOTE[S{id}-Q{n}]: "{verbatim quote}" — [{source name}]({URL})
 
-## 數字對照表
-| 報告數字 | 類型 | 原文原句 | 來源 | claim_id |
+## Number Reconciliation Table
+| Reported number | Type | Original sentence | Source | claim_id |
 |---------|------|---------|------|----------|
-| {數字} | ORIGINAL | "{原句}" | [{URL}] | Q{n}-C{m} |
-| {換算數字} (orig: {原文數字+單位}) | NORMALIZED | "{原句}" | [{URL}] | Q{n}-C{m} |
-| {計算結果} | DERIVED | 公式: {formula} | [{URL}] | Q{n}-C{m} |
+| {number} | ORIGINAL | "{original sentence}" | [{URL}] | Q{n}-C{m} |
+| {converted number} (orig: {original number+unit}) | NORMALIZED | "{original sentence}" | [{URL}] | Q{n}-C{m} |
+| {computed value} | DERIVED | formula: {formula} | [{URL}] | Q{n}-C{m} |
 
-## 分析與判斷 ← Claude 推論
-{基於上述原文證據的分析}
-{每句推論必須附 supporting claim_id}
-{跨 claim 推導必須標記 [INFERENCE] 並列出所有 supporting claim_ids}
+## Analysis and Judgment  <- Claude's inference
+{analysis based on the original evidence above}
+{every inferential sentence must carry a supporting claim_id}
+{cross-claim derivations must be marked [INFERENCE] and list all supporting claim_ids}
 
-## 信心等級
-- 等級：🟢/🟡/🟠/🔴
-- 不確定性：{0.0-1.0}
-- 依據：{來源數、層級、Bedrock 分數}
+## Confidence Level
+- Level: HIGH/MEDIUM/CONFLICTING/LOW
+- Uncertainty: {0.0-1.0}
+- Basis: {number of sources, tier, Bedrock score}
 ```
 
 ---
 
-## Phase 2 完成 Checklist（逐項回答）
+## Phase 2 Completion Checklist (answer item by item)
 
 ```
-□ 1. 每個子問題都有 report-section 檔案（Status: FINAL）？
-     → 逐一列出
+[ ] 1. Each subquestion has a report-section file (Status: FINAL)?
+       -> list them
 
-□ 2. 每個事實陳述都有對應的 approved claim_id？
-     → 無 claim_id 的事實陳述數：{N}（必須 = 0）
+[ ] 2. Every factual statement has a corresponding approved claim_id?
+       -> factual statements without a claim_id: {N} (must be 0)
 
-□ 3. 每個結論都有信心等級和不確定性評分？
-     → 🟢:{n} 🟡:{n} 🟠:{n} 🔴:{n}
+[ ] 3. Every conclusion has a confidence level and uncertainty score?
+       -> HIGH:{n} MEDIUM:{n} CONFLICTING:{n} LOW:{n}
 
-□ 4. 所有 🔴 結論已弱化語氣或移至「未解答」？
-     → ✅/❌
+[ ] 4. All LOW conclusions have their tone weakened or moved to "Unanswered"?
+       -> OK/FAIL
 
-□ 5. 所有非原文直接陳述是否標記 [INFERENCE] 並附 claim_ids？
-     → 未標記的推論數：{N}（必須 = 0）
+[ ] 5. Every non-verbatim statement marked [INFERENCE] and carries claim_ids?
+       -> unmarked inferences: {N} (must be 0)
 
-□ 6. root-source 去重已完成？所有 [COI] 在結論中明示？
-     → ✅/❌
+[ ] 6. Root-source dedup complete? All [COI] disclosed in conclusions?
+       -> OK/FAIL
 
-□ 7. gap-log.md 已更新（未解矛盾已記錄）？
-     → ✅/❌
+[ ] 7. gap-log.md updated (unresolved contradictions recorded)?
+       -> OK/FAIL
 
-→ 全部 ✅ → 進入 Phase 3
+-> all OK -> proceed to Phase 3
 ```
