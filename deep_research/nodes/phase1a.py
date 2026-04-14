@@ -339,6 +339,7 @@ Rules:
 - If the Gap Log introduces a new tool name in a later round, add a category-B query for it.
 - When the user_msg contains a "newly discovered entities" field, **produce at least 1 B-type follow-up query per entity** (e.g. `{entity name} review {YEAR}` or `alternative to {entity name}`).
 - **Hard rule for academic / paper topics**: when the research involves keywords like paper, model, agent, SOTA, framework, or benchmark, **every entity in the `known tools` field must have at least 1 category-E query** (arxiv or github, pick one); these queries do not need a zh-TW counterpart.
+- **Adversarial hard rule**: every subquestion must emit at least 1 query whose `role` is `critic` AND whose wording directly attacks the subquestion's premise. Acceptable phrasings: `"{subquestion topic} failures"`, `"why {approach} does not work"`, `"criticism of {approach}"`, `"{approach} antipattern"`, `"{approach} vs alternatives"`. This is separate from general "limitations" queries — it must name a concrete failure mode or alternative. A subquestion with only advocate + generic limitation queries violates this rule.
 - Use the {YEAR} value from the user_msg's "this round's year" field.
 
 ## Taiwan source locking

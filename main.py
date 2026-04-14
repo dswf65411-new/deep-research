@@ -814,6 +814,14 @@ def cli():
     if not topic and not args.resume:
         parser.error("Please provide a research topic, or use --resume to continue execution")
 
+    if not ask_mode and not args.json:
+        _log(
+            "\n[deep-research] WARNING: --noask mode skips clarification and plan approval.\n"
+            "                 The pipeline will commit to its own interpretation of the topic\n"
+            "                 and spend the full search budget without a chance to correct.\n"
+            "                 Use --ask (default) for anything non-trivial.\n"
+        )
+
     depth = "quick" if args.quick else "standard" if args.standard else "deep"
     budget = args.budget or {"quick": 30, "standard": 60, "deep": 150}[depth]
 

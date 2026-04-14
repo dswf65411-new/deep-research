@@ -716,15 +716,16 @@ def _build_plan_system_prompt(depth: str, budget: int, config: dict) -> str:
 - Use {current_year} for the year in search queries (e.g. "best tools {current_year}", "top tools {current_year} recommendation")
 - Do not use {current_year - 1} or earlier years as "latest" in queries
 
-## Eight required elements
-1. Topic triage (Adversarial / Temporal / Funnel / Multi-Stakeholder)
-2. Query Enrichment (PICO + source priority + anti-hallucination anchors)
-3. Stakeholder perspectives (at least 1 advocate + 1 critic)
-4. Subquestion DAG (facets, dependencies, execution order) — at most {subq_cap}
-5. Search strategy (minimum query set for round 1 + triggers for later rounds)
-6. Budget allocation (quota per subquestion × iterations), total budget {budget}
-7. High-hallucination-risk areas (numeric / causal / trend / comparative)
-8. Inclusion / exclusion criteria
+## Nine required elements
+1. **Premise audit** — list the 2-3 assumptions embedded in the topic itself that, if wrong, would invalidate the whole research. For each: (a) restate the assumption explicitly, (b) propose 1 concrete search query that attacks it, (c) describe what evidence would falsify it. This section must appear BEFORE subquestions so the DAG can absorb any falsifier findings.
+2. Topic triage (Adversarial / Temporal / Funnel / Multi-Stakeholder)
+3. Query Enrichment (PICO + source priority + anti-hallucination anchors)
+4. Stakeholder perspectives (at least 1 advocate + 1 critic)
+5. Subquestion DAG (facets, dependencies, execution order) — at most {subq_cap}
+6. Search strategy (minimum query set for round 1 + triggers for later rounds)
+7. Budget allocation (quota per subquestion × iterations), total budget {budget}
+8. High-hallucination-risk areas (numeric / causal / trend / comparative)
+9. Inclusion / exclusion criteria
 
 ## Output format (strict)
 ```markdown
@@ -743,6 +744,9 @@ def _build_plan_system_prompt(depth: str, budget: int, config: dict) -> str:
 - subquestions: {{N}}
 - perspectives: {{N}}
 - total_coverage_units: {{N}} (required: {{M}})
+
+## Premise audit
+{{2-3 assumptions baked into the topic, each with: (a) assumption restated, (b) falsifier query, (c) what evidence would invalidate}}
 
 ## Query Enrichment
 {{PICO + source priority + anti-hallucination anchors}}

@@ -18,7 +18,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
 from deep_research.harness.gates import quality_gate
-from deep_research.llm import get_llm, safe_ainvoke, safe_ainvoke_chain
+from deep_research.llm import get_available_providers, get_llm, get_provider, safe_ainvoke, safe_ainvoke_chain
 from deep_research.state import Claim, SubagentResult, VerifyState
 from deep_research.tools.grounding import (
     check_grounding_availability,
@@ -112,6 +112,73 @@ Only output JSON, no other text: {{"score": 0.0 to 1.0}}"""
         "score": score,
         "verdict": verdict,
         "tool": "llm",
+        "threshold": threshold,
+    }
+
+
+async def _march_blind_recheck(
+    claim: "Claim",
+    source_texts: list[str],
+    alternate_provider: str,
+    semaphore: asyncio.Semaphore,
+) -> dict | None:
+    """Independent grounding verification by a different-vendor LLM (MARCH pattern).
+
+    MARCH (arxiv 2603.24579) observes that LLMs from the same family share
+    correlated hallucinations — a single model agreeing with its own claim is
+    weak evidence. The blind checker sees the same claim + source but NOT the
+    solver's reasoning, and must independently judge. If primary and blind
+    checker disagree on a GROUNDED verdict, the claim is downgraded.
+
+    Uses the same rubric as ``_llm_ground_one_claim`` so that only the model
+    identity differs. Returns a dict with ``{claim_id, score, verdict,
+    tool: "march-<provider>"}`` or None if the alternate LLM itself failed
+    (we do not penalize the claim for alternate-provider outages).
+    """
+    combined = "\n\n---\n\n".join(source_texts[:3])
+    if len(combined) > 6000:
+        combined = combined[:6000] + "\n...[truncated]"
+
+    threshold = THRESHOLDS.get(claim.claim_type, 0.7)
+
+    prompt = f"""You are an independent fact checker. Judge whether the Claim is directly supported by the Source text. You have not seen any other model's reasoning about this claim — judge from source only.
+
+## Notes
+- The Claim may be in Traditional Chinese while the source is in English (or vice versa). Cross-language matches count as grounded if meaning is faithful.
+
+## Source text
+{combined}
+
+## Claim (type: {claim.claim_type})
+{claim.claim_text}
+
+## Rubric
+- 1.0: source explicitly states the claim
+- 0.7-0.9: source indirectly supports or allows reasonable derivation
+- 0.5-0.69: partial support
+- 0.0-0.49: no support or contradicted
+
+Only output JSON: {{"score": 0.0 to 1.0}}"""
+
+    async with semaphore:
+        try:
+            llm = get_llm(tier="strong", max_tokens=60, temperature=0.0, provider=alternate_provider)
+            response = await safe_ainvoke(llm, [HumanMessage(content=prompt)])
+            text = response.content if hasattr(response, "content") else str(response)
+            m = re.search(r'\{[^}]+\}', text)
+            if not m:
+                return None
+            score = min(max(float(json.loads(m.group()).get("score", 0.5)), 0.0), 1.0)
+        except Exception as exc:
+            logger.info("MARCH recheck via %s failed for %s: %s", alternate_provider, claim.claim_id, exc)
+            return None
+
+    verdict = "GROUNDED" if score >= threshold else "NOT_GROUNDED"
+    return {
+        "claim_id": claim.claim_id,
+        "score": score,
+        "verdict": verdict,
+        "tool": f"march-{alternate_provider}",
         "threshold": threshold,
     }
 
@@ -233,6 +300,58 @@ async def grounding_check_node(state: VerifyState) -> dict:
             "LLM grounding fallback complete: %d claims, %d have source, %d NO_SOURCE_TEXT",
             len(claims), len(grounding_indices), len(no_source_indices),
         )
+
+        # ── MARCH blind recheck: second opinion from a different vendor ─────
+        # For every claim the primary model marked GROUNDED, an independent
+        # LLM from a different family re-verifies. Disagreement downgrades.
+        # Skipped when only one provider has an API key.
+        providers = get_available_providers()
+        alternates = [p for p in providers if p != get_provider()]
+        if alternates and any(r and r.get("verdict") == "GROUNDED" for r in results):
+            alt = alternates[0]
+            logger.info("MARCH blind recheck starting via alternate provider: %s", alt)
+            recheck_tasks = []
+            recheck_indices: list[int] = []
+            for i, r in enumerate(results):
+                if not r or r.get("verdict") != "GROUNDED":
+                    continue
+                try:
+                    claim_i = next(idx for idx, c in enumerate(claims) if c.claim_id == r["claim_id"])
+                except StopIteration:
+                    continue
+                srcs = all_sources[claim_i]
+                if not srcs:
+                    continue
+                recheck_indices.append(i)
+                recheck_tasks.append(_march_blind_recheck(claims[claim_i], srcs, alt, sem))
+
+            recheck_results = await asyncio.gather(*recheck_tasks, return_exceptions=True)
+
+            downgrade_count = 0
+            for i, rr in zip(recheck_indices, recheck_results):
+                if isinstance(rr, BaseException) or rr is None:
+                    results[i]["march_status"] = "unchecked"
+                    continue
+                results[i]["march_score"] = rr["score"]
+                results[i]["march_provider"] = alt
+                if rr["verdict"] == "GROUNDED":
+                    results[i]["march_status"] = "agreed"
+                else:
+                    results[i]["march_status"] = "disagreed"
+                    results[i]["verdict"] = "NOT_GROUNDED"
+                    results[i]["downgrade_reason"] = f"MARCH disagreement (alt={alt} score={rr['score']:.2f})"
+                    downgrade_count += 1
+
+            logger.info(
+                "MARCH recheck complete: %d claims rechecked, %d downgraded due to disagreement",
+                len(recheck_indices), downgrade_count,
+            )
+        else:
+            logger.info(
+                "MARCH recheck skipped (providers=%s, alternates=%s)",
+                providers, alternates,
+            )
+
         return {"grounding_results": [r for r in results if r is not None]}
 
     # ── CLI grounding path (bedrock / minicheck / nemo) ──────────────────────

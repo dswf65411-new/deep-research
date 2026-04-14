@@ -121,27 +121,50 @@ async def validate_arxiv_id(
 ) -> bool:
     """Return True iff arxiv accepts ``arxiv_id``.
 
-    The arxiv Atom API returns 200 for any well-formed query; a missing
-    paper just results in an empty feed (no ``<entry>`` tag). We check for
-    ``<entry>`` as the existence signal.
+    Two-stage check:
+
+    1. The Atom API at ``export.arxiv.org`` is authoritative (empty feed =
+       missing paper). This is the preferred signal.
+    2. When ``export.arxiv.org`` times out or errors, fall back to a HEAD
+       on ``arxiv.org/abs/<id>``. A 200 on the abs page means the paper
+       exists; a 404 means it's hallucinated. This avoids false negatives
+       when the API mirror is unreachable (observed 2026-04: the export
+       host was returning connection timeouts from residential networks
+       while the main arxiv.org was reachable).
     """
     cache = _load_cache(cache_path)
     if arxiv_id in cache:
         return cache[arxiv_id]
 
-    url = f"https://export.arxiv.org/api/query?id_list={arxiv_id}"
-    ok = False
-    try:
-        if client is None:
-            async with httpx.AsyncClient(timeout=timeout) as c:
-                resp = await c.get(url)
-        else:
-            resp = await client.get(url, timeout=timeout)
-        ok = resp.status_code == 200 and "<entry>" in resp.text
-    except Exception as exc:
-        logger.warning("validate_arxiv_id(%s) network failure: %s", arxiv_id, exc)
-        ok = False
+    api_url = f"https://export.arxiv.org/api/query?id_list={arxiv_id}"
+    abs_url = f"https://arxiv.org/abs/{arxiv_id}"
+    ok: Optional[bool] = None
 
+    async def _probe(c: httpx.AsyncClient) -> Optional[bool]:
+        try:
+            resp = await c.get(api_url, timeout=timeout)
+            if resp.status_code == 200:
+                return "<entry>" in resp.text
+        except Exception as exc:
+            logger.info("validate_arxiv_id(%s) export API failed, falling back to abs: %s", arxiv_id, exc)
+        try:
+            resp = await c.head(abs_url, timeout=timeout, follow_redirects=True)
+            if resp.status_code == 200:
+                return True
+            if resp.status_code in (404, 410):
+                return False
+        except Exception as exc:
+            logger.warning("validate_arxiv_id(%s) abs fallback also failed: %s", arxiv_id, exc)
+        return None
+
+    if client is None:
+        async with httpx.AsyncClient() as c:
+            ok = await _probe(c)
+    else:
+        ok = await _probe(client)
+
+    if ok is None:
+        ok = False
     cache[arxiv_id] = ok
     _save_cache(cache_path, cache)
     return ok
