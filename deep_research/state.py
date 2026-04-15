@@ -70,6 +70,15 @@ class Claim(BaseModel):
     claim_type: Literal["numeric", "comparative", "causal", "forecast", "qualitative"] = "qualitative"
     source_ids: list[str] = Field(default_factory=list)
     quote_ids: list[str] = Field(default_factory=list)
+    evidence_quotes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Verbatim quote / number-sentence snippets resolved from quote_ids at "
+            "extraction time. Populated by phase1a `_collect_claims`; phase1b's "
+            "MARCH-style blind checker reads this directly so the verifier sees the "
+            "same text the claim was grounded on, instead of chasing opaque IDs."
+        ),
+    )
     bedrock_score: float = 0.0
     citation_verdict: str = ""
     number_tag: Literal["ORIGINAL", "NORMALIZED", "DERIVED"] | None = None
@@ -160,7 +169,22 @@ class ResearchState(TypedDict, total=False):
     coverage_status: Annotated[dict, _replace]
 
     # Phase 2
-    report_sections: Annotated[list[str], operator.add]
+    # _replace (not operator.add) so the Critic-revise loop can re-run phase2
+    # without the second draft being *appended* to the first. Each revision
+    # replaces the whole section list; phase3 reads from disk anyway.
+    report_sections: Annotated[list[str], _replace]
+    # gpt-researcher-style Critic-revise loop (see multi_agents/agents/editor.py:129).
+    # review_verdict holds the latest critic output {accept, issues, per_sq_issues};
+    # revision_count is incremented each time phase2 is re-entered and capped at 2
+    # so a persistently-failing writer cannot loop forever.
+    review_verdict: Annotated[dict, _replace]
+    revision_count: Annotated[int, _replace]
+    # Tongyi ParallelMuse "Heavy Mode": when the revise loop hits max revisions
+    # with an unresolved critic verdict, fan out the rejected sections into n=3
+    # rollouts at staggered temperatures and let a selector LLM pick the best
+    # candidate per section (no merging, per Tongyi INTEGRATE_PROMPT:58-66).
+    # heavy_mode_triggered is a one-shot latch so the route does not re-enter.
+    heavy_mode_triggered: Annotated[bool, _replace]
 
     # Phase 3
     final_report: str

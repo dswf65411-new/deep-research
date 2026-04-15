@@ -43,10 +43,17 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-from deep_research.context import read_reference_files  # noqa: E402 — after load_dotenv
+from deep_research.context import read_reference_files, scan_project_dir  # noqa: E402 — after load_dotenv
+from deep_research.harness import cost_tracker, runtime_limits  # noqa: E402
+from deep_research.harness.runtime_limits import LimitExceeded  # noqa: E402
 from deep_research.harness.secret_scanner import redact_secrets  # noqa: E402
 
 DEFAULT_MAX_QUESTIONS = 10
+
+# Whisper P2-2: emit a PROGRESS line at most every N real-time seconds so a
+# tight phase1a loop doesn't spam stdout with hundreds of updates. 2s feels
+# alive without drowning a JSON consumer.
+_PROGRESS_MIN_INTERVAL_S = 2.0
 
 
 def _redact_user_text(text: str, source_label: str) -> str:
@@ -133,6 +140,7 @@ async def run_graph(
     clarifications: list[dict] | None = None,
     refs: list[dict] | None = None,
     interactive_cli: bool = False,
+    json_mode: bool = False,
 ) -> str:
     """Run the research graph. Returns workspace path.
 
@@ -171,11 +179,31 @@ async def run_graph(
     _log(f"[deep-research] Starting research: {topic}")
     _log(f"[deep-research] mode={'interactive' if ask_mode else 'autonomous'}, depth={depth}, budget={budget}")
 
-    async for event in graph.astream(initial_state, config, stream_mode="updates"):
-        for node_name, update in event.items():
-            if isinstance(update, dict):
-                for log_entry in update.get("execution_log", []):
-                    _log(f"  [{node_name}] {log_entry}")
+    runtime_limits.start()
+    progress = _ProgressEmitter(json_mode=json_mode)
+    progress.emit(phase="start", force=True)
+
+    try:
+        async for event in graph.astream(initial_state, config, stream_mode="updates"):
+            for node_name, update in event.items():
+                if isinstance(update, dict):
+                    for log_entry in update.get("execution_log", []):
+                        _log(f"  [{node_name}] {log_entry}")
+                    cost_tracker.set_phase(node_name)
+                    # Wire the workspace abort marker the first time it is
+                    # known so ``--abort <ws>`` from a sibling process is
+                    # respected from here on.
+                    ws_path = update.get("workspace_path")
+                    if ws_path:
+                        runtime_limits.set_abort_marker(
+                            runtime_limits.abort_marker_path(ws_path)
+                        )
+                    progress.emit(phase=node_name, state_snapshot=update)
+    except LimitExceeded as exc:
+        _log(f"\n[deep-research] runtime limit hit — {exc}. Stopping gracefully.")
+        final_state = graph.get_state(config)
+        state_values = final_state.values if hasattr(final_state, "values") else {}
+        return state_values.get("workspace_path", "")
 
     # Check for plan approval interrupt
     snapshot = graph.get_state(config)
@@ -218,19 +246,41 @@ async def run_graph(
         else:
             resume_value = {"approved": True}
 
-        async for event in graph.astream(
-            Command(resume=resume_value), config, stream_mode="updates"
-        ):
-            for node_name, update in event.items():
-                if isinstance(update, dict):
-                    for log_entry in update.get("execution_log", []):
-                        _log(f"  [{node_name}] {log_entry}")
+        try:
+            async for event in graph.astream(
+                Command(resume=resume_value), config, stream_mode="updates"
+            ):
+                for node_name, update in event.items():
+                    if isinstance(update, dict):
+                        for log_entry in update.get("execution_log", []):
+                            _log(f"  [{node_name}] {log_entry}")
+                        cost_tracker.set_phase(node_name)
+                        ws_path = update.get("workspace_path")
+                        if ws_path:
+                            runtime_limits.set_abort_marker(
+                                runtime_limits.abort_marker_path(ws_path)
+                            )
+                        progress.emit(phase=node_name, state_snapshot=update)
+        except LimitExceeded as exc:
+            _log(f"\n[deep-research] runtime limit hit — {exc}. Stopping gracefully.")
+            final_state = graph.get_state(config)
+            state_values = final_state.values if hasattr(final_state, "values") else {}
+            return state_values.get("workspace_path", "")
 
     final_state = graph.get_state(config)
     state_values = final_state.values if hasattr(final_state, "values") else {}
     workspace = state_values.get("workspace_path", "")
 
-    _log(f"\n[deep-research] Research complete")
+    progress.emit(phase="done", state_snapshot=state_values, force=True)
+
+    final_snap = cost_tracker.snapshot_dict()
+    _log(
+        f"\n[deep-research] Research complete — "
+        f"LLM calls: {final_snap['llm_calls']}, "
+        f"tokens: {final_snap['input_tokens']}->{final_snap['output_tokens']}, "
+        f"est cost ~${final_snap['est_cost_usd']:.3f} USD, "
+        f"searches: {final_snap['searches']}, sources: {final_snap['sources']}"
+    )
     if workspace:
         _log(f"[deep-research] Report at: {workspace}/final-report.md")
 
@@ -244,11 +294,17 @@ async def run_graph(
 async def cli_interactive(
     topic: str, depth: str, budget: int, ask_mode: bool, max_questions: int,
     ref_paths: list[str] | None = None,
+    project_dir: str | None = None,
 ) -> None:
     """Interactive CLI with multi-round clarification + follow-up loop."""
 
     current_topic = topic
     current_refs = read_reference_files(ref_paths) if ref_paths else []
+    if project_dir:
+        project_refs = scan_project_dir(project_dir)
+        if project_refs:
+            _log(f"[deep-research] Scanned project dir {project_dir}: {len(project_refs)} files")
+            current_refs = current_refs + project_refs
 
     while True:
         # --- Clarification phase ---
@@ -263,6 +319,7 @@ async def cli_interactive(
             topic=current_topic, depth=depth, budget=budget,
             ask_mode=ask_mode, clarifications=clarifications,
             refs=current_refs, interactive_cli=True,
+            json_mode=False,
         )
 
         if workspace:
@@ -380,6 +437,7 @@ async def skill_mode(
     max_questions: int,
     resume_workspace: str | None,
     answer: str | None,
+    project_dir: str | None = None,
 ) -> None:
     """Handle --json skill mode."""
     from deep_research.nodes.phase0 import (
@@ -657,6 +715,13 @@ async def skill_mode(
         from deep_research.tools.workspace import create_workspace
         workspace_path = create_workspace(topic)
 
+        project_refs = scan_project_dir(project_dir) if project_dir else []
+        initial_clarifications: list[dict] = []
+        ref_entry = refs_to_clarification(project_refs)
+        if ref_entry:
+            initial_clarifications.append(ref_entry)
+            _log(f"[deep-research] Scanned project dir {project_dir}: {len(project_refs)} files")
+
         base_state = {
             "topic": topic,
             "depth": depth,
@@ -664,14 +729,14 @@ async def skill_mode(
             "ask_mode": ask_mode,
             "max_questions": max_questions,
             "workspace": workspace_path,
-            "clarifications": [],
+            "clarifications": initial_clarifications,
             "total_asked": 0,
             "round": 0,
         }
 
         if ask_mode:
             questions, reasoning = await generate_questions(
-                topic, [], max_questions=max_questions, round_num=1,
+                topic, initial_clarifications, max_questions=max_questions, round_num=1,
             )
 
             if questions:
@@ -698,6 +763,9 @@ async def skill_mode(
             workspace = await run_graph(
                 topic=topic, depth=depth, budget=budget,
                 ask_mode=False, interactive_cli=False,
+                clarifications=initial_clarifications,
+                refs=project_refs,
+                json_mode=True,
             )
             _json_out({"status": "DONE", "workspace": workspace})
 
@@ -738,6 +806,7 @@ async def _run_full(state: dict) -> str:
         ask_mode=False,
         clarifications=state.get("clarifications", []),
         interactive_cli=False,
+        json_mode=True,
     )
 
     if state.get("ask_mode", True):
@@ -757,12 +826,119 @@ async def _run_full(state: dict) -> str:
         return workspace
 
 
+async def _plan_only(
+    topic: str,
+    depth: str,
+    budget: int,
+    max_questions: int,
+    ref_paths: list[str] | None,
+    project_dir: str | None,
+    json_mode: bool,
+) -> None:
+    """Whisper P2-5 ``--plan-only`` — generate plan then stop.
+
+    Intentionally bypasses clarify prompting (``ask_mode=False``) so this is a
+    quick dry-run for scripted regression / debugging. If the caller wants
+    clarifications first they can run normally and quit after the plan step.
+    """
+    from deep_research.nodes.phase0 import phase0_plan_standalone
+    from deep_research.tools.workspace import create_workspace
+
+    refs = read_reference_files(ref_paths) if ref_paths else []
+    if project_dir:
+        project_refs = scan_project_dir(project_dir)
+        refs = refs + project_refs
+
+    initial_clarifications: list[dict] = []
+    ref_entry = refs_to_clarification(refs)
+    if ref_entry:
+        initial_clarifications.append(ref_entry)
+
+    workspace_path = create_workspace(topic)
+    plan = await phase0_plan_standalone(
+        topic=topic,
+        depth=depth,
+        budget=budget,
+        clarifications=initial_clarifications,
+        workspace_path=workspace_path,
+    )
+
+    if json_mode:
+        _json_out({
+            "status": "PLAN_ONLY",
+            "workspace": workspace_path,
+            "plan_summary": plan,
+        })
+    else:
+        print(f"\n[deep-research] --plan-only complete. Workspace: {workspace_path}")
+        print(f"[deep-research] Plan saved to: {workspace_path}/phase0-plan.md")
+        print("\n" + "=" * 60 + "\nPlan:\n" + "=" * 60)
+        print(plan)
+
+
 def _json_out(data: dict) -> None:
     print(json.dumps(data, ensure_ascii=False))
 
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Whisper P2-2 — progress / cost emission
+# ---------------------------------------------------------------------------
+
+
+class _ProgressEmitter:
+    """Throttled progress sink.
+
+    Two consumers:
+      - ``--json`` callers (Claude Code skill, CI) parse stdout JSON lines
+        and need a machine-readable stream;
+      - humans reading stderr need a human-readable ``[progress] ...`` line
+        so a 20-minute run doesn't feel silent.
+
+    We throttle to one emission per ``_PROGRESS_MIN_INTERVAL_S`` to avoid
+    spamming tight phase1a loops.
+    """
+
+    def __init__(self, json_mode: bool) -> None:
+        self.json_mode = json_mode
+        self._last_ts: float = 0.0
+
+    def emit(self, phase: str, state_snapshot: dict | None = None, *, force: bool = False) -> None:
+        import time
+        now = time.monotonic()
+        if not force and (now - self._last_ts) < _PROGRESS_MIN_INTERVAL_S:
+            return
+        self._last_ts = now
+
+        snap = cost_tracker.snapshot_dict()
+        snap["phase"] = phase or snap.get("phase", "")
+        if state_snapshot:
+            sc = state_snapshot.get("search_count")
+            if isinstance(sc, int):
+                snap["searches"] = sc
+            src = state_snapshot.get("sources")
+            if isinstance(src, list):
+                snap["sources"] = len(src)
+
+        if self.json_mode:
+            _json_out({"status": "PROGRESS", **snap})
+        else:
+            _log(
+                f"[progress] phase={snap['phase']} "
+                f"llm_calls={snap['llm_calls']} "
+                f"tokens={snap['input_tokens']}->{snap['output_tokens']} "
+                f"est_cost=${snap['est_cost_usd']:.3f} "
+                f"searches={snap['searches']} sources={snap['sources']}"
+            )
+
+        # Enforce --max-time / --max-cost / --abort here because the emitter
+        # already fires on every node transition and is the natural throttle
+        # point. Raising LimitExceeded breaks the graph.astream loop and lets
+        # run_graph() wrap up with whatever has been flushed to disk so far.
+        runtime_limits.check(cost_usd=snap.get("est_cost_usd"))
 
 
 # ---------------------------------------------------------------------------
@@ -797,13 +973,38 @@ def cli():
                              "(faster, but may trigger lost-in-the-middle)")
     parser.add_argument("--ref", type=str, nargs="+", metavar="FILE",
                         help="reference materials (previous research workspace dirs, documents, notes, etc.; one or more)")
+    parser.add_argument("--project-dir", type=str, metavar="PATH",
+                        help="user project directory to scan (docs/manifests/source; "
+                             "used so research for 'design X for project Y' actually knows Y). "
+                             f"Capped at 50 files / 10K chars-per-file / 200K total.")
     parser.add_argument("--resume", type=str, metavar="WORKSPACE")
     parser.add_argument("--answer", type=str)
     parser.add_argument("--json", action="store_true", help="JSON output (for skill use)")
 
+    # Whisper P2-5 — ops flags
+    parser.add_argument("--plan-only", action="store_true",
+                        help="run phase 0 (clarify + plan) only, then exit without executing research")
+    parser.add_argument("--max-time-minutes", type=float, default=None, metavar="MINS",
+                        help="soft wall-clock cap; pipeline stops gracefully between phases when exceeded")
+    parser.add_argument("--max-cost-usd", type=float, default=None, metavar="USD",
+                        help="soft cost cap; pipeline stops gracefully between phases when exceeded")
+    parser.add_argument("--abort", type=str, default=None, metavar="WORKSPACE",
+                        help="write an abort marker into WORKSPACE so a running pipeline stops at the next checkpoint")
+
     parser.add_argument("--auto", action="store_true", help="(deprecated; use --noask)")
 
     args = parser.parse_args()
+
+    # --abort is a one-shot side effect: write the marker and exit. Do this
+    # before anything else so we don't require a topic or touch LLM config.
+    if args.abort:
+        try:
+            marker = runtime_limits.write_abort_marker(args.abort)
+        except FileNotFoundError as exc:
+            _log(f"[deep-research] --abort failed: {exc}")
+            sys.exit(1)
+        _log(f"[deep-research] wrote abort marker: {marker}")
+        sys.exit(0)
 
     if args.auto:
         args.noask = True
@@ -829,18 +1030,49 @@ def cli():
     set_provider(args.model)
     set_context_threshold(args.context_threshold)
 
+    # Fresh cost tracker for this run — previous cli() invocations in the
+    # same interpreter would otherwise accumulate into the running total.
+    cost_tracker.reset()
+
+    # Runtime limits: module-level singletons, also reset per invocation so a
+    # prior run's settings don't leak.
+    runtime_limits.reset()
+    runtime_limits.set_max_time_minutes(args.max_time_minutes)
+    runtime_limits.set_max_cost_usd(args.max_cost_usd)
+
+    if args.plan_only:
+        try:
+            asyncio.run(_plan_only(
+                topic=topic, depth=depth, budget=budget,
+                max_questions=args.max_questions,
+                ref_paths=args.ref, project_dir=args.project_dir,
+                json_mode=bool(args.json),
+            ))
+        except KeyboardInterrupt:
+            _log("\n[deep-research] User interrupted")
+            sys.exit(1)
+        except Exception as e:
+            if args.json:
+                _json_out({"status": "ERROR", "error": str(e)})
+            else:
+                _log(f"\n[deep-research] error: {e}")
+            sys.exit(1)
+        return
+
     try:
         if args.json or args.resume:
             asyncio.run(skill_mode(
                 topic=topic, depth=depth, budget=budget,
                 ask_mode=ask_mode, max_questions=args.max_questions,
                 resume_workspace=args.resume, answer=args.answer,
+                project_dir=args.project_dir,
             ))
         else:
             asyncio.run(cli_interactive(
                 topic=topic, depth=depth, budget=budget,
                 ask_mode=ask_mode, max_questions=args.max_questions,
                 ref_paths=args.ref,
+                project_dir=args.project_dir,
             ))
     except KeyboardInterrupt:
         _log("\n[deep-research] User interrupted")

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from langgraph.graph import END, START, StateGraph
 
 from deep_research.harness.gates import quality_gate
 from deep_research.llm import get_available_providers, get_llm, get_provider, safe_ainvoke, safe_ainvoke_chain
+from deep_research.prompts_shared import FOCUSED_EXEC_PROMPT
 from deep_research.state import Claim, SubagentResult, VerifyState
 from deep_research.tools.grounding import (
     check_grounding_availability,
@@ -41,6 +43,36 @@ THRESHOLDS = {
     "forecast": 0.75,
     "qualitative": 0.7,
 }
+
+# Relevance filter three-stage gate (Whisper plan P1-2).
+# Applied per-subquestion: do NOT reject on relevance alone when the sample
+# size is small or the rejection rate is low. Prevents one noisy relevance
+# judge call from tipping an SQ into fallback via false_dims cascade.
+RELEVANCE_MIN_APPROVED = 3
+RELEVANCE_REJECT_RATIO = 0.5
+
+
+def _grounding_concurrency() -> int:
+    """Max concurrent LLM grounding calls. Configurable via
+    ``DEEP_RESEARCH_GROUNDING_CONCURRENCY`` env var; default 5 to avoid 429.
+    Clamped to [1, 32]."""
+    try:
+        raw = int(os.environ.get("DEEP_RESEARCH_GROUNDING_CONCURRENCY", "5"))
+    except (TypeError, ValueError):
+        raw = 5
+    return max(1, min(32, raw))
+
+
+def _list_march_alternates() -> list[str]:
+    """Return available providers excluding the currently-configured one.
+
+    Pulled into a helper so tests can monkeypatch a single function to skip
+    MARCH recheck (``lambda: []``) instead of patching both
+    ``get_available_providers`` and ``get_provider``.
+    """
+    providers = get_available_providers()
+    current = get_provider()
+    return [p for p in providers if p != current]
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +279,14 @@ async def _gather_claim_sources(
 
 
 async def grounding_check_node(state: VerifyState) -> dict:
-    """Run grounding verification on all claims."""
+    """Run grounding verification on all claims.
+
+    ### Environment variables
+    - ``DEEP_RESEARCH_GROUNDING_CONCURRENCY`` (default ``5``, clamped to ``[1, 32]``):
+      max concurrent LLM grounding calls. Set higher when the provider rate
+      limit allows (e.g. ``10`` doubles throughput on 200-claim runs); keep
+      at 5 or lower if you hit HTTP 429s. See ``_grounding_concurrency``.
+    """
     claims = state.get("claims_to_verify", [])
     workspace = state.get("workspace_path", "")
 
@@ -264,7 +303,9 @@ async def grounding_check_node(state: VerifyState) -> dict:
 
     if use_llm_fallback:
         # LLM fallback path: first gather source texts concurrently, then run LLM grounding concurrently
-        sem = asyncio.Semaphore(5)  # at most 5 concurrent LLM calls, to avoid 429
+        concurrency = _grounding_concurrency()
+        sem = asyncio.Semaphore(concurrency)  # configurable, default 5 to avoid 429
+        logger.info("grounding_check_node: concurrency=%d", concurrency)
 
         # Gather source texts for all claims concurrently
         source_tasks = [_gather_claim_sources(claim, workspace) for claim in claims]
@@ -305,8 +346,7 @@ async def grounding_check_node(state: VerifyState) -> dict:
         # For every claim the primary model marked GROUNDED, an independent
         # LLM from a different family re-verifies. Disagreement downgrades.
         # Skipped when only one provider has an API key.
-        providers = get_available_providers()
-        alternates = [p for p in providers if p != get_provider()]
+        alternates = _list_march_alternates()
         if alternates and any(r and r.get("verdict") == "GROUNDED" for r in results):
             alt = alternates[0]
             logger.info("MARCH blind recheck starting via alternate provider: %s", alt)
@@ -348,8 +388,8 @@ async def grounding_check_node(state: VerifyState) -> dict:
             )
         else:
             logger.info(
-                "MARCH recheck skipped (providers=%s, alternates=%s)",
-                providers, alternates,
+                "MARCH recheck skipped (alternates=%s)",
+                alternates,
             )
 
         return {"grounding_results": [r for r in results if r is not None]}
@@ -423,17 +463,58 @@ async def quality_eval_node(state: VerifyState) -> dict:
         # NO_SOURCE_TEXT → stays pending (attack agent may have source context)
 
     # ── Step 2: Relevance filter ──────────────────────────────────────────
-    # Grounding only checks "does the text exist in source?"; not "does it answer the SQ?".
-    # Reject off-topic approved claims (addresses, bios, boilerplate that happen to be in source).
+    # Grounding only checks "does the text exist in source?"; not "does it
+    # answer the SQ?". Reject off-topic approved claims (addresses, bios,
+    # boilerplate that happen to be in source).
+    #
+    # Three-stage gating (Whisper plan P1-2): avoid letting a noisy relevance
+    # judge cascade into a fallback storm when signal is low. Per SQ:
+    #   - approved_count < RELEVANCE_MIN_APPROVED (3): skip rejection entirely
+    #       → too few samples; relevance is not a reliable signal.
+    #   - rejected_ratio < RELEVANCE_REJECT_RATIO (0.5): skip rejection
+    #       → most claims look on-topic, don't penalize the minority.
+    #   - otherwise: apply rejection.
+    # Rationale: failed-workspace analysis (2026-04-14) showed relevance
+    # alone tripping trigger_fallback's ``false_dims`` check when the real
+    # problem was noisy judge, not off-topic claims. This stops the bleed.
     irrelevant_ids = await _run_relevance_checks(claims, workspace)
+    by_subq_for_rel: dict[str, list[Claim]] = {}
     for c in claims:
-        if c.claim_id in irrelevant_ids:
+        by_subq_for_rel.setdefault(c.subquestion, []).append(c)
+
+    kept_by_gate: list[tuple[str, int, int]] = []
+    for subq, subq_claims in by_subq_for_rel.items():
+        approved = [c for c in subq_claims if c.status == "approved"]
+        if not approved:
+            continue
+        sq_irrelevant = [c for c in approved if c.claim_id in irrelevant_ids]
+        approved_count = len(approved)
+        rejected_count = len(sq_irrelevant)
+        rejected_ratio = rejected_count / approved_count
+
+        if approved_count < RELEVANCE_MIN_APPROVED:
+            kept_by_gate.append((subq, approved_count, rejected_count))
+            continue
+        if rejected_ratio < RELEVANCE_REJECT_RATIO:
+            kept_by_gate.append((subq, approved_count, rejected_count))
+            continue
+
+        for c in sq_irrelevant:
             logger.info(
                 "quality_eval: relevance filter rejected off-topic claim %s: %s",
                 c.claim_id,
                 c.claim_text[:60],
             )
             c.status = "rejected"
+
+    if kept_by_gate:
+        gate_summary = ", ".join(
+            f"{sq}(approved={a},flagged={r})" for sq, a, r in kept_by_gate
+        )
+        logger.info(
+            "quality_eval: relevance rejection skipped for low-signal SQs: %s",
+            gate_summary,
+        )
 
     # ── Step 3: Compute quality dimensions (post-relevance-filter) ────────
     by_subq: dict[str, list[Claim]] = {}
@@ -650,7 +731,7 @@ async def _run_relevance_checks(
     return irrelevant_ids
 
 
-ATTACK_SYSTEM = """You are an adversarial fact checker. Your task is to try to prove the claims under review are wrong.
+ATTACK_SYSTEM = FOCUSED_EXEC_PROMPT + """You are an adversarial fact checker. Your task is to try to prove the claims under review are wrong.
 
 ## Verification rules (strictly follow)
 
@@ -887,31 +968,68 @@ async def phase1b_verify(state: ResearchState) -> dict:
             grounding_md += f"- {r.get('claim_id', '?')}: score={r.get('score', 0):.2f} verdict={r.get('verdict', '?')}\n"
         write_workspace_file(workspace, "grounding-results/latest.md", grounding_md)
 
-    # Defensive coverage assertion: a healthy run grounds every claim in to_verify
-    # (each gets either a LLM result or a NO_SOURCE_TEXT stub). In the 2026-04-14
-    # failure workspace only 17/208 claims landed a grounding entry, yet the final
-    # report still claimed "all claims verified". Catch that here so downstream
-    # audit sees the broken invariant rather than a silently truncated ledger.
-    if to_verify and len(grounding) < 0.9 * len(to_verify):
-        coverage_ratio = len(grounding) / len(to_verify) if to_verify else 0.0
-        try:
-            import datetime as _dt
-            from deep_research.tools.workspace import append_workspace_file as _append
-            ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            _append(
-                workspace,
-                "gap-log.md",
-                f"\n\n## CRITICAL — Phase 1b grounding coverage degraded ({ts})\n"
-                f"- grounding_results covers {len(grounding)}/{len(to_verify)} "
-                f"claims ({coverage_ratio:.1%}), below 90% floor\n"
-                f"- downstream report cannot claim \"all claims verified\"\n",
+    # Defensive coverage assertion + backfill (Whisper P2-3).
+    #
+    # A healthy run grounds every claim in to_verify (each gets either a LLM
+    # result or a NO_SOURCE_TEXT stub). In the 2026-04-14 failure workspace
+    # only 17/208 claims landed a grounding entry, yet the final report still
+    # claimed "all claims verified". We do three things here:
+    #
+    # 1. Detect missing claim_ids (to_verify ↘ grounding).
+    # 2. For each missing id, inject a ``MISSING`` stub so downstream audit
+    #    (claim-ledger, statement-ledger) sees the broken invariant as
+    #    ``verdict = MISSING`` rather than an absent row that silently looks
+    #    "verified".
+    # 3. If still below the 90% floor after backfill (shouldn't happen, but
+    #    keep the check as defense-in-depth), append a CRITICAL entry to
+    #    gap-log so post-mortem tooling picks it up.
+    if to_verify:
+        grounded_ids = {r.get("claim_id") for r in grounding if r.get("claim_id")}
+        missing_ids = [c.claim_id for c in to_verify if c.claim_id not in grounded_ids]
+        if missing_ids:
+            logger.warning(
+                "phase1b grounding coverage gap: %d/%d claims missing a grounding entry; "
+                "backfilling with MISSING stubs",
+                len(missing_ids), len(to_verify),
             )
-        except Exception:
-            logger.exception("failed to append grounding-coverage warning to gap-log.md")
-        logger.warning(
-            "phase1b grounding coverage %d/%d = %.1f%% (below 90%% floor)",
-            len(grounding), len(to_verify), coverage_ratio * 100,
-        )
+            for mid in missing_ids:
+                grounding.append({
+                    "claim_id": mid,
+                    "score": 0.0,
+                    "verdict": "MISSING",
+                    "tool": "none",
+                })
+            # Refresh the grounding payload on disk so the ledger reflects
+            # the backfill — easy to forget otherwise.
+            grounding_md = "# Grounding Results\n\n"
+            for r in grounding:
+                grounding_md += (
+                    f"- {r.get('claim_id', '?')}: "
+                    f"score={r.get('score', 0):.2f} "
+                    f"verdict={r.get('verdict', '?')}\n"
+                )
+            write_workspace_file(workspace, "grounding-results/latest.md", grounding_md)
+
+        coverage_ratio = len(grounding) / len(to_verify) if to_verify else 0.0
+        if coverage_ratio < 0.9:
+            try:
+                import datetime as _dt
+                from deep_research.tools.workspace import append_workspace_file as _append
+                ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _append(
+                    workspace,
+                    "gap-log.md",
+                    f"\n\n## CRITICAL — Phase 1b grounding coverage degraded ({ts})\n"
+                    f"- grounding_results covers {len(grounding)}/{len(to_verify)} "
+                    f"claims ({coverage_ratio:.1%}), below 90% floor even after backfill\n"
+                    f"- downstream report cannot claim \"all claims verified\"\n",
+                )
+            except Exception:
+                logger.exception("failed to append grounding-coverage warning to gap-log.md")
+            logger.warning(
+                "phase1b grounding coverage %d/%d = %.1f%% (below 90%% floor)",
+                len(grounding), len(to_verify), coverage_ratio * 100,
+            )
 
     # Backfill bedrock_score + citation_verdict onto claims
     if grounding:
@@ -1152,19 +1270,39 @@ def _parse_attack_results(text: str) -> list[SubagentResult]:
 
 
 def _write_claim_ledger(workspace: str, claims: list[Claim]) -> None:
-    """Write the claim-ledger.md file."""
+    """Write the claim-ledger.md file.
+
+    Tongyi-style three-part evidence row:
+      - claim_text : model-written synthesis (the claim)
+      - quote_ids  : opaque identifiers for lookup
+      - evidence   : verbatim snippets resolved from quote_ids at extraction time
+
+    The evidence column is what the MARCH-style blind checker actually reads:
+    the original text the claim was grounded on, inline, with no need to chase
+    opaque `S001-Q3` IDs through separate files.
+    """
+    def _cell_escape(s: str, limit: int = 220) -> str:
+        cleaned = (s or "").replace("\n", " ").replace("|", "\\|").strip()
+        if len(cleaned) > limit:
+            cleaned = cleaned[:limit] + "…"
+        return cleaned
+
     header = (
         "# Claim Ledger\n\n"
         "| claim_id | subquestion | type | claim_text | source_ids | quote_ids "
-        "| bedrock | status |\n"
+        "| evidence | bedrock | status |\n"
         "|----------|-------------|------|------------|------------|-----------|"
-        "---------|--------|\n"
+        "----------|---------|--------|\n"
     )
     rows = []
     for c in claims:
+        evidence_cell = " ¶ ".join(
+            _cell_escape(q, limit=180) for q in (c.evidence_quotes or [])
+        ) or "(none)"
         rows.append(
             f"| {c.claim_id} | {c.subquestion} | {c.claim_type} "
-            f"| {c.claim_text[:60]}... | {','.join(c.source_ids)} "
-            f"| {','.join(c.quote_ids)} | {c.bedrock_score:.2f} | {c.status} |"
+            f"| {_cell_escape(c.claim_text, limit=120)} | {','.join(c.source_ids)} "
+            f"| {','.join(c.quote_ids)} | {evidence_cell} "
+            f"| {c.bedrock_score:.2f} | {c.status} |"
         )
     write_workspace_file(workspace, "claim-ledger.md", header + "\n".join(rows) + "\n")

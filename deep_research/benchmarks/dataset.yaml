@@ -1,0 +1,120 @@
+# Deep-research benchmark dataset — initial seed set.
+#
+# 10 questions spanning the categories the pipeline has historically fumbled:
+# - academic: SOTA-paper tracking (user's 2026-04-14 failure was here)
+# - comparison: tool-vs-tool with numeric claims that must be grounded
+# - causal: cause/effect analysis that stresses the reasoning chain
+# - how-to: practical guidance requiring correct sequence of steps
+# - local-lang: Traditional-Chinese queries to exercise serper_tw path
+#
+# Keep must_include phrases short and unambiguous — they are semantic anchors,
+# not verbatim patterns. The judge scores presence semantically, so "Whisper
+# has WER around 8% on Chinese" matches "achieves 8.3% Chinese WER".
+#
+# must_not_include catches known hallucination modes: future-dated arxiv IDs,
+# non-existent papers, hallucinated product names.
+
+- id: BQ001
+  question: What is the reported Whisper Large v3 word error rate on Mandarin Chinese benchmarks, and how does it compare to Whisper Large v2?
+  category: comparison
+  difficulty: easy
+  must_include:
+    - Whisper Large v3 Mandarin WER (numeric)
+    - comparison vs Whisper Large v2
+  must_not_include:
+    - Whisper Large v4 (does not exist as of 2026)
+
+- id: BQ002
+  question: What are the core design differences between LangGraph Supervisor pattern and the ReAct pattern for multi-agent orchestration?
+  category: academic
+  difficulty: medium
+  must_include:
+    - Supervisor centrally routes sub-agents
+    - ReAct loops through reason-act cycles without hierarchy
+    - trade-offs on observability or determinism
+  must_not_include:
+    - future-dated arxiv IDs (e.g. 2604.* or later)
+
+- id: BQ003
+  question: How does MLE-Agent (arxiv 2402.04942) structure its ML engineering loop, and what is its reported benchmark score?
+  category: academic
+  difficulty: hard
+  must_include:
+    - MLE-Agent paper arxiv 2402.04942
+    - ML engineering loop structure (planning / coding / debugging stages)
+    - benchmark score on MLE-bench or similar
+  must_not_include:
+    - AutoML-Agent as the same paper (distinct work)
+
+- id: BQ004
+  question: What are three commonly cited failure modes of LLM-based autonomous agents on long-horizon tasks?
+  category: causal
+  difficulty: medium
+  must_include:
+    - context loss or drift over long horizons
+    - error compounding across tool calls
+    - hallucinated tool outputs or fabricated intermediate state
+  must_not_include: []
+
+- id: BQ005
+  question: What are the recommended prompt-engineering techniques for reducing LLM hallucination when summarising long documents?
+  category: how-to
+  difficulty: easy
+  must_include:
+    - grounding with verbatim quotes or citations
+    - chunking or hierarchical summarisation
+    - explicit instruction to decline unsupported claims
+  must_not_include: []
+
+- id: BQ006
+  question: In 2025-2026, which inference-time techniques for LLM agents have been shown to improve grounding (reduce hallucination) without retraining?
+  category: academic
+  difficulty: hard
+  must_include:
+    - retrieval-augmented grounding with quote-level evidence
+    - self-verification or critic loops
+    - multi-sample aggregation (e.g. self-consistency or heavy mode)
+  must_not_include:
+    - fine-tuning as the primary answer (question excludes retraining)
+
+- id: BQ007
+  question: AIDE 與 MLE-Agent 兩個 ML engineering agent 主要差異為何？
+  category: local-lang
+  difficulty: medium
+  must_include:
+    - AIDE is tree-search based
+    - MLE-Agent follows a staged engineering loop
+    - both evaluated on Kaggle-style benchmarks
+  must_not_include:
+    - two papers with same arxiv ID
+
+- id: BQ008
+  question: What evaluation benchmarks exist specifically for measuring ML engineering agents in 2024-2026?
+  category: academic
+  difficulty: medium
+  must_include:
+    - MLE-bench
+    - SWE-bench or a similar coding benchmark
+  must_not_include:
+    - benchmark with unverified future-dated arxiv ID
+
+- id: BQ009
+  question: What are the key trade-offs between using Claude Sonnet 4.6 versus Gemini 2.5 Flash for LLM-judge grounding verification?
+  category: comparison
+  difficulty: medium
+  must_include:
+    - Claude leads on instruction following and critic tasks
+    - Gemini Flash leads on extraction speed and long context
+    - hallucination rate comparison
+  must_not_include: []
+
+- id: BQ010
+  question: For a LangGraph agent that needs to track per-subquestion coverage across multiple search rounds, what state-management pattern is recommended?
+  category: how-to
+  difficulty: medium
+  must_include:
+    - TypedDict with reducer annotations for upsert semantics
+    - persistent workspace file for cross-round continuity
+    - checkpointer for resume-on-crash
+  must_not_include:
+    - pure in-memory state as the only option

@@ -12,7 +12,21 @@
 
 **Critical ordering: merge first -> build statement-ledger first -> cross-check first -> only then write summary and charts**
 
-**Required reading for this Phase:** `prompts/ref-citation-embedding.md`
+**Required reading for this Phase:** `prompts/ref-citation-embedding.md`, `prompts/ref-focused-execution.md`
+
+---
+
+## Execution Mode: Focused Task Execution
+
+Before producing any report content, emit a `[TASK LIST]` covering:
+- T1 merge sections, T2 build statement ledger (one sub-task per subquestion section),
+- T3 subagent cross-check (one sub-task per check group),
+- T4 self-critique (one sub-task per critique dimension: logic, completeness, bias, citation chain, tone),
+- T5 final quality scan, T6 summary writing, T7 charts, T8 compose final report.
+
+Process each wrapped in `[WORKING: T{n}]` / `[DONE: T{n}]`. CRITICAL: do NOT start T6 summary until T1-T5 are all DONE — this mirrors the "build ledger and cross-check before writing summary" rule above.
+
+See `prompts/ref-focused-execution.md` for full rules.
 
 ---
 

@@ -176,7 +176,7 @@ _RATE_LIMITERS: dict[str, InMemoryRateLimiter] = {
 #   30% is the conservative baseline; future A/B testing (stuff-everything vs
 #   iterative with the same data) can calibrate this.
 #
-# Implementation lives in deep_research/context.py (TODO)
+# Implementation lives in deep_research/context.py.
 # ---------------------------------------------------------------------------
 
 
@@ -401,8 +401,27 @@ async def safe_ainvoke(llm: BaseChatModel, messages: list, **kwargs):
       4. asyncio.wait_for hard timeout             — guards against LangChain #25309 hang bug
 
     In most cases (1) + (2) absorb 429s; (3)(4) are insurance.
+
+    Emits a usage-metadata record to the run-wide cost tracker (Whisper P2-2)
+    so ``main.py`` can surface progress and rough USD burn in ``--json``
+    mode. Failures in the tracker are swallowed — a metrics bug must never
+    take down a real LLM call.
     """
-    return await _invoke_with_retry(llm, messages, **kwargs)
+    response = await _invoke_with_retry(llm, messages, **kwargs)
+    try:
+        from deep_research.harness import cost_tracker as _cost
+        usage = _cost.extract_usage(response)
+        if usage:
+            model, itoks, otoks = usage
+            if not model:
+                # ChatAnthropic stores the model on the chat object, not the
+                # response. Recover it from the caller if possible so the
+                # pricing table gets the right key.
+                model = getattr(llm, "model", "") or getattr(llm, "model_name", "") or ""
+            _cost.record_llm_call(model, itoks, otoks)
+    except Exception:
+        logger.debug("cost tracker record_llm_call failed", exc_info=True)
+    return response
 
 
 # ---------------------------------------------------------------------------

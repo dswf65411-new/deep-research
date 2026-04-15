@@ -31,6 +31,7 @@ from deep_research.llm import (
     get_role_context_limit,
     _available_chain,
 )
+from deep_research.prompts_shared import FOCUSED_EXEC_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +220,129 @@ def read_reference_files(paths: list[str]) -> list[dict]:
     return refs
 
 
+# ---------------------------------------------------------------------------
+# Project directory scan — feeds user's local project into phase0 brief
+# ---------------------------------------------------------------------------
+
+# Extensions worth reading for "what is this project?" — docs first, then
+# manifests, then source. PDFs / images are excluded because a recursive
+# project scan should stay lightweight (use --ref for those).
+_PROJECT_SCAN_EXTS: set[str] = {
+    # Docs (highest priority)
+    ".md", ".markdown", ".txt", ".rst",
+    # Manifests / config
+    ".toml", ".json", ".yaml", ".yml", ".cfg", ".ini",
+    # Source
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java",
+    ".c", ".cc", ".cpp", ".h", ".hpp", ".rb", ".php", ".sh",
+}
+
+# Directory names to skip wholesale — dependency / build / cache dirs that
+# would blow the scan budget with machine-generated noise and rarely carry
+# project intent.
+_PROJECT_SCAN_SKIP_DIRS: set[str] = {
+    ".git", ".hg", ".svn",
+    "node_modules", "__pycache__", ".venv", "venv", "env",
+    "dist", "build", "target", ".next", ".cache",
+    "coverage", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".idea", ".vscode",
+}
+
+# Scan limits — keeps the LLM synthesize context sane. Whisper plan P0-5
+# calls for 50 files / 10K chars-per-file / 200K total; see the plan for
+# rationale.
+_PROJECT_SCAN_MAX_FILES = 50
+_PROJECT_SCAN_PER_FILE_CHARS = 10_000
+_PROJECT_SCAN_TOTAL_CHARS = 200_000
+
+
+def _score_project_file(path: Path, root: Path) -> tuple[int, int, str]:
+    """Sort key so docs outrank source, and shallower paths outrank deep ones.
+
+    Returns (priority, depth, name). Lower priority wins.
+      - 0: README / OVERVIEW / CLAUDE.md at root (project-describing docs)
+      - 1: other .md / .txt / .rst
+      - 2: manifests (.toml / .json / .yaml / etc.)
+      - 3: source files
+    """
+    name = path.name.lower()
+    suffix = path.suffix.lower()
+    depth = len(path.relative_to(root).parts)
+
+    doc_stems = {"readme", "overview", "claude", "agents", "contributing", "architecture"}
+    if suffix in {".md", ".markdown", ".txt", ".rst"} and path.stem.lower() in doc_stems:
+        return (0, depth, name)
+    if suffix in {".md", ".markdown", ".txt", ".rst"}:
+        return (1, depth, name)
+    if suffix in {".toml", ".json", ".yaml", ".yml", ".cfg", ".ini"}:
+        return (2, depth, name)
+    return (3, depth, name)
+
+
+def scan_project_dir(root: str) -> list[dict]:
+    """Recursively read a user's project directory into ref dicts.
+
+    Honours ``_PROJECT_SCAN_SKIP_DIRS`` (won't descend into node_modules etc.),
+    ``_PROJECT_SCAN_EXTS`` (only text-like extensions), per-file cap of
+    ``_PROJECT_SCAN_PER_FILE_CHARS``, total-budget cap of
+    ``_PROJECT_SCAN_TOTAL_CHARS``, and a hard file-count cap of
+    ``_PROJECT_SCAN_MAX_FILES``.
+
+    Returns a list of ref dicts shaped like ``read_reference_files`` output —
+    ``{"type": "text", "name": <relative path>, "content": <text>}`` — so
+    ``synthesize_research_topic`` can consume them unchanged.
+
+    Files are ordered by priority (docs first, then manifests, then source),
+    tiebroken by depth (shallower wins) then filename. Truncated files get a
+    trailing marker so the LLM knows the tail was dropped.
+    """
+    root_path = Path(root).expanduser().resolve()
+    if not root_path.is_dir():
+        raise ValueError(f"--project-dir is not a directory: {root}")
+
+    candidates: list[Path] = []
+    for path in root_path.rglob("*"):
+        if any(part in _PROJECT_SCAN_SKIP_DIRS for part in path.parts):
+            continue
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in _PROJECT_SCAN_EXTS:
+            continue
+        candidates.append(path)
+
+    candidates.sort(key=lambda p: _score_project_file(p, root_path))
+
+    refs: list[dict] = []
+    total_chars = 0
+    for path in candidates:
+        if len(refs) >= _PROJECT_SCAN_MAX_FILES:
+            break
+        if total_chars >= _PROJECT_SCAN_TOTAL_CHARS:
+            break
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            # Binary / non-UTF-8 / permission error — silently skip; project
+            # scan is best-effort, not fail-fast (unlike --ref).
+            continue
+        truncated = False
+        if len(text) > _PROJECT_SCAN_PER_FILE_CHARS:
+            text = text[:_PROJECT_SCAN_PER_FILE_CHARS] + "\n\n...[truncated]..."
+            truncated = True
+        remaining = _PROJECT_SCAN_TOTAL_CHARS - total_chars
+        if len(text) > remaining:
+            text = text[:remaining] + "\n\n...[truncated to fit total budget]..."
+            truncated = True
+        rel = path.relative_to(root_path).as_posix()
+        refs.append({
+            "type": "text",
+            "name": f"project-dir/{rel}",
+            "content": text,
+        })
+        total_chars += len(text)
+    return refs
+
+
 def _extract_pdf_text(path: Path) -> str:
     """Extract text from a PDF."""
     try:
@@ -265,7 +389,7 @@ def refs_to_message_content(refs: list[dict]) -> list[dict]:
 # Research brief integration (topic + refs + clarifications -> full_research_topic)
 # ---------------------------------------------------------------------------
 
-SYNTHESIZE_PROMPT = """You are a research-requirements analyst. Integrate the information below into a structured research brief.
+SYNTHESIZE_PROMPT = FOCUSED_EXEC_PROMPT + """You are a research-requirements analyst. Integrate the information below into a structured research brief.
 
 This brief will be the core instruction for the entire research pipeline; all subsequent search, analysis, and reporting will be executed according to it.
 Describe the requester's needs in the third person so that anyone reading this brief can independently understand the full research requirement.
@@ -469,7 +593,7 @@ def _rank_sources_bm25(sources: list[str], query: str) -> list[str]:
 # Iterative Refinement core loop
 # ---------------------------------------------------------------------------
 
-ITERATIVE_SYSTEM = """You are a deep-research analyst. Your task is to integrate new search results into the current research draft according to the research brief.
+ITERATIVE_SYSTEM = FOCUSED_EXEC_PROMPT + """You are a deep-research analyst. Your task is to integrate new search results into the current research draft according to the research brief.
 
 ## Integration rules
 

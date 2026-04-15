@@ -15,9 +15,20 @@ dependencies = [
     "python-dotenv>=1.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
 [project.scripts]
 deep-research = "deep_research.main:cli"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+# Strict mode: only tests marked with @pytest.mark.asyncio use the asyncio
+# plugin. Lets existing `asyncio.run()`-style sync tests keep working untouched.
+asyncio_mode = "strict"

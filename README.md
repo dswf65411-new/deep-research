@@ -54,15 +54,16 @@ Phase 3  (Report)    → Statement ledger + final audit + Coverage Sanity Check
 ```bash
 git clone https://github.com/dswf65411-new/deep-research.git
 cd deep-research
-make init
+make init             # or: scripts/setup.sh
 ```
 
 `make init` will:
-1. Install pyenv (if missing)
-2. Install Python 3.13.12
-3. Create venv + install dependencies (via `uv`)
-4. Prompt for API keys
-5. Optionally install Claude Code / Gemini CLI skills
+1. Check Python >=3.12 is available
+2. Create `.venv/` (if missing)
+3. Upgrade pip + install project with `[dev]` extras (runtime + pytest + pytest-asyncio)
+4. Run a pytest collection sanity check
+
+For API key setup, see the "API Keys" section below.
 
 ## API Keys
 
@@ -119,7 +120,25 @@ LLM grounding is used by default (cross-language support); CLI tools serve as fa
 
 # Specify the full model name + adjust context threshold
 .venv/bin/python3 main.py "Quantum computing" --model gemini-2.5-pro --context-threshold 0.5
+
+# Plan-only: skip search, just produce phase0 plan
+.venv/bin/python3 main.py "topic" --plan-only
+
+# Feed a user project directory so the brief reads local CLAUDE.md / README / source
+.venv/bin/python3 main.py "topic" --project-dir /path/to/my-project
+
+# Hard stop limits — graceful partial report when exceeded
+.venv/bin/python3 main.py "topic" --max-time-minutes 20 --max-cost-usd 5.00
+
+# Abort a running workspace (drops a .abort marker; next check exits cleanly)
+.venv/bin/python3 main.py --abort workspaces/2026-04-15_my-topic
 ```
+
+### Env vars
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DEEP_RESEARCH_GROUNDING_CONCURRENCY` | `5` | Max concurrent LLM grounding calls (clamped to `[1, 32]`). Bump to `10` on high-throughput providers; reduce on 429s. |
 
 ### Claude Code skill
 
@@ -188,44 +207,58 @@ deep-research/
 │   │   ├── phase2.py           # Integrator (with biased-source marking)
 │   │   └── phase3.py           # Statement ledger + Final audit + Coverage sanity
 │   ├── harness/
-│   │   ├── gates.py            # 4D quality gate (actionability/freshness/plurality/completeness)
-│   │   ├── validators.py       # Tier 1 hard rules + metadata filter + span-based index
-│   │   ├── source_tier.py      # T1-T6 automatic classification
-│   │   └── claim_dedup.py      # Normalize + fuzzy ratio near-duplicate dedup
+│   │   ├── gates.py              # 4D quality gate (actionability/freshness/plurality/completeness)
+│   │   ├── validators.py         # Tier 1 hard rules + metadata filter + span-based index
+│   │   ├── source_tier.py        # T1-T6 automatic classification
+│   │   ├── claim_dedup.py        # Normalize + fuzzy ratio near-duplicate dedup
+│   │   ├── claim_relevance.py    # Claim-level relevance_to_question scorer (offline, Jaccard + entity boost)
+│   │   ├── source_mirror.py      # Cross-source mirror detector (arxiv ID / DOI / title Jaccard)
+│   │   ├── stakeholder_collision.py  # Advocate-vs-critic contradiction detector
+│   │   ├── self_eval.py          # Pipeline self-scoring + LLM follow-up suggestions
+│   │   ├── review_gate.py        # Mid-pipeline /skip /refocus /inject-url command parser
+│   │   ├── runtime_limits.py     # --max-time / --max-cost / --abort enforcement
+│   │   ├── cost_tracker.py       # LLM call count / token / USD accounting
+│   │   ├── secret_scanner.py     # PII / webhook / API key redaction (P0-6)
+│   │   └── url_validator.py      # arxiv ID / URL existence check (P0-4)
 │   └── tools/
-│       ├── search.py           # Brave / Serper direct HTTP
-│       ├── grounding.py        # Bedrock / MiniCheck / NeMo CLI wrapper
-│       └── workspace.py        # Workspace I/O tools
-├── grounding_scripts/          # Grounding CLI tools
-├── prompts/                    # Phase instruction files
-├── tests/                      # 222 pytest (11 test files)
-└── setup.sh                    # One-click install
+│       ├── search.py             # Brave / Serper direct HTTP
+│       ├── grounding.py          # Bedrock / MiniCheck / NeMo CLI wrapper
+│       ├── workspace.py          # Workspace I/O tools
+│       ├── arxiv_retriever.py    # arxiv API search (official endpoint)
+│       └── github_search.py      # GitHub Code Search API
+├── grounding_scripts/            # Grounding CLI tools
+├── prompts/                      # Phase instruction files
+├── tests/                        # 739 pytest across 54 test files
+├── scripts/
+│   ├── setup.sh                  # Idempotent dev-env bootstrap (venv + pip install -e ".[dev]")
+│   ├── pytest_baseline.sh        # Store / diff pytest failure baselines
+│   └── archive_workspaces.sh     # TTL-based workspace archival
+└── Makefile                      # make init / test / baseline-save / baseline-diff / archive
 ```
 
 ## Testing
 
 ```bash
-source .venv/bin/activate
-python -m pytest tests/ -q
+.venv/bin/python -m pytest tests/              # full 739-test suite (<1s)
+make test                                       # same as above via Makefile
+
+# Regression-check against a stored baseline
+scripts/pytest_baseline.sh save                 # snapshot current failures
+# ... make changes ...
+scripts/pytest_baseline.sh diff                 # prints NEW red + NEWLY green only
 ```
 
-Tests cover key invariants:
+Tests cover the key invariants. Highlights (54 files, 739 cases total):
 
-| Test file | Verified items |
-|-----------|----------|
-| `test_bedrock_flow.py` | Bedrock score write-back + >= 0.3 threshold |
-| `test_budget_guard.py` | Minimum per-SQ budget reservation |
-| `test_claim_dedup.py` | Normalize + ratio dedup |
-| `test_coverage_sanity.py` | Keyword + SQ coverage cross-check |
-| `test_discovery_queries.py` | Planner discovery-facet query templates |
-| `test_fallback_loop.py` | Low grounding triggers re-search |
-| `test_iterative_expansion.py` | New entity extraction + next-round backfill |
-| `test_metadata_filter.py` | Address / SEO / legal boilerplate regex filter |
-| `test_relevance_filter.py` | LLM relevance decision + dim_scores integration |
-| `test_source_tier.py` | T1-T6 domain classification |
-| `test_taiwan_whitelist.py` | Taiwan authoritative domains auto-upgraded to T3 |
-| `test_thin_content.py` | < 500 chars → THIN_CONTENT tag |
-| `test_url_dedup.py` | Cross-round URL dedup + UNREACHABLE exclusion |
+| Area | Representative test files |
+|------|---------------------------|
+| Grounding | `test_bedrock_flow`, `test_grounding_coverage_assertion`, `test_grounding_concurrency`, `test_march_blind_recheck` |
+| Claim quality | `test_claim_dedup`, `test_claim_relevance`, `test_relevance_filter`, `test_metadata_filter`, `test_off_topic_gap` |
+| Source tiering | `test_source_tier`, `test_source_curator`, `test_source_mirror`, `test_taiwan_whitelist`, `test_zh_low_info_filter` |
+| Phase integrity | `test_phase0_url_validation`, `test_phase2_section_writeback`, `test_phase3_statement_ledger_resilient`, `test_phase3_llm_sanity_check` |
+| Search / budget | `test_budget_guard`, `test_url_dedup`, `test_discovery_queries`, `test_iterative_expansion`, `test_serper_scholar`, `test_scholar_auto_upgrade` |
+| Runtime / CLI | `test_runtime_limits`, `test_review_gate`, `test_self_eval`, `test_clarify_staged`, `test_coverage_chk_sync`, `test_stakeholder_collision` |
+| Security / validation | `test_secret_scanner`, `test_url_validator`, `test_arxiv_retriever`, `test_github_search` |
 
 ## Output
 

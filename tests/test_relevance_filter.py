@@ -147,13 +147,16 @@ def test_quality_eval_relevance_dim_in_scores(monkeypatch):
 
 
 def test_quality_eval_relevance_false_when_offtopic(monkeypatch):
-    """If relevance check rejects a claim, dim_scores['relevance'] must be False."""
+    """If relevance check rejects a claim, dim_scores['relevance'] must be False.
+
+    P1-2 three-stage gate requires ≥3 approved and ≥50% flagged before
+    rejection kicks in; use 4 claims with 2 flagged to cross both thresholds.
+    """
     from deep_research.nodes.phase1b import quality_eval_node
     from deep_research.state import VerifyState
 
-    # Simulate one off-topic claim detected
     async def mock_relevance_checks(claims, workspace):
-        return {"Q1-C2"}  # Q1-C2 is off-topic
+        return {"Q1-C3", "Q1-C4"}  # 2 of 4 off-topic → ratio=0.5 ≥ threshold
 
     monkeypatch.setattr(
         "deep_research.nodes.phase1b._run_relevance_checks",
@@ -162,11 +165,15 @@ def test_quality_eval_relevance_false_when_offtopic(monkeypatch):
 
     claims = [
         _approved_claim("Q1-C1", "Q1", "Whisper WER is 8.3%"),
-        _approved_claim("Q1-C2", "Q1", "company address: 1 Xinyi Road, Taipei"),
+        _approved_claim("Q1-C2", "Q1", "MacWhisper supports local models"),
+        _approved_claim("Q1-C3", "Q1", "company address: 1 Xinyi Road, Taipei"),
+        _approved_claim("Q1-C4", "Q1", "CEO bio says founded in 1998"),
     ]
     grounding = [
         {"claim_id": "Q1-C1", "score": 0.9, "verdict": "GROUNDED"},
-        {"claim_id": "Q1-C2", "score": 0.8, "verdict": "GROUNDED"},
+        {"claim_id": "Q1-C2", "score": 0.85, "verdict": "GROUNDED"},
+        {"claim_id": "Q1-C3", "score": 0.8, "verdict": "GROUNDED"},
+        {"claim_id": "Q1-C4", "score": 0.8, "verdict": "GROUNDED"},
     ]
 
     state: VerifyState = {
@@ -179,25 +186,33 @@ def test_quality_eval_relevance_false_when_offtopic(monkeypatch):
     scores = result["quality_scores"]
     updated_claims = result["claims_to_verify"]
 
-    # Q1-C2 should be rejected
-    c2 = next(c for c in updated_claims if c.claim_id == "Q1-C2")
-    assert c2.status == "rejected", "Off-topic claim must be rejected"
+    # Q1-C3 / Q1-C4 should be rejected
+    c3 = next(c for c in updated_claims if c.claim_id == "Q1-C3")
+    c4 = next(c for c in updated_claims if c.claim_id == "Q1-C4")
+    assert c3.status == "rejected", "Off-topic claim must be rejected"
+    assert c4.status == "rejected", "Off-topic claim must be rejected"
 
-    # Q1-C1 should remain approved
+    # Q1-C1 / Q1-C2 should remain approved
     c1 = next(c for c in updated_claims if c.claim_id == "Q1-C1")
+    c2 = next(c for c in updated_claims if c.claim_id == "Q1-C2")
     assert c1.status == "approved"
+    assert c2.status == "approved"
 
     # relevance dimension should be False (had off-topic claims)
     assert scores["Q1"]["relevance"] is False
 
 
 def test_quality_eval_offtopic_reduces_actionability(monkeypatch):
-    """If all claims for a SQ are off-topic -> actionability=False -> needs_attack."""
+    """If all claims for a SQ are off-topic -> actionability=False -> needs_attack.
+
+    P1-2 three-stage gate requires ≥3 approved claims before rejection kicks
+    in; use 3 claims all flagged so gate triggers and all get rejected.
+    """
     from deep_research.nodes.phase1b import quality_eval_node
     from deep_research.state import VerifyState
 
     async def mock_relevance_checks(claims, workspace):
-        return {"Q1-C1", "Q1-C2"}  # both off-topic
+        return {"Q1-C1", "Q1-C2", "Q1-C3"}  # all 3 off-topic
 
     monkeypatch.setattr(
         "deep_research.nodes.phase1b._run_relevance_checks",
@@ -207,10 +222,12 @@ def test_quality_eval_offtopic_reduces_actionability(monkeypatch):
     claims = [
         _approved_claim("Q1-C1", "Q1", "address information A"),
         _approved_claim("Q1-C2", "Q1", "address information B"),
+        _approved_claim("Q1-C3", "Q1", "address information C"),
     ]
     grounding = [
         {"claim_id": "Q1-C1", "score": 0.9, "verdict": "GROUNDED"},
         {"claim_id": "Q1-C2", "score": 0.85, "verdict": "GROUNDED"},
+        {"claim_id": "Q1-C3", "score": 0.82, "verdict": "GROUNDED"},
     ]
 
     state: VerifyState = {

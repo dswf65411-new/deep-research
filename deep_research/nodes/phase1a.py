@@ -37,7 +37,10 @@ from deep_research.harness.validators import (
 from deep_research.harness.claim_dedup import is_near_duplicate, normalize_for_dedup
 from deep_research.harness.source_tier import classify_tier
 from deep_research.llm import get_llm, safe_ainvoke, safe_ainvoke_chain
+from deep_research.prompts_shared import FOCUSED_EXEC_PROMPT
 from deep_research.state import Claim, ResearchState, Source
+from deep_research.tools.arxiv_retriever import arxiv_search
+from deep_research.tools.github_search import github_repo_search
 from deep_research.tools.search import (
     BRAVE_API_KEY,
     SERPER_API_KEY,
@@ -87,6 +90,64 @@ _TAIWAN_DOMAIN_WHITELIST: frozenset[str] = frozenset({
 # LLM call, then merged and deduplicated.
 _CHUNK_SIZE = 8000
 _CHUNK_OVERLAP = 1000
+
+
+# ---------------------------------------------------------------------------
+# Scholar-intent auto-upgrade (Whisper P1-6)
+# ---------------------------------------------------------------------------
+# In the failed 2026-04-14 workspace, brief-named SOTA papers (AIDE, MLE-bench,
+# ResearchAgent, AutoML-Agent) were buried under marketing blogs because
+# generic web engines (Brave / Serper) rank by backlinks, not by venue. Even
+# with dedicated ``arxiv`` / ``serper_scholar`` engines, the web ones still
+# burn budget on noise.
+#
+# This heuristic catches scholar-intent web queries (words like ``arxiv``,
+# ``paper``, ``benchmark``, ``SOTA`` …) and appends a ``site:`` filter so
+# Brave/Serper only return hits from arxiv / ACL Anthology / OpenReview.
+#
+# Intentionally narrow: only applies to ``brave`` and ``serper_en``. The
+# zh/cn variants would lose regional coverage with site: filters, and the
+# dedicated ``serper_scholar`` / ``arxiv`` / ``github`` engines already
+# query authoritative corpora directly.
+_SCHOLAR_INTENT_RE: re.Pattern = re.compile(
+    r"\b("
+    r"arxiv|"
+    r"papers?|preprint|"
+    r"sota|state[- ]of[- ]the[- ]art|"
+    r"benchmark|leaderboard|"
+    r"peer[- ]review(?:ed)?|proceedings|"
+    r"thesis|dissertation|"
+    r"acl|emnlp|neurips|nips|icml|iclr|aaai|cvpr|iccv"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_SCHOLAR_UPGRADE_ENGINES: frozenset[str] = frozenset({"brave", "serper_en"})
+
+_SCHOLAR_SITE_CLAUSE = (
+    " (site:arxiv.org OR site:aclanthology.org OR site:openreview.net)"
+)
+
+
+def _maybe_upgrade_to_scholar_query(query: str, engine: str) -> str:
+    """Wrap scholar-intent queries with a ``site:`` filter on generic web engines.
+
+    Returns the query unchanged if:
+      - engine is not a generic web engine (dedicated scholar/arxiv/github
+        engines handle authoritative sources natively);
+      - the query already contains ``site:`` (user-specified filter wins);
+      - no scholar-intent keyword matched.
+
+    Keeping this pure + deterministic so the test suite can exercise it
+    without touching HTTP.
+    """
+    if engine not in _SCHOLAR_UPGRADE_ENGINES:
+        return query
+    if "site:" in query.lower():
+        return query
+    if not _SCHOLAR_INTENT_RE.search(query):
+        return query
+    return query + _SCHOLAR_SITE_CLAUSE
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +270,29 @@ async def phase1a_search(state: ResearchState) -> dict:
     )
 
     llm_queries = query_plan.get("queries", [])
+
+    # Cross-round duplicate rollback (MiroThinker-inspired):
+    # planner's prompt asks it to dedupe, but LLM paraphrases still slip through.
+    # Dropping pre-execution saves search budget and forces the next round's
+    # planner to change angle when the gap-log shows the rollback.
+    llm_queries, dup_dropped = _detect_duplicate_queries(llm_queries, already_searched)
+    if dup_dropped:
+        _log_duplicate_rollback(workspace, iteration, dup_dropped)
+        # STUCK escalation: 5+ consecutive rounds of rollback for the same SQ
+        # gets a louder warning so phase1b / phase2 can note it.
+        stuck_sqs = sorted({
+            q.get("subquestion", "Q?") for q in dup_dropped
+            if _count_consecutive_stuck_rounds(gap_log, q.get("subquestion", "")) + 1 >= 5
+        })
+        if stuck_sqs:
+            append_workspace_file(
+                workspace,
+                "gap-log.md",
+                f"\n\n## [STUCK] subquestions with 5+ consecutive rollback rounds\n"
+                + "\n".join(f"- {s}: planner looks trapped — consider BLOCKER" for s in stuck_sqs)
+                + "\n",
+            )
+
     # Merge seed + LLM queries, seeds first to ensure priority; dedupe by query string
     seen_q: set[str] = set()
     queries: list[dict] = []
@@ -269,6 +353,16 @@ async def phase1a_search(state: ResearchState) -> dict:
     sq_texts = _parse_sq_texts(coverage)
     extractions = await _extract_all_sources(raw_sources, workspace, sq_texts)
 
+    # ── Stage 3.5: Source-pool curator (gpt-researcher style) ─────────
+    # LLM scores every fetched source for relevance/credibility/quant_value.
+    # Low-scoring sources emit a [CURATOR WARNING] in gap-log so phase1b and
+    # phase2 can apply stricter grounding thresholds / reject their claims.
+    try:
+        curator_scores = await _curate_sources(raw_sources, extractions, plan, coverage)
+        _write_source_curation(workspace, iteration, curator_scores)
+    except Exception as e:
+        logger.warning("source curator step failed (%s) — continuing", e)
+
     # ── Stage 4: Registry ────────────────────────────────────────────
     _update_source_registry(workspace, raw_sources)
     _append_execution_log(workspace, iteration, queries, searches_used)
@@ -276,6 +370,18 @@ async def phase1a_search(state: ResearchState) -> dict:
     _log_domain_bias(workspace, iteration, existing_sources, raw_sources)
     _log_off_topic_ratio(workspace, iteration, raw_sources)
     _build_sq_evidence_snapshot(workspace, iteration, raw_sources, sq_texts)
+
+    # think_tool-style planner reflection appended to sq-progress.md for the
+    # next round's planner. Re-reads the snapshot that was just written.
+    refreshed_snapshot = read_workspace_file(workspace, "sq-progress.md") or ""
+    refreshed_gap_log = read_workspace_file(workspace, "gap-log.md") or gap_log
+    await _write_planner_reflection(
+        workspace,
+        iteration,
+        refreshed_snapshot,
+        coverage,
+        refreshed_gap_log,
+    )
 
     # Budget guard: update this round's sq_counts; write any still-underfunded SQs to gap-log
     updated_sq_counts = dict(sq_counts)
@@ -327,7 +433,7 @@ async def phase1a_search(state: ResearchState) -> dict:
 # Stage 1: Planner — produces the query list
 # ---------------------------------------------------------------------------
 
-_PLANNER_SYSTEM = """You are the research-search Planner. Given the research plan and current coverage, produce the list of search queries to run next round.
+_PLANNER_SYSTEM = FOCUSED_EXEC_PROMPT + """You are the research-search Planner. Given the research plan and current coverage, produce the list of search queries to run next round.
 
 ## Responsibilities
 - Only plan queries; do not execute searches.
@@ -347,6 +453,7 @@ _PLANNER_SYSTEM = """You are the research-search Planner. Given the research pla
 - `serper_tw`: Google Traditional Chinese (zh-TW query only; do not mix with brave/serper_en)
 - `serper_cn`: Google China
 - `serper_scholar`: dedicated Google Scholar API — returns pdfUrl + citation counts + publicationInfo; use this (not a `site:arxiv.org` web hack) for every E-type academic query
+- `arxiv`: direct arxiv.org API — canonical arxiv_id + published date, free and no API-key budget; pair with `serper_scholar` on E-type queries that look for papers (not repos). Catches recent preprints that Scholar has not yet indexed.
 
 ## Output (strict JSON, no other text)
 ```json
@@ -369,7 +476,7 @@ Beyond advocate / critic, each subquestion needs at least **2 discovery queries*
 | B competitors  | `alternative to {known tool} {YEAR}` / `{known tool} competitors {YEAR}` | brave, serper_en |
 | C local (Taiwan) | `{topic} <Traditional Chinese recommendation phrase>` / `site:ithome.com.tw {topic}` | serper_tw (this engine only) |
 | D community    | `site:reddit.com {topic} {YEAR} recommendation` | serper_en |
-| E academic / source | `{entity} arxiv` / `{entity} github` / `{entity} paper pdf` | serper_scholar, brave |
+| E academic / source | `{entity} arxiv` / `{entity} paper pdf` → `arxiv, serper_scholar, brave`; `{entity} github` → `github, brave, serper_en` | (see inline) |
 
 Rules:
 - Every subquestion must cover at least category A + category C; categories B and D as budget allows.
@@ -377,11 +484,15 @@ Rules:
 - If the Gap Log introduces a new tool name in a later round, add a category-B query for it.
 - When the user_msg contains a "newly discovered entities" field, **produce at least 1 B-type follow-up query per entity** (e.g. `{entity name} review {YEAR}` or `alternative to {entity name}`).
 - **Hard rule for academic / paper topics**: when the research involves keywords like paper, model, agent, SOTA, framework, or benchmark, **every entity in the `known tools` field must have at least 1 category-E query** (arxiv or github, pick one); these queries do not need a zh-TW counterpart.
-- **Year-bias rule for academic topics**: when the research involves paper / arxiv / SOTA / benchmark / framework / model comparison, **category E queries MUST NOT append `{YEAR}`**. Leading papers are often from prior years (e.g. AIDE 2024, MLE-bench 2024) and appending the current year silently excludes them from results. Category A/B/D still append {YEAR} (those track timely tools/prices/alternatives, not paper publication).
+- **Year-window policy** (relative time windows, NOT hardcoded single year):
+  - **Academic / SOTA / paper / benchmark topics** (categories E, and any A/B/D query about specific models/frameworks/papers): **do NOT append any year**. Leading papers are often from prior years (e.g. AIDE 2024, MLE-bench 2024); hardcoding `{YEAR}` silently excludes them.
+  - **Tool comparison / "best X" / alternatives / reviews** (categories A, B when they target living products): append the 2-year window `{LAST_2_YEARS}` (e.g. `best LLM coding agent 2025..2026`) — this captures current tools without missing last year's dominant option.
+  - **Trend / forecast / prediction / "2026 outlook"** (typically category A forecast phrasing, D community predictions): append the single `{YEAR}` — these queries genuinely mean "this year".
+  - **When in doubt, drop the year**. Over-specifying the year is the #1 cause of missed SOTA results; under-specifying costs at most 1 extra result page.
 - **Off-topic gap rule**: when the Gap Log flags a subquestion with `[OFF_TOPIC_RATIO >= 0.5]`, do NOT reuse that SQ's previous angles; rewrite from a different angle (e.g. switch advocate phrasing, target a different sub-aspect, or use a different entity). Producing minor rewordings that repeat the same angle counts as a rule violation.
 - **Per-SQ S_t rule** (Tongyi-style evolving state): the "Per-SQ evidence snapshot from last iteration (S_t)" section shows which SQs already have LIVE evidence (title + URL listed) and which still have `no LIVE evidence yet`. For SQs already covered by LIVE evidence, do NOT re-ask queries whose answers are visibly satisfied — probe the remaining gaps instead (missing sub-aspects, contradictions, newer evidence). For SQs marked `no LIVE evidence yet`, treat them as highest priority and rewrite the query angle aggressively.
 - **Adversarial hard rule**: every subquestion must emit at least 1 query whose `role` is `critic` AND whose wording directly attacks the subquestion's premise. Acceptable phrasings: `"{subquestion topic} failures"`, `"why {approach} does not work"`, `"criticism of {approach}"`, `"{approach} antipattern"`, `"{approach} vs alternatives"`. This is separate from general "limitations" queries — it must name a concrete failure mode or alternative. A subquestion with only advocate + generic limitation queries violates this rule.
-- Use the {YEAR} value from the user_msg's "this round's year" field.
+- Use the `{YEAR}` and `{LAST_2_YEARS}` values from the user_msg's "this round's time window" field.
 
 ## Taiwan source locking
 When the research topic concerns Taiwan, prefer these site: prefixes to produce precise Traditional-Chinese queries:
@@ -462,12 +573,26 @@ Refetch requirements:
     else:
         known_tools_section = ""
 
-    # Current year (used for the {YEAR} placeholder in Discovery Queries)
-    year_section = (
-        f"\n## This round's year\n- Current year: {current_year or '2026'} "
-        "(use this number for year values inside queries)\n"
-        if current_year else ""
-    )
+    # Time windows for Discovery Queries.
+    #   {YEAR}         → current year (trend/forecast queries only)
+    #   {LAST_2_YEARS} → e.g. "2025..2026" (tool-comparison queries)
+    # Academic / SOTA / paper / benchmark queries append NEITHER; see the
+    # Year-window policy in _PLANNER_SYSTEM.
+    if current_year:
+        try:
+            cy = int(current_year)
+            last_2_years = f"{cy - 1}..{cy}"
+        except (TypeError, ValueError):
+            cy = 2026
+            last_2_years = "2025..2026"
+        year_section = (
+            f"\n## This round's time window\n"
+            f"- `{{YEAR}}` = {current_year} (use for trend/forecast queries)\n"
+            f"- `{{LAST_2_YEARS}}` = {last_2_years} (use for tool-comparison queries)\n"
+            f"- Academic / SOTA / paper / benchmark queries: append neither.\n"
+        )
+    else:
+        year_section = ""
 
     # newly discovered entities (extracted by _extract_emerging_entities from the prior round's results)
     if emerging_entities:
@@ -550,6 +675,112 @@ Produce the query list to run this round."""
             "engines": q.get("engines") or ["brave", "serper_en"],
         })
     return {"queries": clean}
+
+
+# ---------------------------------------------------------------------------
+# Duplicate query rollback (MiroThinker-style)
+# ---------------------------------------------------------------------------
+# Planner's prompt asks it to dedupe against already_searched, but LLMs still
+# paraphrase. Cross-round detection here catches the paraphrase cases and drops
+# them pre-execution so search budget is not wasted on near-identical queries.
+
+def _detect_duplicate_queries(
+    llm_queries: list[dict],
+    already_searched: list[str],
+    ratio: float = 0.9,
+) -> tuple[list[dict], list[dict]]:
+    """Separate planned queries into (kept, dropped) based on similarity to prior rounds.
+
+    A query is dropped if:
+      - normalized form matches any prior-round normalized form, OR
+      - SequenceMatcher ratio against any prior query >= `ratio` (default 0.9)
+
+    The 0.9 threshold is looser than the claim-dedup default (0.92) because query
+    text is short (5-10 words) and even minor rewording changes ratio a lot.
+    """
+    prior_norm: set[str] = {normalize_for_dedup(q) for q in already_searched if q}
+    prior_raw: list[str] = [q for q in already_searched if q]
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for q in llm_queries:
+        qtext = (q.get("query") or "").strip()
+        if not qtext:
+            continue
+        qnorm = normalize_for_dedup(qtext)
+        if qnorm in prior_norm:
+            dropped.append(q)
+            continue
+        if any(is_near_duplicate(qtext, prev, ratio=ratio) for prev in prior_raw):
+            dropped.append(q)
+            continue
+        kept.append(q)
+        # Extend across within-batch paraphrases: subsequent queries must dedupe
+        # against the ones we already accepted this round, not just prior rounds.
+        prior_norm.add(qnorm)
+        prior_raw.append(qtext)
+    return kept, dropped
+
+
+def _log_duplicate_rollback(workspace: str, iteration: int, dropped: list[dict]) -> None:
+    """Write a `[DUPLICATE ROLLBACK]` entry to gap-log so next round's planner sees it.
+
+    Rule enforced downstream: an SQ that accumulates 5 consecutive rounds of
+    duplicate rollback is treated as stuck. The planner's prompt (off_topic_gap
+    rule) already requires switching angle after such signals — we add one more
+    surface here.
+    """
+    if not dropped:
+        return
+    from collections import Counter
+    sq_counts = Counter(q.get("subquestion", "Q?") for q in dropped)
+    lines = [
+        f"\n\n## [DUPLICATE ROLLBACK] round {iteration + 1}",
+        "Planner produced queries that near-duplicate prior rounds' queries "
+        "(normalize or SequenceMatcher >= 0.9). Dropped before execution:",
+    ]
+    for sq, cnt in sq_counts.most_common():
+        sample = next(
+            (q.get("query", "") for q in dropped if q.get("subquestion") == sq),
+            "",
+        )
+        lines.append(f"- **{sq}**: {cnt} duplicate queries dropped (e.g. `{sample[:80]}`)")
+    lines.append(
+        "Next round MUST switch angle for these SQs — not just reword synonyms. "
+        "Acceptable switches: different sub-aspect, new entity, opposing stance, "
+        "different time-window, or different source type (paper vs blog vs forum)."
+    )
+    append_workspace_file(workspace, "gap-log.md", "\n".join(lines) + "\n")
+
+
+def _count_consecutive_stuck_rounds(gap_log: str, sq: str) -> int:
+    """Count how many of the most-recent rounds tagged `[DUPLICATE ROLLBACK]`
+    for this SQ consecutively (without an intervening round that did NOT
+    trigger a rollback).
+
+    Used by the planner caller to escalate to `[STUCK]` at >= 5.
+    """
+    if not gap_log or not sq:
+        return 0
+    rounds = re.findall(
+        r"^## \[DUPLICATE ROLLBACK\] round (\d+)([\s\S]*?)(?=^## |\Z)",
+        gap_log,
+        re.MULTILINE,
+    )
+    if not rounds:
+        return 0
+    rounds.sort(key=lambda x: int(x[0]), reverse=True)
+    consecutive = 0
+    expected = int(rounds[0][0])
+    for num_str, body in rounds:
+        num = int(num_str)
+        if num != expected:
+            break
+        if f"**{sq}**" in body:
+            consecutive += 1
+            expected -= 1
+        else:
+            break
+    return consecutive
 
 
 def _extract_searched_queries(exec_log: str) -> list[str]:
@@ -826,6 +1057,227 @@ def _build_sq_evidence_snapshot(
     append_workspace_file(workspace, "sq-progress.md", "\n".join(lines) + "\n")
 
 
+# ---------------------------------------------------------------------------
+# Planner reflection (open_deep_research `think_tool` pattern)
+# ---------------------------------------------------------------------------
+# open_deep_research forces the planner to invoke a `think_tool` after every
+# batch of results, listing (a) what is still missing and (b) the next concrete
+# step. Without this forced reflection the planner drifts and produces queries
+# that don't target real gaps. We emulate it with a small structured LLM call
+# appended to `sq-progress.md` so the next round's planner reads both the raw
+# evidence snapshot AND the explicit reflection.
+
+_REFLECTION_SYSTEM = """You are a research-loop reflector. Given the current
+per-SQ evidence snapshot, coverage checklist, and gap log, produce a brief
+reflection that the NEXT iteration's planner will read.
+
+For each subquestion (Q1, Q2, ...) that still lacks coverage or strong evidence,
+output exactly this block:
+
+- **{SQ}**:
+  - missing: <what concrete sub-aspect / entity / data point is not yet covered>
+  - next step: <one specific query angle or source type to try next round — name entities or site:/API switches>
+
+Rules:
+- Be terse — one short line per field, <= 25 words each.
+- Do NOT list SQs that already have 3+ LIVE sources AND are marked done in coverage.
+- Prefer concrete names (tool name, paper title, domain) over vague phrases.
+- If the same SQ has been `[DUPLICATE ROLLBACK]`-tagged recently, the next step
+  MUST be a new angle (different sub-aspect, entity, or source type) — not a rewording.
+
+Output raw markdown only (no code fences, no preamble)."""
+
+
+async def _write_planner_reflection(
+    workspace: str,
+    iteration: int,
+    sq_progress_snapshot: str,
+    coverage: str,
+    gap_log: str,
+) -> None:
+    """Append `## Iteration N — planner reflection` to sq-progress.md.
+
+    Called right after `_build_sq_evidence_snapshot`. Errors are swallowed
+    (reflection is a nice-to-have, not a hard dependency).
+    """
+    if not sq_progress_snapshot and not coverage:
+        return
+    user_msg = (
+        f"## Per-SQ evidence snapshot (this round)\n{sq_progress_snapshot or '(empty)'}\n\n"
+        f"## Coverage checklist\n{coverage or '(empty)'}\n\n"
+        f"## Gap log (recent)\n{gap_log[-4000:] if gap_log else '(empty)'}\n\n"
+        "Produce the reflection now."
+    )
+    try:
+        response = await safe_ainvoke_chain(
+            role="verifier",
+            messages=[
+                SystemMessage(content=_REFLECTION_SYSTEM),
+                HumanMessage(content=user_msg),
+            ],
+            max_tokens=2048,
+            temperature=0.2,
+        )
+        body = (response.content or "").strip()
+        if not body:
+            return
+        append_workspace_file(
+            workspace,
+            "sq-progress.md",
+            f"\n\n## Iteration {iteration + 1} — planner reflection\n"
+            "<!-- think_tool-style reflection: explicit 'missing + next step' per SQ, "
+            "read by the next round's planner. -->\n"
+            f"{body}\n",
+        )
+    except Exception as e:
+        logger.warning("planner reflection skipped (%s)", e)
+
+
+# ---------------------------------------------------------------------------
+# Source-pool curator (gpt-researcher `skills/curator.py` pattern)
+# ---------------------------------------------------------------------------
+# gpt-researcher's SourceCurator asks an LLM to score each candidate source and
+# prune marketing/off-topic pages before spending expensive generation on them.
+# We run the curator AFTER extraction (post-hoc scoring) so it only annotates
+# rather than blocks — phase1b can consume the scores later to tighten Bedrock
+# grounding thresholds on low-scoring sources. Annotation-only keeps the blast
+# radius small for the first PR.
+
+_CURATOR_SYSTEM = FOCUSED_EXEC_PROMPT + """You are a source-pool curator. Given the research goal
+(plan + coverage) and a list of fetched sources (id, url, title, tier, short
+snippet, claim count), score each source on three dimensions:
+
+- relevance   (0-5): how directly does this source address the plan's subquestions?
+- credibility (0-5): source tier (T1/T2 > T3/T4 > T5/T6), author identifiability, publisher reputation.
+- quant_value (0-5): does the source carry specific numbers/benchmarks/dates we can cite? (0 = pure opinion, 5 = data paper)
+
+Return STRICT JSON, no other text:
+```json
+{"scores":[{"source_id":"S001","relevance":4,"credibility":3,"quant_value":2,"note":"12 words max — one-line reason"}, ...]}
+```
+
+Rules:
+- Output one entry per input source_id — do not skip, do not invent new IDs.
+- note <= 12 words; use hints such as "off-topic marketing", "seminal paper",
+  "blog summary of a real paper", "forum anecdote".
+- If a source is clearly off-topic for every subquestion, give relevance=0."""
+
+
+async def _curate_sources(
+    raw_sources: list[dict],
+    extractions: list[dict],
+    plan: str,
+    coverage: str,
+) -> list[dict]:
+    """Score each fetched source on relevance/credibility/quant_value.
+
+    Returns list shaped like:
+      [{"source_id":"S001","relevance":4,"credibility":3,"quant_value":2,"note":"..."}, ...]
+    The caller writes these scores to `source-curation.md` and a low-score
+    warning to gap-log if average < 2.0.
+    """
+    # Only score sources that actually made it through fetching (skip UNREACHABLE).
+    live_sources = [s for s in raw_sources if s.get("content") or s.get("status") == "THIN_CONTENT"]
+    if not live_sources:
+        return []
+    claim_counts = {e.get("source_id", ""): len(e.get("claims", []) or []) for e in extractions}
+
+    bullet_lines = []
+    for s in live_sources:
+        sid = s.get("source_id", "S???")
+        url = s.get("url", "")
+        title = (s.get("title") or "")[:100]
+        snippet = (s.get("content") or "")[:300].replace("\n", " ")
+        tier = classify_tier(url, title, s.get("content") or "") if s.get("status") != "THIN_CONTENT" else "T6"
+        bullet_lines.append(
+            f"- {sid} | tier {tier} | {s.get('subquestion', '?')}/{s.get('role', '?')} "
+            f"| {url}\n  title: {title}\n  claims: {claim_counts.get(sid, 0)}\n  snippet: {snippet}"
+        )
+    user_msg = (
+        f"## Research plan\n{plan[:3000]}\n\n"
+        f"## Coverage checklist\n{coverage[:2000]}\n\n"
+        f"## Fetched sources (score every one)\n" + "\n".join(bullet_lines)
+    )
+    try:
+        response = await safe_ainvoke_chain(
+            role="verifier",
+            messages=[
+                SystemMessage(content=_CURATOR_SYSTEM),
+                HumanMessage(content=user_msg),
+            ],
+            max_tokens=4096,
+            temperature=0.1,
+        )
+        json_match = re.search(r"\{[\s\S]*\}", response.content or "")
+        if not json_match:
+            return []
+        data = json.loads(json_match.group())
+    except (json.JSONDecodeError, Exception) as e:
+        logger.warning("source curator skipped (%s)", e)
+        return []
+
+    # Normalise and clip scores
+    scores = []
+    seen_ids: set[str] = set()
+    for item in data.get("scores", []):
+        sid = (item.get("source_id") or "").strip()
+        if not sid or sid in seen_ids:
+            continue
+        seen_ids.add(sid)
+        try:
+            rel = max(0, min(5, int(item.get("relevance", 0))))
+            cred = max(0, min(5, int(item.get("credibility", 0))))
+            quant = max(0, min(5, int(item.get("quant_value", 0))))
+        except (TypeError, ValueError):
+            continue
+        note = (item.get("note") or "").strip()[:100]
+        scores.append({
+            "source_id": sid,
+            "relevance": rel,
+            "credibility": cred,
+            "quant_value": quant,
+            "note": note,
+        })
+    return scores
+
+
+def _write_source_curation(workspace: str, iteration: int, scores: list[dict]) -> None:
+    """Write source curator scores to `source-curation.md`.
+
+    One cumulative file (append-only) so later phases can read the full scoring
+    history. Low-scoring sources (avg < 2.0) also get a warning in gap-log so
+    the planner/phase2 know to treat their claims with caution.
+    """
+    if not scores:
+        return
+    header_needed = not (
+        read_workspace_file(workspace, "source-curation.md") or ""
+    ).startswith("| source_id")
+    lines: list[str] = []
+    if header_needed:
+        lines.append(
+            "| source_id | round | relevance | credibility | quant_value | avg | note |\n"
+            "|-----------|-------|-----------|-------------|-------------|-----|------|"
+        )
+    low: list[tuple[str, float]] = []
+    for s in scores:
+        avg = (s["relevance"] + s["credibility"] + s["quant_value"]) / 3
+        lines.append(
+            f"| {s['source_id']} | {iteration + 1} | {s['relevance']} "
+            f"| {s['credibility']} | {s['quant_value']} | {avg:.2f} | {s['note']} |"
+        )
+        if avg < 2.0:
+            low.append((s["source_id"], avg))
+    append_workspace_file(workspace, "source-curation.md", "\n".join(lines) + "\n")
+
+    if low:
+        warn = [f"\n\n## [CURATOR WARNING] low-quality sources (round {iteration + 1})"]
+        warn.append("<!-- avg < 2.0 on relevance/credibility/quant_value — phase1b should tighten grounding thresholds. -->")
+        for sid, avg in low:
+            warn.append(f"- {sid}: avg {avg:.2f}")
+        append_workspace_file(workspace, "gap-log.md", "\n".join(warn) + "\n")
+
+
 def _log_budget_gaps(
     workspace: str,
     iteration: int,
@@ -1043,9 +1495,13 @@ def _seed_paper_queries(
     queries: list[dict] = []
     idx = 0
     for kind in ("arxiv", "github"):
+        # ``github`` and ``arxiv`` are now first-class engines with direct
+        # API calls (see _run_single_search). Web-search engines stay as
+        # secondary fallbacks in case the official API is rate-limited or
+        # returns an empty set.
         engines = (
-            ["serper_scholar", "brave"] if kind == "arxiv"
-            else ["brave", "serper_en"]
+            ["arxiv", "serper_scholar", "brave"] if kind == "arxiv"
+            else ["github", "brave", "serper_en"]
         )
         for entity in entities:
             if len(queries) >= budget_cap:
@@ -1212,6 +1668,9 @@ async def _execute_searches(
 
 async def _run_single_search(query: str, engine: str) -> list[dict]:
     """Dispatch to the appropriate underlying search function for each engine."""
+    # Scholar-intent queries on generic web engines get an auto site: filter
+    # (Whisper P1-6) — see _maybe_upgrade_to_scholar_query for rationale.
+    query = _maybe_upgrade_to_scholar_query(query, engine)
     try:
         if engine == "brave":
             return await brave_search(query, count=10)
@@ -1226,6 +1685,18 @@ async def _run_single_search(query: str, engine: str) -> list[dict]:
             # gives us publication info, citation counts, and pdf links that
             # generic web search strips out.
             return await serper_scholar(query, num=10)
+        if engine == "arxiv":
+            # Direct arxiv API — no key needed, returns canonical arxiv_id +
+            # published date so validate_arxiv_id can later confirm it's real.
+            # Complements serper_scholar: catches papers Google Scholar hasn't
+            # indexed yet (new arxiv submissions lag in Scholar by days/weeks).
+            return await arxiv_search(query, max_results=10)
+        if engine == "github":
+            # Direct GitHub search — bypasses generic-web ranking that
+            # frequently misses canonical repos (failed-workspace had AIDE,
+            # MLE-Agent, ResearchAgent buried under marketing blogs).
+            # Sort by stars to surface the authoritative repo card.
+            return await github_repo_search(query, max_results=10, sort="stars")
     except Exception:
         return []
     return []
@@ -1414,7 +1885,7 @@ async def _fetch_one(item: dict, idx: int) -> tuple[str, str]:
 # Stage 3: Extractor — independent LLM per source, fresh context
 # ---------------------------------------------------------------------------
 
-_EXTRACTOR_SYSTEM = """You are a precise transcriber. Extract evidence relevant to the subquestion from a single source document.
+_EXTRACTOR_SYSTEM = FOCUSED_EXEC_PROMPT + """You are a precise transcriber. Extract evidence relevant to the subquestion from a single source document.
 
 ## Task
 For this one source document, in this exact order:
@@ -2194,6 +2665,21 @@ def _collect_claims(extractions: list[dict], existing_claims: list | None = None
 
     for ext in extractions:
         sid = ext.get("source_id", "S???")
+        # Build per-source lookup so each claim's quote_ids can be resolved to
+        # verbatim text. Both quotes (text field) and numbers (sentence field)
+        # are referenced by claims via a shared quote_ids list — we merge them.
+        qid_to_text: dict[str, str] = {}
+        for q in ext.get("quotes", []) or []:
+            qid = (q.get("quote_id") or "").strip()
+            txt = (q.get("text") or "").strip()
+            if qid and txt:
+                qid_to_text[qid] = txt
+        for n in ext.get("numbers", []) or []:
+            nid = (n.get("number_id") or "").strip()
+            sent = (n.get("sentence") or "").strip()
+            if nid and sent:
+                qid_to_text[nid] = sent
+
         for c in ext.get("claims", []):
             subq = c.get("subquestion", "Q1")
             claim_text = (c.get("claim_text") or "").strip()
@@ -2212,13 +2698,21 @@ def _collect_claims(extractions: list[dict], existing_claims: list | None = None
             ctype = c.get("claim_type", "qualitative")
             if ctype not in ("numeric", "comparative", "causal", "forecast", "qualitative"):
                 ctype = "qualitative"
+
+            # Resolve quote_ids -> verbatim snippets so downstream MARCH blind
+            # check sees original text (not opaque `S001-Q3` IDs). Keep the ID
+            # list for backwards compatibility; evidence_quotes is additive.
+            qids = c.get("quote_ids", [])
+            evidence = [qid_to_text[q] for q in qids if q in qid_to_text]
+
             out.append(Claim(
                 claim_id=claim_id,
                 subquestion=subq,
                 claim_text=claim_text,
                 claim_type=ctype,
                 source_ids=[sid],
-                quote_ids=c.get("quote_ids", []),
+                quote_ids=qids,
+                evidence_quotes=evidence,
                 status="pending",
             ))
 

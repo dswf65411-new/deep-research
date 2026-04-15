@@ -10,10 +10,11 @@ from deep_research.nodes.phase1a import _PLANNER_SYSTEM
 
 
 def test_prompt_has_year_bias_rule():
-    """The exact phrase used in the rule should appear so downstream tooling
-    can grep for it if the prompt ever gets rewritten."""
-    assert "Year-bias rule for academic topics" in _PLANNER_SYSTEM
-    assert "MUST NOT append `{YEAR}`" in _PLANNER_SYSTEM
+    """The exact phrases used in the rule should appear so downstream tooling
+    can grep for them if the prompt ever gets rewritten."""
+    # The policy block heading and the key imperative for academic topics.
+    assert "Year-window policy" in _PLANNER_SYSTEM
+    assert "do NOT append any year" in _PLANNER_SYSTEM
 
 
 def test_prompt_cites_prior_year_examples():

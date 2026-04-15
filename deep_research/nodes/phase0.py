@@ -47,6 +47,12 @@ DEPTH_CONFIG = {
 # Default question limit per round
 DEFAULT_MAX_QUESTIONS = 10
 
+# Whisper P3-1 — split clarify into staged rounds.
+# Round 1 asks only the top scope/priority questions so the user isn't buried
+# under ten ambiguous items; the Judge-driven follow-ups (round 2+) go deep
+# on whatever still isn't clear.
+FIRST_ROUND_CORE_CAP = 3
+
 # QA compaction threshold: when exceeded, older rounds are compressed into a topic list
 QA_COMPACT_THRESHOLD = 15
 QA_KEEP_LATEST = 5
@@ -129,11 +135,27 @@ async def generate_questions(
     """
     context = _compact_clarifications(existing_clarifications)
 
-    round_note = ""
-    if round_num > 1:
+    # P3-1: round 1 is deliberately narrow — just enough to nail scope &
+    # priority — so the user isn't overwhelmed. The Judge's follow-ups in
+    # later rounds handle depth. ``effective_max`` becomes the cap for both
+    # the prompt and the downstream slice.
+    if round_num == 1:
+        effective_max = min(max_questions, FIRST_ROUND_CORE_CAP)
         round_note = (
-            f"\nThis is clarification round {round_num}. Based on the previous rounds' answers, "
-            "dig deeper or cover any aspects still missing.\n"
+            f"\nThis is clarification round 1 — the *scoping* round. Ask the "
+            f"{effective_max} single most important questions that lock down "
+            "research scope, decision priority, and success criteria. Do NOT "
+            "ask for tech-stack details, budget, team size, or other narrow "
+            "constraints yet — those are for later rounds if the judge deems "
+            "them needed.\n"
+        )
+    else:
+        effective_max = max_questions
+        round_note = (
+            f"\nThis is clarification round {round_num} — the *depth* round. "
+            "Round 1 already locked down scope and priority. Now dig into the "
+            "specific aspects the judge flagged as still unclear, or ask "
+            "concrete follow-ups that unblock downstream planning.\n"
         )
 
     system_msg = SystemMessage(content=f"""You are the clarification module of a deep-research planner.
@@ -142,7 +164,7 @@ Given the user's research topic, decide whether clarification is needed. Ask gen
 
 Only return an empty `questions` array when the topic is fully clear on every aspect.
 {round_note}
-Generate at most {max_questions} questions. Each question must state "why do we need to know this".
+Generate at most {effective_max} questions. Each question must state "why do we need to know this".
 
 Consider the following aspects (only ask what's needed):
 1. Research purpose: making a decision? writing a report? learning? solving a concrete problem?
@@ -182,7 +204,7 @@ If no further questions are needed:
     except (json.JSONDecodeError, AttributeError):
         parsed = {"questions": [], "reasoning": "parse_error"}
 
-    questions = parsed.get("questions", [])[:max_questions]
+    questions = parsed.get("questions", [])[:effective_max]
     return questions, parsed.get("reasoning", "")
 
 

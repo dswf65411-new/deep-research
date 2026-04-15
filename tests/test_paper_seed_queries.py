@@ -47,12 +47,19 @@ class TestBasic:
     def test_arxiv_engines(self):
         out = _seed_paper_queries(["AIDE"], ["Q1"], budget_cap=10)
         arxiv_q = next(q for q in out if q["query"] == "AIDE arxiv")
-        assert set(arxiv_q["engines"]) == {"serper_scholar", "brave"}
+        assert set(arxiv_q["engines"]) == {"arxiv", "serper_scholar", "brave"}
+        # arxiv must be first so the free API is tried before Serper.
+        assert arxiv_q["engines"][0] == "arxiv"
 
     def test_github_engines(self):
         out = _seed_paper_queries(["AIDE"], ["Q1"], budget_cap=10)
         github_q = next(q for q in out if q["query"] == "AIDE github")
-        assert set(github_q["engines"]) == {"brave", "serper_en"}
+        # P1-4: github is now a first-class engine with its own API call, web
+        # search engines stay as secondary fallbacks.
+        assert set(github_q["engines"]) == {"github", "brave", "serper_en"}
+        assert github_q["engines"][0] == "github", (
+            "github must be first so the official API is tried before fallbacks"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -93,6 +93,9 @@ _T2_DOMAINS: frozenset[str] = frozenset({
     "neurips.cc",
     "icml.cc",
     "iclr.cc",
+    # PapersWithCode — SOTA tracking + paper↔repo linking; treated as
+    # academic-adjacent curation rather than a marketing blog.
+    "paperswithcode.com",
 })
 
 # TLD patterns for academic: .edu, .edu.tw, .ac.uk, .ac.jp, .ac.tw …
@@ -166,6 +169,36 @@ _T5_DOMAINS: frozenset[str] = frozenset({
 
 
 # ---------------------------------------------------------------------------
+# Low-info zh-TW / zh-CN domains — Whisper plan P1-5
+# ---------------------------------------------------------------------------
+# Domains that publish high-volume, low-signal "2026 X 趨勢 / 你必須知道"
+# style listicles. In the failed-workspace run 84.5% of sources came from
+# exactly this class of blog. These are NOT academic, NOT first-party, and
+# NOT reviewed engineering writeups — they're content-mill output.
+# Classifying them as T5 (same bucket as UGC) means:
+#   - They still get fetched when nothing better is available;
+#   - They never outrank a genuine T1–T3 source in ``tier_rank`` ordering;
+#   - ``_log_domain_bias`` will still flag over-concentration if a run is
+#     dominated by one.
+_LOW_INFO_ZH_DOMAINS: frozenset[str] = frozenset({
+    # Large-portal news aggregators — mostly syndicated marketing copy.
+    "tw.news.yahoo.com",
+    "news.yahoo.com",
+    "tw.stock.yahoo.com",
+    # Vendor-run blogs republished as "insight articles".
+    "ibm.com",
+    # Content-mill republishers (reposts of Weibo / WeChat click-bait).
+    "kknews.cc",
+    "toutiao.com",
+    "sohu.com",
+    "163.com",
+    "sina.com.cn",
+    "cnbeta.com",
+    "iask.ca",
+})
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -178,12 +211,61 @@ def _hostname(url: str) -> str:
         return ""
 
 
+def _path(url: str) -> str:
+    """Extract the URL path (lowercase, without query/fragment)."""
+    try:
+        parsed = urlparse(url if "://" in url else "https://" + url)
+        return (parsed.path or "").lower()
+    except Exception:
+        return ""
+
+
 def _matches(hostname: str, domain_set: frozenset[str]) -> bool:
     """True if hostname equals or is a subdomain of any entry in domain_set."""
     for d in domain_set:
         if hostname == d or hostname.endswith("." + d):
             return True
     return False
+
+
+# GitHub repo root + docs pages count as T2 (canonical README / wiki /
+# architecture docs are first-party-quality descriptions of the software).
+# Deep source-code URLs stay at T4 — the pipeline is not trying to consume
+# raw code as a research claim. ``github.blog`` is editorial marketing and
+# is left to fall through to T4.
+#
+# Match examples:
+#   github.com/user/repo                    → T2 (repo root)
+#   github.com/user/repo/                   → T2
+#   github.com/user/repo/blob/main/README.md → T2 (README)
+#   github.com/user/repo/wiki               → T2 (wiki)
+#   github.com/user/repo/tree/main/docs     → T2 (docs tree)
+#   github.com/user/repo/blob/main/src/x.py → T4 (not matched)
+_GITHUB_T2_PATH_RE: re.Pattern = re.compile(
+    r"^/[^/]+/[^/]+(?:"
+    r"/?$"                                   # repo root (optional trailing slash)
+    r"|/blob/[^/]+/readme(?:\.[a-z]+)?$"      # README.*
+    r"|/tree/[^/]+/docs(?:/|$)"               # /docs/ tree
+    r"|/blob/[^/]+/docs/"                     # file under docs/
+    r"|/wiki(?:/|$)"                          # wiki
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_github_t2(host: str, path: str) -> bool:
+    """True for github.com URLs that carry curated, T2-grade documentation.
+
+    Keep permissive but not sloppy:
+      - github.com only (NOT github.blog / github.io – those have their own rules)
+      - ``user/repo`` root (landing page is effectively the README)
+      - Explicit README.* blobs
+      - /wiki/... and /docs/... trees
+    Everything else (raw source files, issues, pulls, actions, …) stays T4.
+    """
+    if host != "github.com":
+        return False
+    return bool(_GITHUB_T2_PATH_RE.match(path))
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +295,7 @@ def classify_tier(
     host = _hostname(url)
     if not host:
         return "T4"
+    path = _path(url)
 
     # T1 — Official
     if _matches(host, _T1_DOMAINS):
@@ -225,6 +308,12 @@ def classify_tier(
         return "T2"
     if any(pat.search(host) for pat in _T2_TLD_PATTERNS):
         return "T2"
+    # T2 — *.github.io project pages (canonical docs published via GH Pages).
+    if host == "github.io" or host.endswith(".github.io"):
+        return "T2"
+    # T2 — github.com repo root / README / wiki / /docs (not raw source).
+    if _is_github_t2(host, path):
+        return "T2"
 
     # T3 — Taiwan professional media
     if _matches(host, _T3_TAIWAN_DOMAINS):
@@ -236,6 +325,12 @@ def classify_tier(
 
     # T5 — UGC / community
     if _matches(host, _T5_DOMAINS):
+        return "T5"
+
+    # T5 — Low-info zh-TW / zh-CN content mills (Whisper P1-5).
+    # Classified alongside UGC so they stay fetchable when nothing better is
+    # available, but never outrank T1–T3 in tier_rank ordering.
+    if _matches(host, _LOW_INFO_ZH_DOMAINS):
         return "T5"
 
     # T4 — Default

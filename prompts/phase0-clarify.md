@@ -6,6 +6,20 @@
 
 ---
 
+## Execution Mode: Focused Task Execution
+
+**Before producing any output, follow the `ref-focused-execution` contract:**
+
+1. First emit `[TASK LIST]` enumerating each step/substep you intend to do (e.g. T1 clarifying questions, T2 mode selection, T3.1 query enrichment for topic A, T3.2 for topic B, …).
+2. Then process tasks one by one wrapped in `[WORKING: T{n}]` / `[DONE: T{n}]` markers.
+3. Only after all tasks are done emit the final plan in the structured format required by the output schema (JSON if that's what the caller expects, markdown otherwise).
+
+Do NOT include the `[TASK LIST]`/`[WORKING]`/`[DONE]` scaffold inside the final JSON/markdown deliverable — they stay as plain-text scaffolding before the deliverable.
+
+See `prompts/ref-focused-execution.md` for full rules and rationale.
+
+---
+
 ## Step 1: Clarifying Questions
 
 Confirm with AskUserQuestion. Ask fewer questions when intent is clear, more when ambiguous. For each question, explain "why we need to know this".

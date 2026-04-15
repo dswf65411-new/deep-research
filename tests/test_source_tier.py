@@ -59,6 +59,68 @@ def test_t2_ac_tld():
 
 
 # ---------------------------------------------------------------------------
+# T2 — PapersWithCode + GitHub docs (Whisper plan P1-1)
+# ---------------------------------------------------------------------------
+#
+# Rationale: the failed-workspace analysis showed T1/T2 coverage collapsed
+# to 9% because high-signal research surfaces (PwC SOTA pages, repo READMEs,
+# github.io project pages) were silently dumped into T4 alongside marketing
+# blogs. These upgrades put them back into the high-quality tier that
+# downstream ranking actually rewards.
+
+@pytest.mark.parametrize("url", [
+    "https://paperswithcode.com/sota/image-classification-on-imagenet",
+    "https://paperswithcode.com/paper/gpt-4-technical-report",
+])
+def test_t2_paperswithcode(url):
+    assert classify_tier(url) == "T2", f"PapersWithCode should be T2, got {classify_tier(url)}"
+
+
+@pytest.mark.parametrize("url", [
+    # repo root landing page is effectively the README
+    "https://github.com/langchain-ai/langgraph",
+    "https://github.com/langchain-ai/langgraph/",
+    # explicit README blobs
+    "https://github.com/langchain-ai/langgraph/blob/main/README.md",
+    "https://github.com/langchain-ai/langgraph/blob/main/README",
+    "https://github.com/langchain-ai/langgraph/blob/main/readme.md",
+    # /docs/ tree and files
+    "https://github.com/langchain-ai/langgraph/tree/main/docs",
+    "https://github.com/langchain-ai/langgraph/blob/main/docs/architecture.md",
+    # wiki
+    "https://github.com/some/repo/wiki",
+    "https://github.com/some/repo/wiki/Home",
+])
+def test_t2_github_docs(url):
+    assert classify_tier(url) == "T2", f"GitHub docs URL should be T2: {url}"
+
+
+@pytest.mark.parametrize("url", [
+    "https://langchain-ai.github.io/langgraph/",
+    "https://some-project.github.io/reference/api.html",
+])
+def test_t2_github_io(url):
+    # Note: docs.*.github.io lands in T1 via the general docs. prefix rule,
+    # which is fine — docs subdomains are already curated official pages.
+    assert classify_tier(url) == "T2", f"github.io project pages should be T2: {url}"
+
+
+@pytest.mark.parametrize("url", [
+    # raw source code is not a research claim source
+    "https://github.com/langchain-ai/langgraph/blob/main/src/langgraph/graph.py",
+    "https://github.com/langchain-ai/langgraph/blob/main/tests/test_graph.py",
+    # issues / pulls / actions are noisy, keep as T4
+    "https://github.com/langchain-ai/langgraph/issues/1234",
+    "https://github.com/langchain-ai/langgraph/pull/5678",
+    # github.blog is editorial marketing, not docs
+    "https://github.blog/2024-01-01-some-announcement/",
+])
+def test_github_source_and_meta_stay_t4(url):
+    tier = classify_tier(url)
+    assert tier == "T4", f"{url} should stay T4, got {tier}"
+
+
+# ---------------------------------------------------------------------------
 # T3 — Taiwan professional media
 # ---------------------------------------------------------------------------
 

@@ -7,6 +7,7 @@ writes report sections with confidence levels.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from pathlib import Path
@@ -17,6 +18,7 @@ from deep_research.harness.claim_dedup import is_near_duplicate
 from deep_research.harness.validators import validate_claims_for_phase2, validate_numeric_claims
 from deep_research.harness.source_tier import tier_rank
 from deep_research.llm import get_llm, safe_ainvoke, safe_ainvoke_chain
+from deep_research.prompts_shared import FOCUSED_EXEC_PROMPT
 from deep_research.state import Claim, ResearchState, Source
 from deep_research.tools.workspace import (
     append_workspace_file,
@@ -225,6 +227,16 @@ async def phase2_integrate(state: ResearchState) -> dict:
     # BLOCKER list (written by trigger_fallback_node)
     all_blockers: list[str] = state.get("blockers", [])
 
+    # Critic-revise loop hints (gpt-researcher style).
+    # When phase2 is re-entered after phase2_review flagged issues, the
+    # prior verdict is surfaced to the writer as a "revise these problems"
+    # section in the system prompt. On the first pass both dicts are empty
+    # and no hint is injected.
+    prior_verdict: dict = state.get("review_verdict") or {}
+    revision_count: int = state.get("revision_count", 0)
+    per_sq_revision_hints: dict[str, list[str]] = prior_verdict.get("per_sq_issues") or {}
+    top_level_revision_hints: list[str] = prior_verdict.get("issues") or []
+
     async def _write_one_section(
         subq: str,
         subq_claims: list[Claim],
@@ -262,7 +274,29 @@ async def phase2_integrate(state: ResearchState) -> dict:
                 f"phase2/{subq}: LLM writer failed; wrote fallback section: {err[:200]}"
             ]
 
-        integrate_system = f"""{instructions}
+        # Revision hint — only present on revisions (revision_count > 0).
+        # Surfaces prior critic verdict so the writer knows exactly what to fix
+        # instead of regenerating the same flawed section from scratch.
+        revision_hint = ""
+        if revision_count > 0:
+            sq_issues = per_sq_revision_hints.get(subq, [])
+            if sq_issues or top_level_revision_hints:
+                parts = ["", "## Revision requested (round %d)" % revision_count]
+                if sq_issues:
+                    parts.append(f"The prior draft of {subq} was flagged for:")
+                    parts.extend(f"- {i}" for i in sq_issues)
+                if top_level_revision_hints:
+                    parts.append("")
+                    parts.append("General issues from the last critic pass:")
+                    parts.extend(f"- {i}" for i in top_level_revision_hints)
+                parts.append("")
+                parts.append(
+                    "Rewrite this section to address these problems. "
+                    "Keep the same structure and claim_id citations."
+                )
+                revision_hint = "\n".join(parts)
+
+        integrate_system = f"""{FOCUSED_EXEC_PROMPT}{instructions}
 
 You are the research report integrator. Based on the validated approved claims and source originals, generate a report section.
 
@@ -289,7 +323,7 @@ You may receive source documents in multiple rounds. Each round you must:
 3. Output the complete latest report section (not a diff).
 
 Language: English (keep technical terms verbatim).
-Please follow the Phase 2 Step 6 format to generate the report section for {subq}."""
+Please follow the Phase 2 Step 6 format to generate the report section for {subq}.{revision_hint}"""
 
         extra = f"""## Subquestion: {subq}
 
@@ -384,14 +418,126 @@ Please follow the Phase 2 Step 6 format to generate the report section for {subq
             f"\n\n## CRITICAL — Phase 2 empty output\n- {critical_msg}\n",
         )
 
+    # Whisper P2-4: mark coverage.chk in-sync with the sections that actually
+    # landed on disk, so phase3's coverage table and post-mortem auditing
+    # don't read stale "[ ] not_started" entries for SQs that did complete.
+    marked_sqs = _sync_coverage_checklist(workspace, sections_on_disk)
+
+    # Whisper P3-3: surface advocate/critic collisions into gap-log so the
+    # final report can't silently flatten both sides into a one-sided
+    # narrative. Keeps scope tight by only flagging SQs that *actually* have
+    # claims cited from both stakeholder roles.
+    try:
+        from deep_research.harness.stakeholder_collision import (
+            collect_collisions, format_collision_section,
+        )
+        collisions = collect_collisions(approved, state.get("sources", []))
+        section_text = format_collision_section(collisions)
+        if section_text:
+            append_workspace_file(workspace, "gap-log.md", "\n\n" + section_text)
+    except Exception as exc:  # noqa: BLE001 — defensive; never block phase2
+        logger.warning("stakeholder collision detector failed: %r", exc)
+
+    # Whisper X-1: flag same-upstream mirror clusters so downstream grounding
+    # doesn't count multiple copies of the same paper as independent
+    # confirmation. Purely additive: only appends to gap-log.
+    try:
+        from deep_research.harness.source_mirror import (
+            detect_mirror_groups, format_mirror_warnings,
+        )
+        mirror_groups = detect_mirror_groups(state.get("sources", []))
+        mirror_text = format_mirror_warnings(mirror_groups)
+        if mirror_text:
+            append_workspace_file(workspace, "gap-log.md", "\n\n" + mirror_text)
+    except Exception as exc:  # noqa: BLE001 — defensive; never block phase2
+        logger.warning("source mirror detector failed: %r", exc)
+
     return {
         "report_sections": report_sections,
         "blockers": blockers,
         "execution_log": [
             f"Phase 2 complete: {len(report_sections)} sections, {len(approved)} approved claims integrated"
             + (f" ({len(sections_on_disk)} files written)" if sections_on_disk else " (warning: report-sections is empty)")
+            + (f"; coverage.chk marked done for {', '.join(sorted(marked_sqs))}" if marked_sqs else "")
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# coverage.chk synchronisation (Whisper P2-4)
+# ---------------------------------------------------------------------------
+
+# Section filenames are ``q{N}_section.md`` (lowercase). We lift the Q id and
+# flip the matching ``- [ ] advocate — ...`` / ``- [ ] critic — ...`` rows.
+_SECTION_FILENAME_RE = re.compile(r"^(q\d+)(?:[_-]|$)", re.IGNORECASE)
+
+
+def _extract_sq_id_from_section_filename(name: str) -> str | None:
+    """Return the canonical ``Q{n}`` id for a section filename, else None."""
+    m = _SECTION_FILENAME_RE.match(name)
+    if not m:
+        return None
+    return m.group(1).upper()
+
+
+def _sync_coverage_checklist(workspace: str, sections_on_disk: list[Path]) -> set[str]:
+    """Rewrite coverage.chk so every SQ that produced a section is marked done.
+
+    Idempotent: running it twice is safe (already-done rows are left alone).
+    Returns the set of SQ ids that were flipped from not_started/in_progress
+    to done, for logging.
+    """
+    if not sections_on_disk:
+        return set()
+
+    ws = Path(workspace)
+    coverage_path = ws / "coverage.chk"
+    if not coverage_path.exists():
+        # phase0 should have written this; if it's missing, nothing to sync.
+        return set()
+
+    covered: set[str] = set()
+    for p in sections_on_disk:
+        sq = _extract_sq_id_from_section_filename(p.name)
+        if sq:
+            covered.add(sq)
+    if not covered:
+        return set()
+
+    original_text = coverage_path.read_text(encoding="utf-8")
+    new_lines: list[str] = []
+    current_sq: str | None = None
+    marked: set[str] = set()
+
+    # Match ``## Q7: description`` headers (case-insensitive, allow punctuation
+    # or whitespace after the id).
+    header_re = re.compile(r"^##\s+(Q\d+)\b", re.IGNORECASE)
+    # Match ``- [ ] advocate — not_started`` / ``- [ ] critic — in_progress``
+    # etc. Accept em-dash, hyphen, or ``-`` between role and state.
+    row_re = re.compile(
+        r"^(\s*-\s*)\[\s\]\s*(advocate|critic|perspective)\s*[—–-]\s*(\S+)\s*$",
+        re.IGNORECASE,
+    )
+
+    for line in original_text.splitlines():
+        header_m = header_re.match(line.strip())
+        if header_m:
+            current_sq = header_m.group(1).upper()
+            new_lines.append(line)
+            continue
+
+        row_m = row_re.match(line)
+        if row_m and current_sq and current_sq in covered:
+            prefix, role, _state = row_m.group(1), row_m.group(2), row_m.group(3)
+            new_lines.append(f"{prefix}[x] {role.lower()} — done")
+            marked.add(current_sq)
+            continue
+
+        new_lines.append(line)
+
+    if marked:
+        coverage_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    return marked
 
 
 def _gather_source_texts(
@@ -441,3 +587,212 @@ def _gather_source_texts(
                     break
 
     return result
+
+
+# =============================================================================
+# Phase 2 Review — gpt-researcher-style Critic-revise loop
+# =============================================================================
+#
+# Pattern: multi_agents/agents/editor.py:129-142 (EditorAgent._draft_article)
+# runs a reviewer → revisor cycle capped at max_revisions=2. Each revisor round
+# gets the critic's issues and rewrites targeted sections.
+#
+# Here the loop sits between phase2_integrate and phase3_report:
+#   phase2_integrate → phase2_review → (accept? phase3 : bump_revision → phase2)
+#
+# State plumbing is in state.py (`review_verdict`, `revision_count`); the graph
+# wiring lives in graph.py (route_after_review + bump_revision_count).
+
+MAX_REVISIONS = 2  # gpt-researcher default; aligns with their editor.py config
+
+_REVIEW_SYSTEM = FOCUSED_EXEC_PROMPT + """You are a research-report critic. You review drafted sections of a deep-research report and decide whether they ship, or need to be rewritten.
+
+Your job is NOT to rewrite anything. Output a strict JSON verdict only.
+
+## What passes ("accept": true)
+A section passes when ALL of these hold:
+1. It has substantive analysis — not just a bulleted claim dump (unless the dump is wrapped in the explicit "section integration failed, using fallback format" header, in which case treat it as a known-bad signal and reject).
+2. It directly answers the subquestion it belongs to. A section that drifts into unrelated topics is a failure even if the writing is polished.
+3. Every factual sentence ends with a claim_id marker like [Q1-C3].
+4. It does not quote claim_ids that are outside the approved-claim list you are given.
+5. It is not truncated: at least 200 chars of prose beyond the header, no mid-sentence cut-off.
+
+## What fails ("accept": false)
+Any of:
+- Section starts with "section integration failed, using fallback format" (writer crashed — needs retry).
+- Section is shorter than 200 chars of content, or ends mid-sentence.
+- Section cites fewer than 30% of the approved claims available for that SQ (wasting grounding work).
+- Section wanders off-topic (fewer than half of the factual sentences carry a claim_id matching this SQ).
+- A subquestion flagged in the research brief as the user's primary question has no substantive section.
+
+## Output — STRICT JSON, no markdown, no prose
+
+{
+  "accept": true | false,
+  "issues": ["top-level issue 1", "top-level issue 2"],
+  "per_sq_issues": {
+    "Q1": ["specific issue for Q1"],
+    "Q3": ["specific issue for Q3"]
+  }
+}
+
+Rules:
+- When `accept` is true, both `issues` and `per_sq_issues` may be empty.
+- When `accept` is false, `per_sq_issues` MUST list at least one failing subquestion with at least one concrete, actionable issue. Vague complaints ("quality is low") are not useful — name the specific problem ("Q3 cites only 2 of 14 approved claims and repeats the same point twice").
+"""
+
+
+async def phase2_review(state: ResearchState) -> dict:
+    """Critic pass over drafted report sections.
+
+    Reads every ``report-sections/*.md`` file on disk (the source of truth;
+    ``state["report_sections"]`` may be stale on a revise loop) and asks a
+    verifier LLM for a strict JSON verdict. Writes the verdict to
+    ``review-log.md`` for traceability.
+
+    The revision counter itself is bumped by the ``bump_revision_count`` node
+    in graph.py — this node only produces the verdict. When the verdict says
+    ``accept: false`` but ``revision_count`` already equals ``MAX_REVISIONS``,
+    graph's ``route_after_review`` still sends the pipeline to phase3 (no
+    infinite loops); this node reports honestly regardless.
+    """
+    workspace = state["workspace_path"]
+    current_count = state.get("revision_count", 0)
+
+    sections_dir = Path(workspace) / "report-sections"
+    section_files = sorted(sections_dir.glob("*.md")) if sections_dir.exists() else []
+
+    if not section_files:
+        # Nothing to review — don't block phase3; the empty-output case is
+        # already logged as a blocker by phase2_integrate.
+        verdict = {
+            "accept": True,
+            "issues": ["phase2 produced no sections; nothing to review"],
+            "per_sq_issues": {},
+        }
+        _write_review_log(workspace, current_count, verdict, note="no sections to review")
+        return {
+            "review_verdict": verdict,
+            "execution_log": [
+                f"Phase 2 review (revision {current_count}): no sections — pass-through"
+            ],
+        }
+
+    sections_text = "\n\n".join(
+        f"## File: {f.name}\n\n{f.read_text(encoding='utf-8')}"
+        for f in section_files
+    )
+
+    brief = read_workspace_file(workspace, "research-brief.md") or ""
+    if len(brief) > 4000:
+        brief = brief[:2000] + "\n\n...[middle omitted]...\n\n" + brief[-2000:]
+
+    # Digest of approved claims so the critic can check coverage (e.g. "Q3
+    # had 14 approved claims but the section cites only 2").
+    claims_raw = state.get("claims", [])
+    claim_objs = [c if isinstance(c, Claim) else Claim(**c) for c in claims_raw]
+    approved = [c for c in claim_objs if getattr(c, "status", None) == "approved"]
+    per_sq_summary: dict[str, int] = {}
+    for c in approved:
+        per_sq_summary[c.subquestion] = per_sq_summary.get(c.subquestion, 0) + 1
+    claim_digest = "\n".join(
+        f"- {sq}: {n} approved claims" for sq, n in sorted(per_sq_summary.items())
+    ) or "(no approved claims)"
+
+    human_content = f"""## Research brief
+{brief or '(no brief available)'}
+
+## Approved-claim counts by subquestion
+{claim_digest}
+
+## Drafted report sections
+{sections_text}
+
+## Revision round
+{current_count} (max {MAX_REVISIONS}). When revision_count already equals {MAX_REVISIONS}, the graph will force-pass regardless of your verdict; still give an honest assessment so the review-log reflects reality.
+"""
+
+    try:
+        response = await safe_ainvoke_chain(
+            role="verifier",
+            messages=[
+                SystemMessage(content=_REVIEW_SYSTEM),
+                HumanMessage(content=human_content),
+            ],
+            max_tokens=4096,
+            temperature=0.0,
+        )
+        content = getattr(response, "content", "") or ""
+        verdict = _parse_review_verdict(content)
+    except Exception as e:
+        # Never let a critic failure block the pipeline — default-accept so
+        # phase3 can proceed and the review-log records why.
+        logger.warning("phase2_review: critic LLM call failed (%s); defaulting to accept=true", e)
+        verdict = {
+            "accept": True,
+            "issues": [f"critic LLM call failed: {e!r}; defaulted to accept"],
+            "per_sq_issues": {},
+        }
+
+    _write_review_log(workspace, current_count, verdict)
+
+    return {
+        "review_verdict": verdict,
+        "execution_log": [
+            f"Phase 2 review (revision {current_count}): accept={verdict.get('accept')}, "
+            f"issues={len(verdict.get('issues', []))}, per_sq={len(verdict.get('per_sq_issues', {}))}"
+        ],
+    }
+
+
+def _parse_review_verdict(text: str) -> dict:
+    """Tolerant JSON parsing — LLM may wrap JSON in ```json fences or trail prose."""
+    stripped = (text or "").strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(
+            r"^```(?:json)?\s*|\s*```$", "", stripped, flags=re.MULTILINE
+        ).strip()
+    m = re.search(r"\{[\s\S]*\}", stripped)
+    if not m:
+        return {
+            "accept": True,
+            "issues": ["critic returned no JSON; defaulted to accept"],
+            "per_sq_issues": {},
+        }
+    try:
+        v = json.loads(m.group(0))
+    except Exception:
+        return {
+            "accept": True,
+            "issues": ["critic JSON parse failed; defaulted to accept"],
+            "per_sq_issues": {},
+        }
+    return {
+        "accept": bool(v.get("accept", True)),
+        "issues": list(v.get("issues", []) or []),
+        "per_sq_issues": dict(v.get("per_sq_issues", {}) or {}),
+    }
+
+
+def _write_review_log(
+    workspace: str, revision: int, verdict: dict, note: str = ""
+) -> None:
+    """Append the verdict to review-log.md so every round of the revise loop
+    is auditable. The file accumulates across revisions; grep for
+    ``## Revision N`` to find a specific round.
+    """
+    lines = [
+        f"\n\n## Revision {revision}",
+        f"- accept: {verdict.get('accept')}",
+    ]
+    if note:
+        lines.append(f"- note: {note}")
+    if verdict.get("issues"):
+        lines.append("- top-level issues:")
+        lines.extend(f"  - {i}" for i in verdict["issues"])
+    if verdict.get("per_sq_issues"):
+        lines.append("- per-subquestion issues:")
+        for sq, issues in verdict["per_sq_issues"].items():
+            lines.append(f"  - {sq}:")
+            lines.extend(f"    - {i}" for i in (issues or []))
+    append_workspace_file(workspace, "review-log.md", "\n".join(lines) + "\n")

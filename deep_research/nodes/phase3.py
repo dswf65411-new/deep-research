@@ -22,6 +22,7 @@ from deep_research.harness.validators import (
     verify_indexed_items,
 )
 from deep_research.llm import get_llm, safe_ainvoke, safe_ainvoke_chain
+from deep_research.prompts_shared import FOCUSED_EXEC_PROMPT
 from deep_research.state import Claim, ResearchState, Source, StatementCheck
 from deep_research.tools.workspace import (
     list_workspace_files,
@@ -112,6 +113,32 @@ async def phase3_report(state: ResearchState) -> dict:
         uncovered_keywords=uncovered_keywords,
     )
 
+    # Whisper P2-1: LLM-level sanity check to catch defects the rule-based
+    # banner misses — e.g. body has text but doesn't actually answer the
+    # brief, paragraphs contradict each other, or named entities appear in
+    # claims but off-topic. Appends to the existing banner; swallows LLM
+    # errors so it never blocks report emission.
+    llm_issues = await _llm_report_sanity_check(
+        brief_text=brief_text,
+        final_body=fixed_body,
+        approved_claim_count=len(approved_claims),
+    )
+    if llm_issues:
+        critical_banner = _append_llm_issues_to_banner(
+            critical_banner, llm_issues, workspace
+        )
+
+    # Whisper P3-4: pipeline self-eval + follow-up suggestions. The rubric is
+    # deterministic (per-SQ status tally) so it always appears; the follow-up
+    # LLM call can silently degrade to an empty list without affecting the
+    # scorecard.
+    self_eval_section = await _build_self_eval_section(
+        brief_text=brief_text,
+        approved_claims=approved_claims,
+        all_claims=claim_objects,
+        state=state,
+    )
+
     # Read clarifications if any
     clarify_section = ""
     clarify_md = read_workspace_file(workspace, "clarifications.md")
@@ -164,6 +191,7 @@ async def phase3_report(state: ResearchState) -> dict:
 
 {gap_log}
 
+{self_eval_section}
 ## Research Methodology
 
 This research uses a LangGraph workflow + agent interleaved architecture:
@@ -381,6 +409,215 @@ def _build_critical_banner(
     )
 
 
+# ---------------------------------------------------------------------------
+# Whisper P2-1 — LLM-level report sanity check
+# ---------------------------------------------------------------------------
+# Rule-based banner catches the obvious carcasses (empty body, no sections).
+# Many of the failed-workspace defects, though, were *semantic*: the body had
+# thousands of words but didn't answer Q6, named 13 SOTA tools but discussed
+# none of them, or asserted X then later contradicted X. Judge with a cheap
+# LLM on the final assembly and append any critical findings to the banner.
+
+# Truncate the body we send to the judge: enough to spot skeleton / topic
+# drift / contradiction, but not so long that it wastes tokens on a report
+# that's already marked skeletal by the rule-based layer.
+_SANITY_BODY_CHAR_CAP = 12000
+_SANITY_BRIEF_CHAR_CAP = 4000
+
+_SANITY_SYSTEM = FOCUSED_EXEC_PROMPT + """You are a strict report-integrity auditor. You are given:
+(1) the original research brief (what the user asked for);
+(2) the assembled "Detailed Analysis" body of the final report.
+
+Identify only *critical* defects — the kind that would make a reader conclude
+the report failed to answer the brief. Do NOT nitpick phrasing, minor
+omissions, or stylistic choices.
+
+Critical defects include, but are not limited to:
+- Large gaps where the body suddenly stops discussing a declared topic;
+- Named tools / methods in the brief that the body mentions only in passing
+  without actually characterising them;
+- Internal contradictions (claim A in one paragraph, contradicted two
+  paragraphs later without reconciliation);
+- Boilerplate / filler text where substantive analysis was expected;
+- Detailed analysis that re-states the brief rather than answering it.
+
+Return STRICT JSON:
+{
+  "critical_issues": ["short imperative sentence describing issue 1", ...]
+}
+
+If the body looks healthy, return {"critical_issues": []}.
+Keep each issue under 25 words. Return at most 5 issues, most severe first.
+Do NOT wrap the JSON in markdown fences.
+"""
+
+
+async def _llm_report_sanity_check(
+    *,
+    brief_text: str,
+    final_body: str,
+    approved_claim_count: int,
+) -> list[str]:
+    """LLM-judge the final report body against the research brief.
+
+    Returns a list of short critical-issue strings. Empty list means the
+    judge found nothing wrong (or the check was skipped). Never raises —
+    a failed sanity check must not block report emission.
+    """
+    body = (final_body or "").strip()
+    brief = (brief_text or "").strip()
+    # Nothing to check, or the rule-based banner already flagged it.
+    if not body or not brief or approved_claim_count == 0:
+        return []
+    if len(body) < _DETAILED_ANALYSIS_MIN_CHARS:
+        return []
+
+    body_snippet = body[:_SANITY_BODY_CHAR_CAP]
+    if len(body) > _SANITY_BODY_CHAR_CAP:
+        body_snippet += "\n[...truncated for sanity check...]"
+    brief_snippet = brief[:_SANITY_BRIEF_CHAR_CAP]
+
+    user_msg = (
+        f"## Research brief (what the user asked for)\n\n{brief_snippet}\n\n"
+        f"---\n\n"
+        f"## Final report body (what we actually wrote)\n\n{body_snippet}"
+    )
+
+    try:
+        llm = get_llm("fast")
+        response = await safe_ainvoke(
+            llm,
+            [SystemMessage(content=_SANITY_SYSTEM), HumanMessage(content=user_msg)],
+        )
+        raw = (response.content or "").strip()
+    except Exception as exc:
+        logger.info("llm sanity check skipped: %s", exc)
+        return []
+
+    if not raw:
+        return []
+    # Defensive JSON parse — strip ```json fences if the LLM ignored the
+    # instruction.
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        logger.info("llm sanity check produced non-JSON output; discarding")
+        return []
+
+    issues_raw = parsed.get("critical_issues") if isinstance(parsed, dict) else None
+    if not isinstance(issues_raw, list):
+        return []
+    cleaned: list[str] = []
+    for item in issues_raw:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if text:
+            cleaned.append(text[:300])  # hard cap per issue
+        if len(cleaned) >= 5:
+            break
+    return cleaned
+
+
+def _append_llm_issues_to_banner(
+    existing_banner: str, llm_issues: list[str], workspace: str,
+) -> str:
+    """Merge LLM sanity findings into the critical banner + persist to gap-log.
+
+    Keeps the rule-based banner format so downstream consumers see one
+    unified "do not quote this report" block.
+    """
+    if not llm_issues:
+        return existing_banner
+
+    bullets = "\n".join(f"> - (LLM) {issue}" for issue in llm_issues)
+    llm_block = (
+        "\n> **LLM sanity check — critical findings**\n"
+        + bullets
+        + "\n> See report-sanity-check.md for the full judge response.\n\n"
+    )
+
+    # Persist the LLM issues to their own file so post-mortem tooling can
+    # read them without re-parsing the final report.
+    try:
+        body = "# Report sanity check (LLM judge)\n\n" + "\n".join(
+            f"- {issue}" for issue in llm_issues
+        ) + "\n"
+        write_workspace_file(workspace, "report-sanity-check.md", body)
+    except Exception:
+        logger.exception("failed to write report-sanity-check.md")
+
+    # Also append to gap-log so the post-mortem trail is co-located with
+    # rule-based findings.
+    try:
+        import datetime as _dt
+        ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        note = (
+            f"\n\n## CRITICAL — LLM sanity check flagged issues ({ts})\n"
+            + "\n".join(f"- {i}" for i in llm_issues)
+            + "\n"
+        )
+        from deep_research.tools.workspace import append_workspace_file as _append
+        _append(workspace, "gap-log.md", note)
+    except Exception:
+        logger.exception("failed to append LLM sanity findings to gap-log.md")
+
+    if existing_banner.strip():
+        # Rule banner already exists — inject LLM block before its trailing
+        # blank line so both blocks render under a single "CRITICAL" header.
+        return existing_banner.rstrip("\n") + "\n" + llm_block
+    return (
+        "\n> **CRITICAL — report integrity check failed**\n"
+        + llm_block
+    )
+
+
+async def _build_self_eval_section(
+    brief_text: str,
+    approved_claims: list[Claim],
+    all_claims: list[Claim],
+    state: ResearchState,
+) -> str:
+    """Whisper P3-4 — self-eval scorecard + follow-up suggestions.
+
+    Always returns a non-empty block. The follow-up LLM call can degrade
+    silently (returns ``[]``) and we still print the deterministic per-SQ
+    scorecard.
+    """
+    from deep_research.harness.self_eval import (
+        format_self_eval_section,
+        generate_follow_ups,
+        score_subquestions,
+    )
+
+    blockers = list(state.get("blockers", []) or [])
+    coverage_sqs = sorted({
+        (getattr(c, "subquestion", "") or "").strip()
+        for c in all_claims
+        if (getattr(c, "subquestion", "") or "").strip()
+    })
+    outcomes = score_subquestions(
+        all_claims, blockers=blockers, coverage_sqs=coverage_sqs,
+    )
+
+    async def _invoker(messages):
+        # Use the "fast" tier — this is a structured one-shot, not reasoning.
+        llm = get_llm("fast")
+        return await safe_ainvoke(llm, messages)
+
+    follow_ups: list[str] = []
+    try:
+        follow_ups = await generate_follow_ups(
+            brief_text=brief_text, outcomes=outcomes, invoker=_invoker,
+        )
+    except Exception:  # noqa: BLE001 — defensive; never block phase3
+        logger.exception("self-eval follow-up generation failed")
+
+    return format_self_eval_section(outcomes, follow_ups=follow_ups)
+
+
 def _compute_coverage_note(plan: str, approved_claims: list[Claim]) -> str:
     """Cross-check planned subquestions against approved claims.
 
@@ -455,7 +692,7 @@ def _ensure_source_objects(sources) -> list[Source]:
     return result
 
 
-_LEDGER_SYSTEM = """Split the report content into statement-level entries. Every factual, numeric, or inference sentence occupies its own line.
+_LEDGER_SYSTEM = FOCUSED_EXEC_PROMPT + """Split the report content into statement-level entries. Every factual, numeric, or inference sentence occupies its own line.
 
 ## Hard Rules
 - Review the entire section in full; no sentence may be skipped or merged
@@ -682,7 +919,7 @@ def _format_statement_ledger(statements: list[dict]) -> str:
     return header + "\n".join(rows) + "\n"
 
 
-AUDIT_SYSTEM = """You are the final-quality adversary. Verify the citation chain completeness of each statement.
+AUDIT_SYSTEM = FOCUSED_EXEC_PROMPT + """You are the final-quality adversary. Verify the citation chain completeness of each statement.
 
 ## Verification Rules
 

@@ -25,7 +25,8 @@ from deep_research.harness.gates import gate_check
 from deep_research.nodes.phase0 import phase0_plan
 from deep_research.nodes.phase1a import phase1a_search
 from deep_research.nodes.phase1b import phase1b_verify, trigger_fallback_node
-from deep_research.nodes.phase2 import phase2_integrate
+from deep_research.nodes.heavy_mode import heavy_mode_rollout
+from deep_research.nodes.phase2 import MAX_REVISIONS, phase2_integrate, phase2_review
 from deep_research.nodes.phase3 import phase3_report
 from deep_research.state import ResearchState
 
@@ -103,6 +104,44 @@ async def increment_iteration(state: ResearchState) -> dict:
     }
 
 
+async def bump_revision_count(state: ResearchState) -> dict:
+    """Increment the revision counter before looping back to Phase 2.
+
+    Sits between phase2_review and phase2 so that phase2_integrate can read
+    the updated ``revision_count`` and surface the prior critic's issues as
+    a revision hint to the writer LLM.
+    """
+    current = state.get("revision_count", 0)
+    return {
+        "revision_count": current + 1,
+        "execution_log": [f"revision {current + 1} → back to Phase 2"],
+    }
+
+
+def route_after_review(state: ResearchState) -> str:
+    """Route after phase2_review.
+
+    Priority:
+    1. Verdict accept=True → phase3 (ship it).
+    2. revision_count already at MAX_REVISIONS, critic still rejecting, and
+       heavy mode has not yet fired → heavy_mode (Tongyi-style last pass).
+    3. revision_count at MAX_REVISIONS and heavy mode already fired →
+       phase3 (safety cap; verdict in review-log.md for auditing).
+    4. Else → bump_revision → phase2 (rewrite targeted sections).
+    """
+    verdict = state.get("review_verdict") or {}
+    current = state.get("revision_count", 0)
+    heavy_done = state.get("heavy_mode_triggered", False)
+
+    if verdict.get("accept"):
+        return "phase3"
+    if current >= MAX_REVISIONS:
+        if not heavy_done:
+            return "heavy_mode"
+        return "phase3"
+    return "bump_revision"
+
+
 # ---------------------------------------------------------------------------
 # Graph assembly
 # ---------------------------------------------------------------------------
@@ -127,6 +166,9 @@ def build_deep_research(checkpointer=None) -> StateGraph:
     builder.add_node("trigger_fallback", trigger_fallback_node)
     builder.add_node("increment_iter", increment_iteration)
     builder.add_node("phase2", phase2_integrate)
+    builder.add_node("phase2_review", phase2_review)
+    builder.add_node("bump_revision", bump_revision_count)
+    builder.add_node("heavy_mode", heavy_mode_rollout)
     builder.add_node("phase3", phase3_report)
 
     # START → plan
@@ -160,8 +202,29 @@ def build_deep_research(checkpointer=None) -> StateGraph:
     )
     builder.add_edge("increment_iter", "phase1a")
 
-    # Phase 2 → Phase 3 → END
-    builder.add_edge("phase2", "phase3")
+    # Phase 2 → Review → (phase3 | bump_revision → phase2)
+    # gpt-researcher-style Critic-revise loop: a drafted report is reviewed
+    # once; if the critic rejects, revision_count is incremented and phase2
+    # re-runs with the critic's per-SQ issues as a revision hint. Capped at
+    # MAX_REVISIONS to prevent infinite loops.
+    builder.add_edge("phase2", "phase2_review")
+    builder.add_conditional_edges(
+        "phase2_review",
+        route_after_review,
+        {
+            "phase3": "phase3",
+            "bump_revision": "bump_revision",
+            "heavy_mode": "heavy_mode",
+        },
+    )
+    builder.add_edge("bump_revision", "phase2")
+    # Tongyi-style Heavy Mode is one-shot (latched via heavy_mode_triggered);
+    # after it runs we always advance to phase3 with the winner sections on
+    # disk. Looping back to phase2_review would just re-consult the critic
+    # and — since the critic already rejected the prior draft — risk a loop
+    # if the latch ever failed to set. Straight to phase3 is both simpler
+    # and matches ParallelMuse semantics (INTEGRATE picks; no re-judging).
+    builder.add_edge("heavy_mode", "phase3")
     builder.add_edge("phase3", END)
 
     # Compile

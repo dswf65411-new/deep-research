@@ -9,7 +9,20 @@
 
 **Output:** `workspace/report-sections/q{n}_section.md`
 
-**Required reading for this Phase:** `prompts/source-criteria.md`, `prompts/ref-citation-embedding.md`
+**Required reading for this Phase:** `prompts/source-criteria.md`, `prompts/ref-citation-embedding.md`, `prompts/ref-focused-execution.md`
+
+---
+
+## Execution Mode: Focused Task Execution
+
+Before drafting any section content, emit a `[TASK LIST]` enumerating:
+- One task per subquestion section you're about to write (T1: write Q1 section, T2: write Q2 section, …)
+- One task per contradiction you detected and must adjudicate (T3.1: adjudicate conflict A, T3.2: conflict B, …)
+- One task for confidence-level tagging, one for source-depth evaluation
+
+Then process each task inside `[WORKING: T{n}]` / `[DONE: T{n}]` markers — generate only that section's text per task, don't draft multiple sections interleaved.
+
+The scaffold is plain text; the final markdown section file content is the deliverable. See `prompts/ref-focused-execution.md` for full rules.
 
 ---
 
